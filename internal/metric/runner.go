@@ -58,7 +58,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	// Use interval from config
+	// Use interval from config (minimum 1 second)
 	interval := time.Duration(r.cfg.Interval) * time.Second
 	if interval <= 0 {
 		interval = time.Second
@@ -79,7 +79,6 @@ func (r *Runner) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-sigChan:
-			fmt.Println("\nReceived interrupt signal, exiting...")
 			return nil
 		case <-ticker.C:
 			// Collect snapshot

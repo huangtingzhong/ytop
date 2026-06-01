@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/yihan/ytop/internal/config"
+	"github.com/yihan/ytop/internal/logger"
 	"github.com/yihan/ytop/internal/models"
 	"golang.org/x/term"
 )
@@ -49,6 +50,11 @@ func NewDisplay(cfg *config.Config) (*Display, error) {
 // Render renders the snapshot to terminal and optionally to file
 func (d *Display) Render(snapshot *models.Snapshot) {
 	d.iteration++
+
+	if d.cfg.DebugMode {
+		logger.Debug("[display] Render iteration #%d: sysStats=%d events=%d sessionMetrics=%d sessionDetails=%d\n",
+			d.iteration, len(snapshot.SysStats), len(snapshot.SystemEvents), len(snapshot.SessionMetrics), len(snapshot.SessionDetails))
+	}
 
 	// Clear screen only if output is to a terminal
 	if d.isTerminal {

@@ -9,13 +9,14 @@ import (
 
 	"github.com/yihan/ytop/internal/config"
 	"github.com/yihan/ytop/internal/connector"
+	"github.com/yihan/ytop/internal/logger"
 	"github.com/yihan/ytop/internal/subcommand"
 )
 
 func runSesstat() {
 	// Check for help flag anywhere in arguments
 	for _, arg := range os.Args[2:] {
-		if arg == "--help" || arg == "help" || arg == "-help" {
+		if arg == "--help" || arg == "-h" || arg == "help" || arg == "-help" {
 			config.PrintSesstatUsage()
 			return
 		}
@@ -59,6 +60,18 @@ func runSesstat() {
 
 	// Apply global flags to config
 	globalFlags.ApplyToConfig(cfg)
+
+	// Initialize logger
+	if err := logger.Init(cfg.DebugMode); err != nil {
+		fmt.Fprintf(os.Stderr, "Error initializing logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer logger.Close()
+
+	if err := config.FinalizeSourceCmd(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Validate
 	if err := cfg.Validate(); err != nil {

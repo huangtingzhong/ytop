@@ -1,0 +1,10 @@
+
+    THREAD# GROUPID       NAME                                                                  SIZE_M STATUS    TYPE        SEQUENCE# 
+----------- ------------- ---------------------------------------------------------------- ----------- --------- --------- ----------- 
+          1 4             /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_4.log               1024 INACTIVE  ONLINE            450
+          1 5             /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_5.log               1024 CURRENT   ONLINE            451
+          1 6             /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_6.log               1024 INACTIVE  ONLINE            448
+          1 7             /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_7.log               1024 INACTIVE  ONLINE            449
+
+4 rows fetched.
+

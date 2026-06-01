@@ -40,7 +40,7 @@ func ParseGlobalFlags(fs *flag.FlagSet) *GlobalFlags {
 	fs.StringVar(&gf.ConnectString, "C", "/ as sysdba", "Connection string (short)")
 
 	fs.StringVar(&gf.SSHHost, "host", "", "SSH host")
-	fs.StringVar(&gf.SSHHost, "h", "", "SSH host (short)")
+	fs.StringVar(&gf.SSHHost, "t", "", "SSH host (short)")
 
 	fs.IntVar(&gf.SSHPort, "port", 0, "SSH port")
 	fs.IntVar(&gf.SSHPort, "P", 0, "SSH port (short)")
@@ -65,7 +65,7 @@ func ParseGlobalFlags(fs *flag.FlagSet) *GlobalFlags {
 	fs.IntVar(&gf.Count, "c", 5, "Number of result outputs (short)")
 
 	fs.IntVar(&gf.TopN, "top", 5, "Number of top results to show")
-	fs.IntVar(&gf.TopN, "t", 5, "Number of top results (short)")
+	fs.IntVar(&gf.TopN, "T", 5, "Number of top results (short)")
 
 	// Other flags
 	fs.StringVar(&gf.OutputFile, "output", "", "Output file path")

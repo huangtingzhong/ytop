@@ -1,0 +1,17 @@
+Database log_mode=ARCHIVELOG, OPEN instances=1, connected instance=1
+ARCHIVELOG: use ARCHIVE LOG CURRENT (cluster-wide redo switch on YAC).
+Target path=/data/yashan/yasdb_data/db-1-1/dbfiles, size=1024M (1073741824 bytes), required 4 file(s) per instance (YAC cluster: count is per instance, not whole DB).
+Already satisfied: 4 redo file(s) match path and size (required >= 4), skip adding.
+Drop phase: connected instance 1 (other instances must be OPEN for GV$ view).
+--- Current redo (V$LOGFILE) ---
+ID     THREAD#  NAME                                                                 SIZE_MB    STATUS
+------ -------- -------------------------------------------------------------------- ---------- ------
+     4        1 /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_4.log                  1024 INACTIVE
+     5        1 /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_5.log                  1024 ACTIVE
+     6        1 /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_6.log                  1024 CURRENT
+     7        1 /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_7.log                  1024 INACTIVE
+--- End of V$LOGFILE ---
+Done.
+
+PL/SQL Succeed.
+

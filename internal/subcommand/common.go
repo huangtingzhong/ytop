@@ -201,7 +201,6 @@ func RunSubcommand(ctx context.Context, conn connector.Connector, qc *QueryConfi
 
 		if i == 0 {
 			prevRecords = records
-			fmt.Printf("Collecting baseline data...\n")
 		} else {
 			// Calculate deltas
 			deltas := CalculateDeltas(prevRecords, records, interval)
@@ -218,7 +217,7 @@ func RunSubcommand(ctx context.Context, conn connector.Connector, qc *QueryConfi
 func DisplayResults(deltas []Record, topN int, instIDs, sids, names string,
 	sample, totalSamples int, title string, showValue1 bool) {
 
-	fmt.Printf("\n=== %s (Sample %d/%d) ===\n", title, sample, totalSamples)
+	fmt.Printf("\n=== %s %s ===\n", title, time.Now().Format("2006-01-02 15:04:05"))
 
 	if len(deltas) == 0 {
 		fmt.Println("No data with non-zero deltas found")
@@ -231,100 +230,91 @@ func DisplayResults(deltas []Record, topN int, instIDs, sids, names string,
 	} else {
 		displayDetailedRecords(deltas, topN, showValue1)
 	}
-
-	// Display filters
-	if instIDs != "" {
-		fmt.Printf("Filtered by: INST_ID IN (%s)\n", instIDs)
-	}
-	if names != "" {
-		fmt.Printf("Filtered by: NAME LIKE (%s)\n", names)
-	}
 }
 
-// displayGroupedBySessions displays records grouped by session
+// displayGroupedBySessions displays records grouped by session and event
 func displayGroupedBySessions(deltas []Record, topN int, showValue1 bool) {
-	sessionTotals := make(map[string]struct {
-		InstID     int
-		SID        int
-		TotalVal1  int64
-		TotalVal2  float64
-	})
+	type SessionTotal struct {
+		InstID    int
+		SID       int
+		Name      string
+		TotalVal1 int64
+		TotalVal2 float64
+	}
+
+	sessionTotals := make(map[string]SessionTotal)
 
 	for _, d := range deltas {
-		key := fmt.Sprintf("%d-%d", d.InstID, d.SID)
+		key := fmt.Sprintf("%d-%d-%s", d.InstID, d.SID, d.Name)
 		entry := sessionTotals[key]
 		entry.InstID = d.InstID
 		entry.SID = d.SID
+		entry.Name = d.Name
 		entry.TotalVal1 += d.Value1
 		entry.TotalVal2 += d.Value2
 		sessionTotals[key] = entry
 	}
 
-	type SessionTotal struct {
-		InstID    int
-		SID       int
-		TotalVal1 int64
-		TotalVal2 float64
-	}
-
-	var sessions []SessionTotal
+	var records []SessionTotal
 	var grandTotal float64
 	for _, entry := range sessionTotals {
-		sessions = append(sessions, SessionTotal{
-			InstID:    entry.InstID,
-			SID:       entry.SID,
-			TotalVal1: entry.TotalVal1,
-			TotalVal2: entry.TotalVal2,
-		})
+		records = append(records, entry)
 		grandTotal += entry.TotalVal2
 	}
 
 	// Sort by Value2 descending
-	sort.Slice(sessions, func(i, j int) bool {
-		return sessions[i].TotalVal2 > sessions[j].TotalVal2
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].TotalVal2 > records[j].TotalVal2
 	})
 
 	// Take top N
-	if len(sessions) > topN {
-		sessions = sessions[:topN]
+	if len(records) > topN {
+		records = records[:topN]
 	}
 
 	// Display header
 	if showValue1 {
-		fmt.Printf("%-8s %-10s %15s %15s %15s %10s\n",
-			"INST_ID", "SID", "TOTAL_WAITS", "TIME_WAITED", "AVG_WAIT(ms)", "PCT%")
-		fmt.Println(strings.Repeat("-", 80))
+		fmt.Printf("%-8s %-10s %-35s %12s %14s %14s %10s\n",
+			"INST_ID", "SID", "EVENT", "TOTAL_WAITS", "TIME_WAIT(s)", "AVG_WAIT(ms)", "PCT%")
+		fmt.Println(strings.Repeat("-", 110))
 
 		// Display data
-		for _, s := range sessions {
+		for _, r := range records {
+			eventName := r.Name
+			if len(eventName) > 35 {
+				eventName = eventName[:32] + "..."
+			}
 			avgWait := 0.0
-			if s.TotalVal1 > 0 {
-				avgWait = (s.TotalVal2 / float64(s.TotalVal1)) * 1000
+			if r.TotalVal1 > 0 {
+				avgWait = r.TotalVal2 / float64(r.TotalVal1) // ms per wait
 			}
 			pct := 0.0
 			if grandTotal > 0 {
-				pct = (s.TotalVal2 / grandTotal) * 100
+				pct = (r.TotalVal2 / grandTotal) * 100
 			}
-			fmt.Printf("%-8d %-10d %15d %15.2f %15.2f %9.2f%%\n",
-				s.InstID, s.SID, s.TotalVal1, s.TotalVal2, avgWait, pct)
+			fmt.Printf("%-8d %-10d %-35s %12d %14.2f %14.2f %9.2f%%\n",
+				r.InstID, r.SID, eventName, r.TotalVal1, r.TotalVal2/1000, avgWait, pct)
 		}
 	} else {
-		fmt.Printf("%-8s %-10s %20s %10s\n",
-			"INST_ID", "SID", "TOTAL_VALUE/SEC", "PCT%")
-		fmt.Println(strings.Repeat("-", 50))
+		fmt.Printf("%-8s %-10s %-35s %20s %10s\n",
+			"INST_ID", "SID", "NAME", "TOTAL_VALUE/SEC", "PCT%")
+		fmt.Println(strings.Repeat("-", 90))
 
 		// Display data
-		for _, s := range sessions {
+		for _, r := range records {
+			name := r.Name
+			if len(name) > 35 {
+				name = name[:32] + "..."
+			}
 			pct := 0.0
 			if grandTotal > 0 {
-				pct = (s.TotalVal2 / grandTotal) * 100
+				pct = (r.TotalVal2 / grandTotal) * 100
 			}
-			fmt.Printf("%-8d %-10d %20.2f %9.2f%%\n",
-				s.InstID, s.SID, s.TotalVal2, pct)
+			fmt.Printf("%-8d %-10d %-35s %20.2f %9.2f%%\n",
+				r.InstID, r.SID, name, r.TotalVal2, pct)
 		}
 	}
 
-	fmt.Printf("\nShowing top %d sessions\n", len(sessions))
 }
 
 // displayDetailedRecords displays detailed records
@@ -348,21 +338,21 @@ func displayDetailedRecords(deltas []Record, topN int, showValue1 bool) {
 	// Display header
 	if showValue1 {
 		fmt.Printf("%-8s %-10s %-40s %15s %15s %15s %10s\n",
-			"INST_ID", "SID", "NAME", "TOTAL_WAITS", "TIME_WAITED", "AVG_WAIT(ms)", "PCT%")
+			"INST_ID", "SID", "NAME", "TOTAL_WAITS", "TIME_WAIT(s)", "AVG_WAIT(ms)", "PCT%")
 		fmt.Println(strings.Repeat("-", 120))
 
 		// Display data
 		for _, d := range deltas {
 			avgWait := 0.0
 			if d.Value1 > 0 {
-				avgWait = (d.Value2 / float64(d.Value1)) * 1000
+				avgWait = d.Value2 / float64(d.Value1) // ms per wait
 			}
 			pct := 0.0
 			if totalVal2 > 0 {
 				pct = (d.Value2 / totalVal2) * 100
 			}
 			fmt.Printf("%-8d %-10d %-40s %15d %15.2f %15.2f %9.2f%%\n",
-				d.InstID, d.SID, d.Name, d.Value1, d.Value2, avgWait, pct)
+				d.InstID, d.SID, d.Name, d.Value1, d.Value2/1000, avgWait, pct)
 		}
 	} else {
 		fmt.Printf("%-8s %-10s %-50s %20s %10s\n",
@@ -379,6 +369,4 @@ func displayDetailedRecords(deltas []Record, topN int, showValue1 bool) {
 				d.InstID, d.SID, d.Name, d.Value2, pct)
 		}
 	}
-
-	fmt.Printf("\nShowing top %d records\n", len(deltas))
 }

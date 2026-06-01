@@ -46,9 +46,17 @@ WHERE NAME IN (%s)%s
 ORDER BY INST_ID, NAME
 `, strings.Join(metricList, ","), instFilter)
 
+	if c.cfg.DebugMode {
+		logger.Debug("[collector] CollectSysStats SQL:\n%s\n", sql)
+	}
+
 	rows, err := c.conn.ExecuteQuery(ctx, sql)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query gv$sysstat: %w", err)
+	}
+
+	if c.cfg.DebugMode {
+		logger.Debug("[collector] CollectSysStats returned %d rows\n", len(rows))
 	}
 
 	var metrics []models.SysStatMetric
@@ -104,9 +112,17 @@ WHERE EVENT NOT LIKE 'SQL*Net%%'
 ORDER BY INST_ID, EVENT
 `, instFilter)
 
+	if c.cfg.DebugMode {
+		logger.Debug("[collector] CollectSystemEvents SQL:\n%s\n", sql)
+	}
+
 	rows, err := c.conn.ExecuteQuery(ctx, sql)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query gv$system_event: %w", err)
+	}
+
+	if c.cfg.DebugMode {
+		logger.Debug("[collector] CollectSystemEvents returned %d rows\n", len(rows))
 	}
 
 	var events []models.SystemEvent
@@ -177,13 +193,23 @@ JOIN GV$SESSTAT st ON s.INST_ID = st.INST_ID AND s.SID = st.SID
 JOIN GV$STATNAME n ON st.INST_ID = n.INST_ID AND st.STATISTIC# = n.STATISTIC#
 WHERE n.NAME IN (%s)
   AND s.USERNAME IS NOT NULL
-  AND s.TYPE != 'BACKGROUND'%s
+  AND s.TYPE != 'BACKGROUND'
+  AND NOT (s.INST_ID = TO_NUMBER(SYS_CONTEXT('USERENV', 'INSTANCE'))
+       AND s.SID = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')))%s
 ORDER BY s.INST_ID, s.SID, n.NAME
 `, strings.Join(metricList, ","), instFilter)
+
+	if c.cfg.DebugMode {
+		logger.Debug("[collector] CollectSessionMetrics SQL:\n%s\n", sql)
+	}
 
 	rows, err := c.conn.ExecuteQuery(ctx, sql)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query session metrics: %w", err)
+	}
+
+	if c.cfg.DebugMode {
+		logger.Debug("[collector] CollectSessionMetrics returned %d rows\n", len(rows))
 	}
 
 	// Group by instance and session
@@ -265,30 +291,56 @@ func (c *Collector) CollectSessionDetails(ctx context.Context) ([]models.Session
 
 	sql := fmt.Sprintf(`
 SELECT
-    a.inst_id||'.'||a.sid||'.'||a.serial#||'.'||b.thread_id AS sid_tid,
-    substr(a.wait_event,1,30) AS event,
-    a.username AS username,
-    substr(a.cli_program,1,30) AS program,
-    substr(c.command_name,1,3)||'.'||nvl(a.sql_id,a.sql_id) AS sql_id,
-    EXTRACT(DAY FROM (sysdate-a.exec_start_time)) * 86400 +
-    EXTRACT(HOUR FROM (sysdate-a.exec_start_time)) * 3600 +
-    EXTRACT(MINUTE FROM (sysdate-a.exec_start_time)) * 60 +
-    EXTRACT(SECOND FROM (sysdate-a.exec_start_time)) AS exec_seconds,
-    a.ip_address||'.'||a.ip_port AS client,
-    a.inst_id
-FROM GV$SESSION a, GV$PROCESS b, V$SQLCOMMAND c
-WHERE a.inst_id = b.inst_id
-  AND a.paddr = b.thread_addr
-  AND a.command = c.command_type(+)
-  AND a.TYPE NOT IN ('BACKGROUND')
-  AND a.status NOT IN ('INACTIVE')%s
-ORDER BY exec_seconds DESC
+    x.sid_tid,
+    x.event,
+    x.username,
+    x.program,
+    x.sql_id,
+    GREATEST(0,
+        EXTRACT(DAY FROM x.exec_delta) * 86400000 +
+        EXTRACT(HOUR FROM x.exec_delta) * 3600000 +
+        EXTRACT(MINUTE FROM x.exec_delta) * 60000 +
+        EXTRACT(SECOND FROM x.exec_delta) * 1000
+    ) AS exec_ms,
+    x.client,
+    x.inst_id
+FROM (
+    SELECT
+        a.inst_id||'.'||a.sid||'.'||a.serial#||'.'||b.thread_id AS sid_tid,
+        substr(a.wait_event,1,30) AS event,
+        a.username AS username,
+        substr(a.cli_program,1,30) AS program,
+        substr(c.command_name,1,3)||'.'||nvl(a.sql_id,a.sql_id) AS sql_id,
+        CAST(
+            CAST(SYSTIMESTAMP AS TIMESTAMP(6)) - CAST(a.exec_start_time AS TIMESTAMP(6))
+            AS INTERVAL DAY(9) TO SECOND(6)
+        ) AS exec_delta,
+        a.ip_address||'.'||a.ip_port AS client,
+        a.inst_id
+    FROM GV$SESSION a, GV$PROCESS b, V$SQLCOMMAND c
+    WHERE a.inst_id = b.inst_id
+      AND a.paddr = b.thread_addr
+      AND a.command = c.command_type(+)
+      AND a.TYPE NOT IN ('BACKGROUND')
+      AND a.status NOT IN ('INACTIVE')
+      AND NOT (a.INST_ID = TO_NUMBER(SYS_CONTEXT('USERENV', 'INSTANCE'))
+           AND a.SID = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')))%s
+) x
+ORDER BY exec_ms DESC
 FETCH FIRST %d ROWS ONLY
 `, instFilter, c.cfg.SessionDetailTopN)
+
+	if c.cfg.DebugMode {
+		logger.Debug("[collector] CollectSessionDetails SQL:\n%s\n", sql)
+	}
 
 	rows, err := c.conn.ExecuteQuery(ctx, sql)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query session details: %w", err)
+	}
+
+	if c.cfg.DebugMode {
+		logger.Debug("[collector] CollectSessionDetails returned %d rows\n", len(rows))
 	}
 
 	var details []models.SessionDetail
@@ -302,11 +354,19 @@ FETCH FIRST %d ROWS ONLY
 			continue
 		}
 
-		// SQL returns: sid_tid, event, username, program, sql_id, exec_seconds, client, inst_id
-		execSeconds, _ := strconv.ParseFloat(row[5], 64)
-		execTime := formatExecTime(execSeconds)
+		// SQL returns: sid_tid, event, username, program, sql_id, exec_ms, client, inst_id
+		execMs, err := strconv.ParseFloat(row[5], 64)
+		if err != nil {
+			logger.Debug("[collector] skipping row: invalid exec_ms %q: %v\n", row[5], err)
+			continue
+		}
+		execTime := formatExecTime(execMs)
 
-		instID, _ := strconv.Atoi(row[7])
+		instID, err := strconv.Atoi(row[7])
+		if err != nil {
+			logger.Debug("[collector] skipping row: invalid inst_id %q: %v\n", row[7], err)
+			continue
+		}
 
 		details = append(details, models.SessionDetail{
 			InstID:   instID,
@@ -323,15 +383,21 @@ FETCH FIRST %d ROWS ONLY
 	return details, nil
 }
 
-// formatExecTime formats execution time in MS/S/KS/WS format
-func formatExecTime(seconds float64) string {
-	if seconds < 1 {
-		return fmt.Sprintf("%.0fMS", seconds*1000)
-	} else if seconds < 1000 {
-		return fmt.Sprintf("%.2fS", seconds)
-	} else if seconds < 10000 {
-		return fmt.Sprintf("%.2fKS", seconds/1000)
-	} else {
-		return fmt.Sprintf("%.2fWS", seconds/10000)
+// formatExecTime formats elapsed time from milliseconds using MS/S/M/H/D (aligned with we.sql).
+func formatExecTime(execMs float64) string {
+	if execMs < 0 {
+		execMs = 0
+	}
+	switch {
+	case execMs < 1000:
+		return fmt.Sprintf("%.0fMS", execMs)
+	case execMs < 60000:
+		return fmt.Sprintf("%.2fS", execMs/1000)
+	case execMs < 3600000:
+		return fmt.Sprintf("%.2fM", execMs/60000)
+	case execMs < 86400000:
+		return fmt.Sprintf("%.2fH", execMs/3600000)
+	default:
+		return fmt.Sprintf("%.2fD", execMs/86400000)
 	}
 }

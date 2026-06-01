@@ -1,11 +1,7 @@
 #!/bin/bash
-#--------------------------------------------------------------------------------
-#-- File name:   generate_flamegraph.sh
-#-- Purpose:     generate flamegraph svg
-#-- Author:      lxy
-#-- Usage:       ./generate_flamegraph.sh -p <pid> -s 10(默认收集10s)
-#--              FLAMEGRAPH_DIR和OUTPUT_DIR目录要建好，并且先上传FlameGraph-master包
-#--------------------------------------------------------------------------------
+# File Name: generate_flamegraph.sh
+# Purpose: Generate flamegraph SVG from perf data
+# Created: 20260517  by  huangtingzhong
 FLAMEGRAPH_DIR=/FlameGraph/FlameGraph-master
 OUTPUT_DIR=/FlameGraph/perf_data
 

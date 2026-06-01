@@ -1,0 +1,6 @@
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT sql_id FROM (
+  SELECT sql_id FROM v$sql
+   WHERE UPPER(sql_text) LIKE UPPER('&1')
+   ORDER BY last_active_time DESC
+) WHERE ROWNUM = 1;

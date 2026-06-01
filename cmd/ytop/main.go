@@ -27,6 +27,32 @@ import (
 // Global input channel for coordinated stdin reading
 var globalInputChan chan byte
 
+// Global terminal state for restoration on exit
+var globalOldState *term.State
+
+// Global stop channel for graceful goroutine shutdown
+var globalStopChan chan struct{}
+
+// restoreTerminal restores terminal state from raw mode if needed
+func restoreTerminal() {
+	if globalOldState != nil {
+		term.Restore(int(os.Stdin.Fd()), globalOldState)
+		globalOldState = nil
+	}
+}
+
+// stopGoroutines signals background goroutines to exit gracefully
+func stopGoroutines() {
+	if globalStopChan != nil {
+		select {
+		case <-globalStopChan:
+			// already closed
+		default:
+			close(globalStopChan)
+		}
+	}
+}
+
 // printVersion prints version information
 func printVersion() {
 	fmt.Printf("ytop version %s\n", Version)
@@ -44,10 +70,29 @@ func main() {
 		case "sesevent", "event":
 			runSesevent()
 			return
+		case "monitor":
+			if len(os.Args) > 2 && (os.Args[2] == "--help" || os.Args[2] == "-h" || os.Args[2] == "help") {
+				config.PrintMonitorUsage()
+				return
+			}
+			// "monitor" without --help: run monitor mode
+			runMonitor()
+			return
+		case "script":
+			if len(os.Args) > 2 && (os.Args[2] == "--help" || os.Args[2] == "-h" || os.Args[2] == "help") {
+				config.PrintScriptUsage()
+				return
+			}
+			// "script" without --help: run monitor mode (script flags like -f will be parsed by LoadConfig)
+			runMonitor()
+			return
+		case "ssh":
+			runSSH()
+			return
 		case "--version", "-v", "version":
 			printVersion()
 			return
-		case "--help", "help":
+		case "--help", "-h", "help":
 			config.PrintUsage()
 			return
 		}
@@ -72,8 +117,11 @@ func runMonitor() {
 	}
 	defer logger.Close()
 
+	// Set script DB type
+	scripts.CurrentDBType = cfg.DBType
+
 	// Check if only finding scripts or reading script content (no database connection needed)
-	if cfg.FindScript != "" {
+	if cfg.FindScriptSet {
 		handleFindScript(cfg.FindScript)
 		return
 	}
@@ -81,6 +129,19 @@ func runMonitor() {
 	if cfg.ReadScript != "" {
 		handleReadScript(cfg.ReadScript)
 		return
+	}
+
+	if cfg.CopyScript != "" && cfg.ConnectionMode == "local" {
+		ctx := context.Background()
+		handleCopyScript(ctx, cfg, executor.NewExecutor(cfg, nil))
+		return
+	}
+
+	// Check monitor mode DB type support before connecting
+	isDirectMode := cfg.ExecuteScript != "" || cfg.ExecuteSQL != "" || cfg.CopyScript != "" || cfg.MetricMode
+	if !isDirectMode && cfg.DBType != "yashandb" {
+		fmt.Fprintf(os.Stderr, "Interactive monitor mode only supports YashanDB. Support for other database types is coming soon.\n")
+		os.Exit(1)
 	}
 
 	// Create connector (for database operations)
@@ -135,7 +196,7 @@ func runDirectExecution(ctx context.Context, cfg *config.Config, conn connector.
 		return
 	}
 
-	if cfg.FindScript != "" {
+	if cfg.FindScriptSet {
 		// Find/search scripts
 		handleFindScript(cfg.FindScript)
 		return
@@ -143,12 +204,14 @@ func runDirectExecution(ctx context.Context, cfg *config.Config, conn connector.
 
 	// Execute script or SQL with interval/count support
 	count := cfg.Count
-	interval := cfg.Interval
-	if count == 0 {
-		count = 1 // Execute once by default
+	// OS commands default to running once; SQL scripts/queries can loop
+	if count == 0 && cfg.ExecuteScript != "" && !strings.HasSuffix(cfg.ExecuteScript, ".sql") {
+		count = 1
 	}
+	interval := cfg.Interval
+	infinite := count == 0
 
-	for i := 0; i < count; i++ {
+	for i := 0; infinite || i < count; i++ {
 		if i > 0 && interval > 0 {
 			time.Sleep(time.Duration(interval) * time.Second)
 		}
@@ -169,11 +232,14 @@ func runDirectExecution(ctx context.Context, cfg *config.Config, conn connector.
 			os.Exit(1)
 		}
 
-		// Display output
+		// Display output (SQL only; OS commands already printed via real-time streaming)
 		if output != "" {
-			fmt.Print(output)
-			if !strings.HasSuffix(output, "\n") {
-				fmt.Println()
+			isSQL := cfg.ExecuteSQL != "" || strings.HasSuffix(cfg.ExecuteScript, ".sql")
+			if isSQL {
+				fmt.Print(output)
+				if !strings.HasSuffix(output, "\n") {
+					fmt.Println()
+				}
 			}
 		}
 	}
@@ -228,6 +294,44 @@ func handleCopyScript(ctx context.Context, cfg *config.Config, exec *executor.Ex
 	}
 }
 
+const (
+	scriptListTypeWidth = 10
+	scriptListFileWidth = 50
+	scriptListDescWidth = 80
+)
+
+func scriptListRuleWidth() int {
+	return scriptListTypeWidth + 1 + scriptListFileWidth + 1 + scriptListDescWidth
+}
+
+func truncateScriptListText(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	if max <= 3 {
+		return s[:max]
+	}
+	return s[:max-3] + "..."
+}
+
+func printScriptListTable(results []scripts.ScriptInfo, eol string) {
+	if eol == "" {
+		eol = "\n"
+	}
+	fmt.Printf("%-*s %-*s %-*s%s",
+		scriptListTypeWidth, "TYPE",
+		scriptListFileWidth, "FILENAME",
+		scriptListDescWidth, "DESCRIPTION", eol)
+	fmt.Print(strings.Repeat("-", scriptListRuleWidth()) + eol)
+	for _, result := range results {
+		fmt.Printf("%-*s %-*s %-*s%s",
+			scriptListTypeWidth, result.Type,
+			scriptListFileWidth, truncateScriptListText(result.Filename, scriptListFileWidth),
+			scriptListDescWidth, truncateScriptListText(result.Description, scriptListDescWidth),
+			eol)
+	}
+}
+
 // handleFindScript finds and lists scripts
 func handleFindScript(pattern string) {
 	results, err := scripts.SearchScripts(pattern)
@@ -241,18 +345,7 @@ func handleFindScript(pattern string) {
 		return
 	}
 
-	// Display results in table format
-	fmt.Printf("%-10s %-30s %s\n", "TYPE", "FILENAME", "DESCRIPTION")
-	fmt.Println(strings.Repeat("-", 100))
-
-	for _, result := range results {
-		desc := result.Description
-		if len(desc) > 55 {
-			desc = desc[:52] + "..."
-		}
-		fmt.Printf("%-10s %-30s %s\n", result.Type, result.Filename, desc)
-	}
-
+	printScriptListTable(results, "\n")
 	fmt.Printf("\n%d script(s) found\n", len(results))
 }
 
@@ -282,37 +375,39 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 	// Check if stdin is a terminal
 	isTerminal := term.IsTerminal(int(os.Stdin.Fd()))
 
-	var oldState *term.State
 	if isTerminal {
 		// Setup terminal for raw input
 		var err error
-		oldState, err = term.MakeRaw(int(os.Stdin.Fd()))
+		globalOldState, err = term.MakeRaw(int(os.Stdin.Fd()))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error setting up terminal: %v\n", err)
 			os.Exit(1)
 		}
-		defer term.Restore(int(os.Stdin.Fd()), oldState)
+		defer restoreTerminal()
 	}
 
 	// Setup signal handling
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 
 	// Channel for keyboard input (only in interactive mode)
 	keyChan := make(chan byte, 10)
 	rawInputChan := make(chan byte, 100)  // Raw input from stdin
 	globalInputChan = rawInputChan         // Set global for terminal.PromptInput
 	pauseReadChan := make(chan bool, 1)   // Channel to pause/resume keyboard reading
+	stopChan := make(chan struct{})
+	globalStopChan = stopChan
 	if isTerminal {
 		// Set up coordinated input reading
 		terminal.GetGlobalInputChan = func() <-chan byte {
 			return rawInputChan
 		}
+		terminal.BeforeExit = restoreTerminal
 
 		// Start raw stdin reader (always reads)
-		go readStdin(rawInputChan)
+		go readStdin(rawInputChan, stopChan)
 		// Start keyboard processor (can be paused)
-		go processKeyboard(rawInputChan, keyChan, oldState, pauseReadChan)
+		go processKeyboard(rawInputChan, keyChan, pauseReadChan, stopChan)
 	}
 
 	// Main loop
@@ -337,6 +432,7 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 
 	// Check if we should exit after first iteration
 	if maxIterations > 0 && iteration >= maxIterations {
+		stopGoroutines()
 		return
 	}
 
@@ -358,15 +454,14 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 
 			// Check if we've reached max iterations
 			if maxIterations > 0 && iteration >= maxIterations {
+				stopGoroutines()
 				return
 			}
 
 		case <-sigChan:
 			// Restore terminal before exit
-			if isTerminal && oldState != nil {
-				term.Restore(int(os.Stdin.Fd()), oldState)
-			}
-			fmt.Println("\r\nReceived interrupt signal, exiting...")
+			restoreTerminal()
+			stopGoroutines()
 			return
 
 		case key := <-keyChan:
@@ -375,9 +470,8 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 				switch key {
 				case 'q', 'Q', 27: // q, Q, or ESC key
 					// Restore terminal before exit
-					if oldState != nil {
-						term.Restore(int(os.Stdin.Fd()), oldState)
-					}
+					restoreTerminal()
+					stopGoroutines()
 					fmt.Println("\r\nExiting...")
 					return
 				case 'a', 'A':
@@ -481,6 +575,7 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 									}
 									// Also check for Ctrl+C
 									if buf[0] == 3 {
+										restoreTerminal()
 										fmt.Println("\n\nExiting...")
 										os.Exit(0)
 									}
@@ -510,13 +605,16 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 							fmt.Fprintf(os.Stderr, "\r\n\r\nError executing command: %v\r\n\r\n", cmdErr)
 						}
 
-						// Display output if available
+						// Display output if available (SQL scripts only;
+						// OS commands already printed via real-time streaming)
 						if output != "" && !cancelled {
-							fmt.Print("\r\n")
-							// Convert \n to \r\n for raw mode
-							displayOutput := strings.ReplaceAll(output, "\n", "\r\n")
-							fmt.Print(displayOutput)
-							fmt.Print("\r\n")
+							isSQLScript := strings.HasSuffix(command, ".sql")
+							if isSQLScript {
+								fmt.Print("\r\n")
+								displayOutput := strings.ReplaceAll(output, "\n", "\r\n")
+								fmt.Print(displayOutput)
+								fmt.Print("\r\n")
+							}
 						}
 
 						if cmdErr == nil && output == "" && !cancelled {
@@ -568,16 +666,7 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 						} else if len(results) == 0 {
 							fmt.Print("No scripts found matching pattern\r\n")
 						} else {
-							// Display results in table format
-							fmt.Printf("%-10s %-30s %s\r\n", "TYPE", "FILENAME", "DESCRIPTION")
-							fmt.Print(strings.Repeat("-", 100) + "\r\n")
-							for _, info := range results {
-								desc := info.Description
-								if len(desc) > 55 {
-									desc = desc[:52] + "..."
-								}
-								fmt.Printf("%-10s %-30s %s\r\n", info.Type, info.Filename, desc)
-							}
+							printScriptListTable(results, "\r\n")
 							fmt.Printf("\r\n%d script(s) found\r\n", len(results))
 						}
 
@@ -717,7 +806,7 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					interactiveDisp.RenderInteractive(snapshot)
 				case 'h', 'H':
 					// Show help with terminal restore
-					terminal.WithTerminalRestore(oldState, func() error {
+					terminal.WithTerminalRestore(globalOldState, func() error {
 						// Clear screen and show help
 						fmt.Print("\033[2J\033[H")
 						fmt.Print(interactiveDisp.ShowHelp())
@@ -736,29 +825,49 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 	}
 }
 
-// readStdin continuously reads from stdin and sends to channel
-func readStdin(inputChan chan<- byte) {
+// readStdin continuously reads from stdin and sends to channel.
+// Stops when stopChan is closed or stdin returns an error.
+func readStdin(inputChan chan<- byte, stopChan <-chan struct{}) {
 	buf := make([]byte, 1)
 	for {
-		n, err := os.Stdin.Read(buf)
-		if err != nil {
+		select {
+		case <-stopChan:
 			return
-		}
-		if n > 0 {
-			inputChan <- buf[0]
+		default:
+			n, err := os.Stdin.Read(buf)
+			if err != nil {
+				return
+			}
+			if n > 0 {
+				select {
+				case inputChan <- buf[0]:
+				case <-stopChan:
+					return
+				}
+			}
 		}
 	}
 }
 
-// processKeyboard processes keyboard input and can be paused
-func processKeyboard(inputChan <-chan byte, keyChan chan<- byte, oldState *term.State, pauseChan <-chan bool) {
+// processKeyboard processes keyboard input and can be paused.
+// Stops when stopChan is closed.
+func processKeyboard(inputChan <-chan byte, keyChan chan<- byte, pauseChan <-chan bool, stopChan <-chan struct{}) {
 	paused := false
 
 	for {
+		// Check if we should stop
+		select {
+		case <-stopChan:
+			return
+		default:
+		}
+
 		// Check if we should pause
 		select {
 		case shouldPause := <-pauseChan:
 			paused = shouldPause
+		case <-stopChan:
+			return
 		default:
 		}
 
@@ -773,8 +882,7 @@ func processKeyboard(inputChan <-chan byte, keyChan chan<- byte, oldState *term.
 		case buf := <-inputChan:
 			// Ctrl+C - exit program
 			if buf == 3 {
-				// Restore terminal before exit
-				term.Restore(int(os.Stdin.Fd()), oldState)
+				restoreTerminal()
 				fmt.Println("\r\nExiting...")
 				os.Exit(0)
 			}
@@ -830,106 +938,15 @@ func processKeyboard(inputChan <-chan byte, keyChan chan<- byte, oldState *term.
 			}
 		case <-time.After(100 * time.Millisecond):
 			// Timeout, continue loop
-		}
-	}
-}
-
-// readKeyboard reads keyboard input in a goroutine (OLD VERSION - REPLACED)
-func readKeyboard(keyChan chan<- byte, oldState *term.State, pauseChan <-chan bool) {
-	buf := make([]byte, 1)
-	paused := false
-
-	for {
-		// Check if we should pause
-		select {
-		case shouldPause := <-pauseChan:
-			paused = shouldPause
-			if paused {
-				// Drain any pending input
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-		default:
-		}
-
-		// If paused, don't read
-		if paused {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-
-		n, err := os.Stdin.Read(buf)
-		if err != nil {
+		case <-stopChan:
 			return
-		}
-		if n > 0 {
-			// Ctrl+C - exit program
-			if buf[0] == 3 {
-				// Restore terminal before exit
-				term.Restore(int(os.Stdin.Fd()), oldState)
-				fmt.Println("\r\nExiting...")
-				os.Exit(0)
-			}
-
-			// Check if this is ESC key (potential start of escape sequence)
-			if buf[0] == 27 {
-				// Try to peek if there are more bytes coming (escape sequence)
-				extraBuf := make([]byte, 2)
-				resultChan := make(chan int, 1)
-
-				go func() {
-					n, _ := os.Stdin.Read(extraBuf)
-					resultChan <- n
-				}()
-
-				// Wait only 20ms to see if more bytes arrive
-				select {
-				case extraN := <-resultChan:
-					// Got more bytes, check if it's an arrow key
-					if extraN == 2 && extraBuf[0] == 91 {
-						// Arrow key: ESC [ A/B/C/D
-						switch extraBuf[1] {
-						case 65: // Up arrow
-							keyChan <- 200
-						case 66: // Down arrow
-							keyChan <- 201
-						case 67: // Right arrow
-							keyChan <- 202
-						case 68: // Left arrow
-							keyChan <- 203
-						}
-					} else {
-						// Not an arrow key, send ESC first
-						keyChan <- 27
-						// Then send the extra bytes we read
-						for i := 0; i < extraN; i++ {
-							keyChan <- extraBuf[i]
-						}
-					}
-				case <-time.After(20 * time.Millisecond):
-					// Timeout, it's just ESC key
-					keyChan <- 27
-					// The goroutine might still read something later
-					// We need to handle that in a non-blocking way
-					go func() {
-						// Wait for the read to complete
-						extraN := <-resultChan
-						// Send any bytes that were read
-						for i := 0; i < extraN; i++ {
-							keyChan <- extraBuf[i]
-						}
-					}()
-				}
-			} else {
-				// Regular key
-				keyChan <- buf[0]
-			}
 		}
 	}
 }
 
 // collectSnapshot collects a data snapshot
 func collectSnapshot(ctx context.Context, coll *collector.Collector, calc *calculator.Calculator) (*models.Snapshot, error) {
+	collectStart := time.Now()
 	timestamp := time.Now()
 
 	// Collect data
@@ -953,10 +970,17 @@ func collectSnapshot(ctx context.Context, coll *collector.Collector, calc *calcu
 		return nil, fmt.Errorf("failed to collect session details: %w", err)
 	}
 
+	collectDuration := time.Since(collectStart)
+
 	// Calculate deltas and rankings
 	sysStats = calc.CalculateSysStatDeltas(sysStats, timestamp)
 	systemEvents = calc.CalculateSystemEventDeltas(systemEvents)
 	sessionMetrics = calc.RankSessionMetrics(sessionMetrics, timestamp)
+
+	if collectDuration > 500*time.Millisecond {
+		fmt.Fprintf(os.Stderr, "[WARN] Snapshot collection took %.2fs (collect=%.2fs)\n",
+			time.Since(collectStart).Seconds(), collectDuration.Seconds())
+	}
 
 	// Create snapshot
 	return &models.Snapshot{

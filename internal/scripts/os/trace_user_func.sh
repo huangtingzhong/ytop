@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+# File Name: trace_user_func.sh
+# Purpose: Trace user-space functions via bpftrace
+# Created: 20260517  by  huangtingzhong
 set -euo pipefail
 
-# trace_yashandb.sh
-#
 # Event-based user-space function tracing using bpftrace uprobes.
 # Designed to resemble: strace -ff -ttt -T
 # - -ttt: timestamp (customizable; default in this script: HH:MM:SS.microseconds)

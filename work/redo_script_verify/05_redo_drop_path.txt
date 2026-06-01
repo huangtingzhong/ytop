@@ -1,0 +1,19 @@
+Enter value for : old	93:   IF LENGTH(TRIM('/tmp/no_such_redo_dir')) = 0 OR INSTR(TRIM('/tmp/no_such_redo_dir'), '&') = 1 THEN
+
+new	93:   IF LENGTH(TRIM('/tmp/no_such_redo_dir')) = 0 OR INSTR(TRIM('/tmp/no_such_redo_dir'), '') = 1 THEN
+log_mode=ARCHIVELOG, instance=1
+Mode=PATH, target=/tmp/no_such_redo_dir
+No matching redo found for target: /tmp/no_such_redo_dir
+
+PL/SQL Succeed.
+
+
+    THREAD# GROUPID       NAME                                                                  SIZE_M STATUS    TYPE        SEQUENCE# 
+----------- ------------- ---------------------------------------------------------------- ----------- --------- --------- ----------- 
+          1 4             /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_4.log               1024 INACTIVE  ONLINE            450
+          1 5             /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_5.log               1024 INACTIVE  ONLINE            451
+          1 6             /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_6.log               1024 CURRENT   ONLINE            452
+          1 7             /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_7.log               1024 INACTIVE  ONLINE            449
+
+4 rows fetched.
+

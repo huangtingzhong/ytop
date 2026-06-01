@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
+# File Name: trace_io.sh
+# Purpose: Trace per-syscall IO latency with bpftrace
+# Created: 20260517  by  huangtingzhong
 set -euo pipefail
 
-# trace_tid_io.sh
-# Trace syscall latency for a process (default: yasdb) and optionally a specific thread (TID):
+# Trace syscall latency for a process (default: yasdb) and optionally a TID:
 # pread64/pwrite64/read/write/preadv/pwritev/readv/writev
 #
 # Measurement: syscall enter -> syscall exit latency (microseconds).
@@ -32,7 +34,7 @@ MIN_US="0"
 DURATION="0"
 BPFTRACE_BUF="none"
 OPS_MODE="io"           # all | io
-IGNORE_EAGAIN="0"       # 0 | 1 (仅对 read/write 生效)
+IGNORE_EAGAIN="0"       # 0 | 1 (read/write only)
 SHOW_FD_PATH="0"        # 0|1 Append FD target (via /proc/<pid>/fd/<fd>)
 FD_PATH_INTERVAL="2"    # seconds: refresh interval for FD->PATH map (lower = more overhead)
 QUIET="1"               # 0|1 Quiet mode: hide script INFO and bpftrace Attaching/Tracing banners (default ON)
@@ -164,7 +166,7 @@ BT="/tmp/trace_io_${PID}_${TID}.bt"
 
 TIDLIST_PRED=""
 if [[ -n "$TID_LIST" && "$TID" == "0" ]]; then
-  # 构造 (tid==a || tid==b || ...)
+  # Build (tid==a || tid==b || ...)
   TIDLIST_PRED=" && ("
   IFS=',' read -r -a _tids <<<"$TID_LIST"
   for i in "${!_tids[@]}"; do
@@ -184,8 +186,8 @@ BEGIN {
 }
 
 // syscall_id: 0 pread64, 1 pwrite64, 2 read, 3 write, 4 preadv, 5 pwritev, 6 readv, 7 writev
-// __TRACE_RW__ : 1/0 是否追踪 read/write/readv/writev
-// __IGNORE_EAGAIN__ : 1/0 是否忽略 read/write ret=-11 的输出
+// __TRACE_RW__ : 1/0 trace read/write/readv/writev
+// __IGNORE_EAGAIN__ : 1/0 skip read/write lines when ret=-11
 
 tracepoint:syscalls:sys_enter_pread64  / pid==__PID__ && (__TID__==0 || tid==__TID__)__TIDLIST_PRED__ / { @ts[tid,0]=nsecs; @fd[tid,0]=args->fd; @req[tid,0]=args->count; @off[tid,0]=args->pos; }
 tracepoint:syscalls:sys_exit_pread64   / @ts[tid,0] / { $us=(nsecs-@ts[tid,0])/1000; if($us>=__MIN_US__){printf("%s.%06d %-16s %-8d %-8d %-9s %-4d %-10d %-10d %-10d %-12lld\n", strftime("%H:%M:%S", nsecs), (nsecs % 1000000000) / 1000, comm,pid,tid,"pread64",@fd[tid,0],@req[tid,0],args->ret,$us,@off[tid,0]);} delete(@ts[tid,0]); delete(@fd[tid,0]); delete(@req[tid,0]); delete(@off[tid,0]); }
@@ -212,12 +214,12 @@ tracepoint:syscalls:sys_enter_writev  / __TRACE_RW__ && pid==__PID__ && (__TID__
 tracepoint:syscalls:sys_exit_writev   / @ts[tid,7] / { $us=(nsecs-@ts[tid,7])/1000; if($us>=__MIN_US__){printf("%s.%06d %-16s %-8d %-8d %-9s %-4d %-10s %-10d %-10d %-12s\n", strftime("%H:%M:%S", nsecs), (nsecs % 1000000000) / 1000, comm,pid,tid,"writev",@fd[tid,7],"-",args->ret,$us,"-");} delete(@ts[tid,7]); delete(@fd[tid,7]); }
 
 END {
-  // 避免 timeout/中断时打印大量残留 map
+  // Avoid stale map lines on timeout/interrupt
   clear(@ts); clear(@fd); clear(@req); clear(@off);
 }
 BT
 
-# 用 sed 替换占位符，避免 shell 展开 bpftrace 的 $变量
+# sed placeholders; avoid shell expanding bpftrace $vars
 escape_sed_repl() { sed -e 's/[\\/&]/\\&/g'; }
 TIDLIST_PRED_ESCAPED="$(printf '%s' "$TIDLIST_PRED" | escape_sed_repl)"
 SHOW_BANNER="${QUIET}"
@@ -316,14 +318,14 @@ if [[ "$SHOW_FD_PATH" == "1" ]]; then
       if (p == "") p = "?"
       return p
     }
-    # info/attach/header 行原样输出；表头行追加 PATH
+    # Pass info/attach/header through; append PATH on header row
     /^\[INFO\]/ { print $0; next }
     /^Attaching/ { print $0; next }
     /^Tracing IO/ { print $0; next }
     /^TIME[[:space:]]+COMM/ { print $0, "PATH"; next }
     NF < 10 { print $0; next }
     {
-      # 默认输出列：TIME COMM PID TID OP FD REQ RET LAT(us) OFF
+      # Default columns: TIME COMM PID TID OP FD REQ RET LAT(us) OFF
       fd = $6
       print $0, get_path(fd)
     }

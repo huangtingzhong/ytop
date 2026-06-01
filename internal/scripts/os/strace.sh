@@ -1,15 +1,7 @@
 #!/usr/bin/env bash
-#===============================================================================
-# strace.sh — 数据库工程师视角的 strace 封装
-#
-# 用途：从操作系统层面对数据库相关进程做 syscall 跟踪，辅助定位
-#       网络阻塞、磁盘 IO、同步刷盘、锁/调度等待等问题。
-#
-# 默认：自动解析进程名 yasdb 的 PID；也可用 -p 指定任意进程号。
-#
-# 依赖：strace(1)、pgrep/pidof（其一即可）
-# 注意：strace 对高频 syscall 进程开销很大，生产环境请短时、小范围使用。
-#===============================================================================
+# File Name: strace.sh
+# Purpose: Wrap strace for database syscall troubleshooting
+# Created: 20260517  by  huangtingzhong
 
 # dash, or bash invoked as `sh` with posix mode (no process substitution). Re-exec with bash.
 _need_bash=
@@ -34,141 +26,201 @@ set -euo pipefail
 PROGNAME="$(basename "$0")"
 DEFAULT_COMM="yasdb"
 
-# 小写（兼容 Bash 3.x，无 ${var,,}）
+# Lowercase (Bash 3.x has no ${var,,})
 lc() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
 #-------------------------------------------------------------------------------
-# 跟踪类别：strace -e trace= 列表（逗号分隔，无空格）
-# 说明：不同内核/架构 syscall 名可能略有差异，若报 unknown syscall 可改小集合。
+# Trace categories: strace -e trace= lists (comma-separated, no spaces).
+# Syscall names may differ by kernel/arch; shrink the set if unknown syscall.
 #-------------------------------------------------------------------------------
 
-# 网络：连接与收发（TCP/UDP 常见路径）
+# Network: connect and send/recv (common TCP/UDP path)
 TRACE_NETWORK="trace=connect,accept,accept4,socket,bind,listen,shutdown,setsockopt,getsockopt,getpeername,getsockname,sendto,recvfrom,sendmsg,recvmsg,send,recv"
 
-# 文件元数据与打开关闭
+# File metadata and open/close
 TRACE_FS_META="trace=open,openat,creat,close,stat,fstat,lstat,statfs,fstatfs,access,faccessat,unlink,unlinkat,rename,renameat,chmod,fchmod,fchmodat,chown,fchown,lchown,truncate,ftruncate"
 
-# 字节级读写与偏移（数据库数据文件、日志常见）
+# Byte read/write and seek (datafiles, redo logs)
 TRACE_IO_RW="trace=read,write,readv,writev,pread64,pwrite64,preadv,pwritev,preadv2,pwritev2,lseek,llseek"
 
-# 刷盘与内存映射持久化相关
+# Flush and mmap persistence
 TRACE_SYNC="trace=fsync,fdatasync,sync_file_range,msync,sync"
 
-# 等待与同步原语（阻塞、调度、锁）
+# Wait and sync primitives (block, schedule, locks)
 TRACE_WAIT="trace=epoll_wait,epoll_pwait,poll,ppoll,select,pselect6,futex,nanosleep,clock_nanosleep,sched_yield"
 
-# 内存映射（大页/ mmap IO 路径）
+# Memory mappings (huge pages / mmap IO)
 TRACE_MEM="trace=mmap,munmap,mremap,madvise,brk,mprotect,mlock,munlock,mlockall,munlockall"
 
-# DBA 快速组合：最常见的“慢在哪里”线索
+# DBA quick mix: common "where is it slow" syscalls
 TRACE_QUICK="trace=connect,accept,accept4,sendto,recvfrom,sendmsg,recvmsg,send,recv,read,write,pread64,pwrite64,open,openat,close,fsync,fdatasync,epoll_wait,epoll_pwait,poll,futex,nanosleep,mmap,munmap"
 
-# 仅连接阶段（排查握手/超时）
+# Connect phase only (handshake / timeout)
 TRACE_CONNECT="trace=connect,socket,setsockopt,getsockopt"
 
-# 仅磁盘读写与刷盘（排查 IO 与 fsync）
+# Disk rw and flush only (IO and fsync)
 TRACE_DISK="trace=read,write,pread64,pwrite64,open,openat,close,fsync,fdatasync,sync_file_range,msync,lseek"
 
 usage() {
   cat <<EOF
-Usage: $PROGNAME [options] [-- extra strace arguments]
+================================================================================
+  $PROGNAME - database process syscall tracing (strace wrapper)
+================================================================================
 
-Requires Bash (process substitution, arrays). If you run \`sh $PROGNAME\`, the script
-re-execs with \`bash\` when the shell is not full Bash (e.g. dash, or bash in POSIX mode).
+  Trace syscalls from the OS layer to spot slow network, disk IO, fsync, locks, etc.
+  Tracing other users' processes usually needs root: sudo $PROGNAME ...
+  Stop tracing: Ctrl+C (-C prints a syscall summary after exit)
 
-Options:
-  -h              Show this help
-  -l              List trace categories and descriptions
-  -p PID          Target PID (if omitted, resolve by process name: ${DEFAULT_COMM})
-                  If several match, you are prompted on a TTY; otherwise use -p
-  -n NAME         Process name used to resolve PID (default: ${DEFAULT_COMM})
-  -c CATEGORY     Trace category (default: quick)
-  -o FILE         strace -o output prefix; with -ff, writes FILE.<pid> files
-  -f              Follow forks (strace -f)
-  -F              Same as strace -ff (one file per pid; use with -o recommended)
-  -C              Count mode: syscall summary on exit (strace -c)
-  -y              Print paths next to fds in syscall lines (strace -y); e.g. pread64(3</path>,...)
-                  Auto-on for categories: disk, io, full_io, sync, quick, io_net (unless STRACE_SH_NO_AUTO_Y=1)
-  -s SIZE         Optional strace -s (string print limit; omit for strace default)
-  -d              Dry-run: print the strace command only, do not execute
-                  Note: put -d BEFORE -- ; after -- it is passed to strace as debug -d
+Usage:
+  $PROGNAME [options...] [-- extra strace arguments]
 
-Categories (-c):
-  quick       Default mix: network + read/write + open/close + fsync + common waits + mmap
-  network     Sockets and send/recv
-  fs          open/close/stat-style metadata
-  io          Byte reads/writes and lseek
-  sync        fsync / fdatasync / msync / sync
-  wait        epoll / poll / select / futex / sleep
-  mem         mmap / brk / mprotect, etc.
-  disk        Storage-focused subset (rw + open + fsync), no network
-  connect     connect/socket only (slow connect / timeouts)
-  io_net      Disk + network without wait syscalls
-  full_io     io + fs metadata + sync (heavier disk-side set)
-  custom      Pass your own -e trace=... after --
+  Quick start (pick one):
+    sudo $PROGNAME                    # resolve ${DEFAULT_COMM}, default -c quick
+    sudo $PROGNAME -p <PID>           # explicit PID
+    sudo $PROGNAME -p <PID> -c disk   # category; see "Trace categories" below
 
-Default strace flags (non -C):
-  -ttt -T      Timestamps + per-syscall time
+  Requires Bash; if invoked via sh, re-execs as bash.
+  Category details and symptom hints: $PROGNAME -l
 
-Yasdb default:
-  If /proc/<pid>/comm is yasdb and you did not pass -f/-F, the script adds -f automatically
-  (fork/exec helpers). Opt out: STRACE_SH_NO_AUTO_FORK=1
+--------------------------------------------------------------------------------
+  Options
+--------------------------------------------------------------------------------
+  Option        Meaning                      Notes
+  ------------  ---------------------------  ----------------------------------
+  -h            Show this help               no arguments
+  -l            List trace categories        includes symptom -> category hints
+  -p PID        Target process ID            if omitted, resolve via -n; multi-instance: pick or use -p
+  -n NAME       Resolve PID by process name  default ${DEFAULT_COMM} (/proc/comm or pgrep)
+  -c CATEGORY   Trace category (syscall set) default quick; see below
+  -o FILE       Output file prefix           same as strace -o; with -F: FILE.<pid>
+  -f            Trace child processes        same as strace -f (after fork)
+  -F            One output file per PID      same as strace -ff; use with -o
+  -C            Count/summary mode           same as strace -c; summary on exit
+  -y            Show path next to fd         same as strace -y; e.g. pread64(3</data/...>,...)
+  -s SIZE       Max string print length      same as strace -s; omit for strace default
+  -d            Dry-run: print command only  must be BEFORE --; after --, -d goes to strace
 
-Fd paths in output (pread64/write/...):
-  strace -y is added automatically for disk/io/full_io/sync/quick/io_net unless STRACE_SH_NO_AUTO_Y=1.
-  Or pass -y explicitly any time.
+  Note: this script's -d is dry-run; strace's own debug -d belongs after --.
 
-Extra strace args:
-  Append at the end, or after --, e.g.:
-  $PROGNAME -p 1 -c custom -- -e trace=read,write
+--------------------------------------------------------------------------------
+  Trace categories (-c)
+--------------------------------------------------------------------------------
+  Category    What is traced                           Typical use
+  ----------  ---------------------------------------  ---------------------------
+  quick       net + rw + open/close + fsync + wait     first pass: where time goes
+  network     connect/send/recv sockets                slow connect, replication net
+  connect     connect/socket only                      handshake / connect timeout
+  disk        rw + open + fsync (no network)           datafiles, redo, flush
+  io          pread/pwrite/read/write/lseek            large IO, latency per call (-T)
+  sync        fsync/fdatasync/msync                    checkpoint / log flush stalls
+  fs          open/stat/rename metadata                many small files, paths, perms
+  wait        epoll/futex/nanosleep                    low CPU, sessions not moving
+  mem         mmap/brk/mprotect                        mappings, address space
+  io_net      disk rw + network (no wait syscalls)     IO and net together, less wait noise
+  full_io     io + metadata + sync (heavier disk set)  deep disk-side investigation
+  custom      none; pass -e trace=... after --         only a few syscalls
 
-Examples:
-  # Default: resolve ${DEFAULT_COMM}, category quick
+--------------------------------------------------------------------------------
+  Defaults (when not overridden)
+--------------------------------------------------------------------------------
+  - strace flags: -ttt -T (timestamps + per-syscall time); with -C: -c
+  - target comm is yasdb and no -f/-F: auto -f (follow forked children)
+  - -c in disk/io/full_io/sync/quick/io_net: auto -y (fd paths in lines)
+  - disable auto behavior: see "Environment variables" below
+
+--------------------------------------------------------------------------------
+  Environment variables
+--------------------------------------------------------------------------------
+  STRACE_SH_NO_AUTO_FORK=1   do not auto-add -f for yasdb
+  STRACE_SH_NO_AUTO_Y=1      do not auto-add -y for disk-related categories
+
+--------------------------------------------------------------------------------
+  Extra strace arguments
+--------------------------------------------------------------------------------
+  Append at end of command, or after -- (custom category needs -e after --):
+
+    $PROGNAME -p <PID> -c custom -- -e trace=read,write
+    $PROGNAME -p <PID> -c network -d          # -d before --: this script dry-run
+    $PROGNAME -p <PID> -c custom -- -d        # -d after --: strace debug option
+
+--------------------------------------------------------------------------------
+  Common examples
+--------------------------------------------------------------------------------
+  # 1) Default: resolve ${DEFAULT_COMM}, quick category (usual entry point)
   sudo $PROGNAME
 
-  # Fixed PID, network only
+  # 2) Multiple instances: confirm PID with ps; non-TTY requires -p
+  sudo $PROGNAME -p 6326
+
+  # 3) Slow client connect / listen timeout -> network or connect only
   sudo $PROGNAME -p 6326 -c network
+  sudo $PROGNAME -p 6326 -c connect
 
-  # Different comm name, log to file, follow children
-  sudo $PROGNAME -n yashandb -c quick -o /tmp/yashandb.strace -f
+  # 4) Slow SQL and busy disk -> rw and flush (-T is per-syscall time)
+  sudo $PROGNAME -p 6326 -c disk
+  sudo $PROGNAME -p 6326 -c sync
 
-  # Count mode (Ctrl+C to stop and print summary)
+  # 5) Many sessions, low throughput, low CPU -> locks / epoll / sleep
+  sudo $PROGNAME -p 6326 -c wait
+
+  # 6) Count mode: Ctrl+C then see which syscalls dominate
   sudo $PROGNAME -p 6326 -C -c quick
 
-  # Dry-run (keep -d before --)
-  $PROGNAME -p 1 -c network -d
+  # 7) Long capture: file output + one file per child (yasdb -f case)
+  sudo $PROGNAME -p 6326 -c quick -o /tmp/yasdb.strace -F
 
-  # custom: this script's flags first, strace flags after --
-  $PROGNAME -p 1 -d -c custom -- -e trace=read,write
+  # 8) Process name other than ${DEFAULT_COMM}
+  sudo $PROGNAME -n yashandb -p 12345 -c quick
+
+  # 9) Preview the strace command before running (use -d before --)
+  $PROGNAME -p 6326 -c network -d
+
+  # 10) Custom syscall list: read/write only
+  sudo $PROGNAME -p 6326 -c custom -- -e trace=read,write,pread64,pwrite64
+
+  # 11) Disable auto -f for yasdb (no fork children, less overhead)
+  STRACE_SH_NO_AUTO_FORK=1 sudo $PROGNAME -p 6326 -c quick
+
+  # 12) Replication: network + standby disk writes together
+  sudo $PROGNAME -p 6326 -c io_net
+
+Production: keep runs short and narrow; strace is expensive on busy processes.
 EOF
 }
 
 list_categories() {
   cat <<EOF
-=== Trace categories (DBA / OS troubleshooting) ===
+================================================================================
+  Trace categories ($PROGNAME -l)
+================================================================================
 
-  quick       First choice: network + datafile rw + open/close + fsync + common blocks + mmap
-  network     Connect/send/recv latency, unreachable peer (use -T per call)
-  fs          Many small files, bad paths, permissions, churning open/close
-  io          Large read/write, pwrite ordering and latency
-  sync        Heavy flush: fsync/fdatasync time, checkpoint-like hints
-  wait        Low CPU but "stuck": locks, epoll, sleep
-  mem         mmap growth / address space
-  disk        Storage side: rw + open + fsync, no network syscalls
-  connect     Connection establishment only
-  io_net      Disk + network without wait syscalls (less noise)
-  full_io     Broader disk side: io + metadata + sync
-  custom      Add -e 'trace=...' etc. after --
+  Category    What is traced                           Typical use
+  ----------  ---------------------------------------  -------------------------
+  quick       net + datafile rw + open/close + fsync   first pass: find bottleneck
+  network     connect/send/recv                        slow link, peer unreachable
+  connect     connect/socket only                      connect/handshake phase
+  disk        rw + open + fsync (no network syscalls)  datafiles, archive logs
+  io          pread/pwrite/read/write/lseek            large IO; per-call -T time
+  sync        fsync/fdatasync/msync                    flush, checkpoint stalls
+  fs          open/stat/rename                         many small files, bad paths
+  wait        epoll/futex/nanosleep                    low CPU, sessions stuck
+  mem         mmap/brk/mprotect                        mapping growth, shared mem
+  io_net      disk rw + network (no wait)              replication/backup IO+net
+  full_io     io + metadata + sync (widest disk set)     deep disk-side (heavier)
+  custom      append: -- -e trace=...                  your own syscall list
 
-=== Rough mapping to common DB symptoms (heuristic) ===
+--------------------------------------------------------------------------------
+  Symptom -> suggested category (heuristic, not absolute)
+--------------------------------------------------------------------------------
+  Slow connect / timeout / listen hang     connect  or  network
+  Slow SQL and busy disk (iostat)          disk     or  sync   or  quick
+  Many sessions, low throughput, low CPU   wait     (add io if needed)
+  Replication / backup network issues      network  or  io_net
+  Not sure where to start                  quick    (default)
 
-  Slow connect / timeout     -> connect or network
-  Slow queries + disk busy   -> disk / sync / quick
-  Many sessions, low tput    -> wait + io (long futex/epoll_wait?)
-  Replication/backup net     -> network + io if needed
-
+Examples: $PROGNAME -h
 EOF
 }
 
@@ -183,20 +235,20 @@ list_pids_by_name() {
   fi
 
   if [[ ${#pids[@]} -eq 0 ]] && command -v pgrep >/dev/null 2>&1; then
-    # 精确匹配进程名（comm）
+    # Exact comm match
     while IFS= read -r line; do
       [[ -n "$line" ]] && pids+=("$line")
     done < <(pgrep -x "$name" 2>/dev/null || true)
   fi
 
   if [[ ${#pids[@]} -eq 0 ]] && command -v pgrep >/dev/null 2>&1; then
-    # 宽松：命令行包含 name（注意可能误匹配，仅作兜底）
+    # Loose: cmdline contains name (may false-match; fallback only)
     while IFS= read -r line; do
       [[ -n "$line" ]] && pids+=("$line")
     done < <(pgrep -f "$name" 2>/dev/null | head -20 || true)
   fi
 
-  # 去重
+  # Deduplicate PIDs
   if [[ ${#pids[@]} -gt 0 ]]; then
     printf '%s\n' "${pids[@]}" | sort -u -n
   fi
@@ -281,7 +333,7 @@ pick_trace_expr() {
   esac
 }
 
-# full_io: 合并 trace= 三段
+# full_io: merge three trace= groups
 build_full_io() {
   printf '%s %s\n' "-e" "trace=read,write,readv,writev,pread64,pwrite64,preadv,pwritev,preadv2,pwritev2,lseek,llseek,open,openat,creat,close,stat,fstat,lstat,statfs,fstatfs,access,faccessat,unlink,unlinkat,rename,renameat,chmod,fchmod,fchmodat,chown,fchown,lchown,truncate,ftruncate,fsync,fdatasync,sync_file_range,msync,sync"
 }

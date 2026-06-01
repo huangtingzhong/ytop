@@ -1,19 +1,8 @@
 #!/usr/bin/env bash
+# File Name: perf_flamegraph.sh
+# Purpose: Record perf samples and FlameGraph SVG
+# Created: 20260517  by  huangtingzhong
 set -euo pipefail
-
-# Usage:
-#   ./perf_flamegraph.sh -p <pid> -s <seconds>
-#   ./perf_flamegraph.sh -p yashan -s <seconds>  # auto-detect yasdb PID by keyword: "yasdb open"
-#   ./perf_flamegraph.sh -d <base_dir_or_flamegraph_dir> -p <pid|yashan|all> -s <seconds>
-#   ./perf_flamegraph.sh -t <tid> -s <seconds>   # record a single thread (TID)
-#   ./perf_flamegraph.sh -f <perf.data> [-d <base_dir_or_flamegraph_dir>]   # analyze existing perf.data
-#   ./perf_flamegraph.sh -s <seconds>            # default: -p yashan
-#   ./perf_flamegraph.sh --help
-#
-# Directory policy:
-# - If /data/yashan exists: use /data/yashan/FlameGraph as the FlameGraph root
-# - Otherwise: fallback to /FlameGraph
-# - Output goes to <FlameGraph root>/perf_data
 
 DEFAULT_SLEEP=10
 
@@ -127,20 +116,20 @@ else
   fi
 fi
 
-# 兼容常见目录结构：有的人会把仓库放在 FlameGraph-master 子目录
+# Support FlameGraph-master subdirectory layout
 if [[ -f "${FLAMEGRAPH_ROOT}/flamegraph.pl" ]]; then
   FLAMEGRAPH_DIR="${FLAMEGRAPH_ROOT}"
 elif [[ -f "${FLAMEGRAPH_ROOT}/FlameGraph-master/flamegraph.pl" ]]; then
   FLAMEGRAPH_DIR="${FLAMEGRAPH_ROOT}/FlameGraph-master"
 else
-  # 兜底：即便不存在，也把“期望目录”设置好，便于打印分析命令
+  # Fallback path for error messages when tools are missing
   FLAMEGRAPH_DIR="${FLAMEGRAPH_ROOT}"
 fi
 
 OUTPUT_DIR="${FLAMEGRAPH_ROOT}/perf_data"
 mkdir -p "${OUTPUT_DIR}"
 
-# 生成带主机名和时间戳的文件名前缀（两种模式共用）
+# Output file prefix with hostname and timestamp
 HOSTNAME="$(hostname)"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 FILE_PREFIX="perf_${HOSTNAME}_${TIMESTAMP}"
@@ -240,7 +229,7 @@ if [[ -n "${PERF_DATA_FILE}" ]]; then
 
   # Put analysis outputs alongside the provided perf.data to avoid confusion.
   PERF_DATA_DIR="$(cd "$(dirname "${PERF_DATA}")" && pwd)"
-  # 使用已定义的主机名和时间戳前缀
+  # Reuse hostname/timestamp prefix for analysis outputs
   PERF_UNFOLDED="${PERF_DATA_DIR}/${FILE_PREFIX}.unfolded"
   PERF_FOLDED="${PERF_DATA_DIR}/${FILE_PREFIX}.folded"
   PERF_SVG="${PERF_DATA_DIR}/${FILE_PREFIX}.svg"

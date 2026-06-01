@@ -12,6 +12,9 @@ import (
 // GetGlobalInputChan is set by main to provide coordinated stdin access
 var GetGlobalInputChan func() <-chan byte
 
+// BeforeExit is called before os.Exit to restore terminal state
+var BeforeExit func()
+
 // WithTerminalRestore executes a function with terminal restored to normal mode
 func WithTerminalRestore(oldState *term.State, fn func() error) error {
 	// Restore terminal
@@ -74,6 +77,9 @@ func PromptInput(prompt string, maxLen int) string {
 
 		// Ctrl+C - exit program
 		if b == 3 {
+			if BeforeExit != nil {
+				BeforeExit()
+			}
 			fmt.Print("\r\n")
 			os.Exit(0)
 		}
@@ -119,6 +125,9 @@ func promptInputNormal(maxLen int) string {
 
 		// Ctrl+C - exit program
 		if b[0] == 3 {
+			if BeforeExit != nil {
+				BeforeExit()
+			}
 			fmt.Println()
 			os.Exit(0)
 		}
@@ -177,6 +186,9 @@ func WaitForKey(message string) bool {
 
 	// Ctrl+C - exit program
 	if b[0] == 3 {
+		if BeforeExit != nil {
+			BeforeExit()
+		}
 		fmt.Print("\r\n")
 		os.Exit(0)
 	}

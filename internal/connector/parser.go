@@ -10,6 +10,18 @@ import (
 // yashanErrorPattern matches YashanDB error codes like YAS-04209
 var yashanErrorPattern = regexp.MustCompile(`YAS-\d{5}`)
 
+// stripSttyWarnings removes stty warnings from shell profile output
+func stripSttyWarnings(output string) string {
+	var lines []string
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "stty:") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
 // checkYashanError checks if output contains YashanDB error codes
 func checkYashanError(output string) error {
 	if yashanErrorPattern.MatchString(output) {
@@ -32,6 +44,7 @@ func checkYashanError(output string) error {
 // parseYasqlOutput parses yasql output into rows
 // YashanDB yasql outputs data in fixed-width columns with headers
 func parseYasqlOutput(output string) ([][]string, error) {
+	output = stripSttyWarnings(output)
 	// Check for YashanDB errors first
 	if err := checkYashanError(output); err != nil {
 		return nil, err
@@ -129,6 +142,7 @@ func parseFixedWidthLine(line, separator string) []string {
 // ParseYasqlOutputWithHeader parses yasql output and returns header + data rows
 // This is similar to parseYasqlOutput but also returns the header row
 func ParseYasqlOutputWithHeader(output string) (header []string, rows [][]string, err error) {
+	output = stripSttyWarnings(output)
 	// Check for YashanDB errors first
 	if err := checkYashanError(output); err != nil {
 		return nil, nil, err

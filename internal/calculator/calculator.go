@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/yihan/ytop/internal/config"
+	"github.com/yihan/ytop/internal/logger"
 	"github.com/yihan/ytop/internal/models"
 )
 
@@ -31,22 +32,26 @@ func NewCalculator(cfg *config.Config) *Calculator {
 // CalculateSysStatDeltas calculates per-second deltas for sysstat metrics
 func (c *Calculator) CalculateSysStatDeltas(metrics []models.SysStatMetric, timestamp time.Time) []models.SysStatMetric {
 	if c.prevTimestamp.IsZero() {
-		// First run, just store current values
 		for _, m := range metrics {
 			key := fmt.Sprintf("%d-%s", m.InstID, m.Name)
 			c.prevSysStats[key] = m.CurrentValue
 		}
 		c.prevTimestamp = timestamp
+		if c.cfg.DebugMode {
+			logger.Debug("[calculator] SysStats first run: stored %d baseline values\n", len(metrics))
+		}
 		return metrics
 	}
 
-	// Calculate time difference in seconds
 	timeDiff := timestamp.Sub(c.prevTimestamp).Seconds()
 	if timeDiff <= 0 {
 		timeDiff = 1
 	}
 
-	// Calculate deltas
+	if c.cfg.DebugMode {
+		logger.Debug("[calculator] SysStats delta: timeDiff=%.2fs, metrics=%d\n", timeDiff, len(metrics))
+	}
+
 	result := make([]models.SysStatMetric, len(metrics))
 	for i, m := range metrics {
 		result[i] = m
@@ -54,27 +59,30 @@ func (c *Calculator) CalculateSysStatDeltas(metrics []models.SysStatMetric, time
 		if prevValue, exists := c.prevSysStats[key]; exists {
 			delta := m.CurrentValue - prevValue
 			result[i].DeltaPerSec = delta / timeDiff
+			if c.cfg.DebugMode {
+				logger.Debug("[calculator]   %s: prev=%.2f cur=%.2f delta/s=%.4f\n", m.Name, prevValue, m.CurrentValue, result[i].DeltaPerSec)
+			}
 		}
 		c.prevSysStats[key] = m.CurrentValue
 	}
 
 	c.prevTimestamp = timestamp
-
 	return result
 }
 
 // CalculateSystemEventDeltas calculates deltas for system events
 func (c *Calculator) CalculateSystemEventDeltas(events []models.SystemEvent) []models.SystemEvent {
 	if len(c.prevSystemEvents) == 0 {
-		// First run, just store current values and return empty result
 		for _, e := range events {
 			key := fmt.Sprintf("%d-%s", e.InstID, e.EventName)
 			c.prevSystemEvents[key] = e
 		}
+		if c.cfg.DebugMode {
+			logger.Debug("[calculator] SystemEvents first run: stored %d baseline events\n", len(events))
+		}
 		return []models.SystemEvent{}
 	}
 
-	// Calculate deltas
 	result := make([]models.SystemEvent, 0, len(events))
 	var totalTime float64
 
@@ -98,21 +106,25 @@ func (c *Calculator) CalculateSystemEventDeltas(events []models.SystemEvent) []m
 		c.prevSystemEvents[key] = e
 	}
 
-	// Calculate percentages
 	for i := range result {
 		if totalTime > 0 {
 			result[i].Percentage = (result[i].TimeWaited / totalTime) * 100
 		}
 	}
 
-	// Sort by time waited descending
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].TimeWaited > result[j].TimeWaited
 	})
 
-	// Take top N
 	if len(result) > c.cfg.EventTopN {
 		result = result[:c.cfg.EventTopN]
+	}
+
+	if c.cfg.DebugMode {
+		logger.Debug("[calculator] SystemEvents: %d active events (top %d), totalTime=%.4f\n", len(result), c.cfg.EventTopN, totalTime)
+		for i, e := range result {
+			logger.Debug("[calculator]   #%d %s: waits=%d time=%.4f avg=%.6f pct=%.1f%%\n", i+1, e.EventName, e.TotalWaits, e.TimeWaited, e.AvgWaitTime, e.Percentage)
+		}
 	}
 
 	return result
@@ -149,7 +161,7 @@ func (c *Calculator) RankSessionMetrics(metrics []models.SessionMetric, timestam
 							deltaMetrics[metricName] = 0
 						}
 					} else {
-						deltaMetrics[metricName] = currentValue / timeDiff
+						deltaMetrics[metricName] = 0
 					}
 				}
 
@@ -195,19 +207,28 @@ func (c *Calculator) RankSessionMetrics(metrics []models.SessionMetric, timestam
 
 	// First iteration, return empty result (don't show cumulative values)
 	if len(result) == 0 {
+		if c.cfg.DebugMode {
+			logger.Debug("[calculator] SessionMetrics: first iteration, no delta yet\n")
+		}
 		return result
 	}
 
-	// Sort by the specified metric
 	sort.Slice(result, func(i, j int) bool {
 		valI := result[i].Metrics[c.cfg.SessionSortBy]
 		valJ := result[j].Metrics[c.cfg.SessionSortBy]
 		return valI > valJ
 	})
 
-	// Take top N
 	if len(result) > c.cfg.SessionTopN {
 		result = result[:c.cfg.SessionTopN]
+	}
+
+	if c.cfg.DebugMode {
+		logger.Debug("[calculator] SessionMetrics: %d sessions (top %d), sortBy=%s\n", len(result), c.cfg.SessionTopN, c.cfg.SessionSortBy)
+		for i, m := range result {
+			sortVal := m.Metrics[c.cfg.SessionSortBy]
+			logger.Debug("[calculator]   #%d %s user=%s sortVal=%.4f\n", i+1, m.SidTid, m.Username, sortVal)
+		}
 	}
 
 	return result

@@ -1,0 +1,7 @@
+
+HOST_NAME       DATABASE_NAME   LOG_MODE   OPEN_MODE  STATUS          FLASHBACK_ON DATABASE_ROLE     PROTECTION_MODE      PROTECTION_LEVEL     SWITCHOVER_STATUS    
+--------------- --------------- ---------- ---------- --------------- ------------ ----------------- -------------------- -------------------- -------------------- 
+yashandb        yashandb        ARCHIVELOG READ_WRITE NORMAL          NO           PRIMARY           MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE  TO STANDBY          
+
+1 row fetched.
+

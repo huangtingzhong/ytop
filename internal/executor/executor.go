@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -62,20 +61,22 @@ func (e *Executor) executeSQLScript(ctx context.Context, scriptName string) (str
 		logger.Debug("Loaded script content:\n%s\n", scriptContent)
 	}
 
-	// Find all variables (&var or &&var)
-	variables := e.findVariables(scriptContent)
-
-	// Prompt for variable values
-	varMap := make(map[string]string)
-	for _, variable := range variables {
-		// Display variable with its prefix; Enter without typing = empty value (replace with "")
-		value := terminal.PromptInput(fmt.Sprintf("\r\nEnter value for %s: ", variable), 256)
-		varMap[variable] = value
-	}
-
-	// Replace variables with precise matching
-	for variable, value := range varMap {
-		scriptContent = e.replaceVariable(scriptContent, variable, value)
+	// Oracle sqlplus natively handles &var substitution with interactive prompts.
+	// All other DB types: ytop handles variable substitution (no terminal or CLI doesn't support &var).
+	skipVarSub := e.cfg.DBType == "oracle"
+	if !skipVarSub {
+		variables := e.findVariables(scriptContent)
+		varMap := make(map[string]string)
+		for _, variable := range variables {
+			value := terminal.PromptInput(fmt.Sprintf("\r\nEnter value for %s: ", variable), 256)
+			if e.cfg.DBType == "yashandb" {
+				value = escapeYasqlSubstValue(value)
+			}
+			varMap[variable] = value
+		}
+		for variable, value := range varMap {
+			scriptContent = e.replaceVariable(scriptContent, variable, value)
+		}
 	}
 
 	// Execute based on connection mode
@@ -105,17 +106,34 @@ func (e *Executor) executeSQLViaSSHUpload(ctx context.Context, scriptContent, sc
 		}
 	}()
 
+	scriptForExec := connector.WrapSQLSuppressScriptEcho(e.cfg.DBType, scriptContent)
+	scriptForExec = connector.EnsureSQLStatementTerminator(scriptForExec, e.cfg.DBType)
+
 	// Write script to remote host
-	uploadCmd := fmt.Sprintf("cat > %s << 'YASTOP_EOF'\n%s\nexit\nYASTOP_EOF", tmpFile, scriptContent)
+	delim := randomHeredocMarker("YASTOP")
+	uploadCmd := fmt.Sprintf("cat > %s << '%s'\n%s\nexit\n%s", tmpFile, delim, scriptForExec, delim)
 	if _, err := sshConn.ExecuteCommand(ctx, uploadCmd); err != nil {
 		return "", fmt.Errorf("failed to upload script: %w", err)
 	}
 
-	// Execute script with -S flag to suppress connection info
-	execCmd := fmt.Sprintf("%s -S %s @%s", e.cfg.YasqlPath, e.cfg.ConnectString, tmpFile)
-	if e.cfg.SourceCmd != "" {
-		execCmd = e.cfg.SourceCmd + " && " + execCmd
+	// Execute script
+	var execCmd string
+	if e.cfg.LoginCmd != "" {
+		delim := randomHeredocMarker("YTOP_SQL")
+		execCmd = fmt.Sprintf("%s <<'%s'\n%s\nexit\n%s", e.cfg.LoginCmd, delim, scriptForExec, delim)
+	} else {
+		cli := e.cfg.DefaultCLI()
+		switch e.cfg.DBType {
+		case "mysql":
+			execCmd = fmt.Sprintf("%s %s < %s", cli, e.cfg.ConnectString, tmpFile)
+		case "postgresql":
+			execCmd = fmt.Sprintf("%s %s -f %s", cli, e.cfg.ConnectString, tmpFile)
+		default:
+			// yasql, sqlplus, disql: @file syntax
+			execCmd = fmt.Sprintf("%s -S %s @%s", cli, e.cfg.ConnectString, tmpFile)
+		}
 	}
+	execCmd = sshConn.WrapCmd(execCmd)
 
 	if e.cfg.DebugMode {
 		logger.Debug("Executing SQL script via SSH: %s\n", execCmd)
@@ -130,8 +148,10 @@ func (e *Executor) executeSQLDirect(ctx context.Context, scriptContent string) (
 	// Create temporary script file
 	tmpFile := fmt.Sprintf("/tmp/ytop_%d.sql", os.Getpid())
 
-	// Write script content to temp file
-	if err := os.WriteFile(tmpFile, []byte(scriptContent), 0644); err != nil {
+	// Write script content to temp file (suppress CLI echo of script text for Oracle-style tools)
+	scriptForExec := connector.WrapSQLSuppressScriptEcho(e.cfg.DBType, scriptContent)
+	scriptForExec = connector.EnsureSQLStatementTerminator(scriptForExec, e.cfg.DBType)
+	if err := os.WriteFile(tmpFile, []byte(scriptForExec), 0644); err != nil {
 		return "", fmt.Errorf("failed to write temp script: %w", err)
 	}
 
@@ -142,21 +162,16 @@ func (e *Executor) executeSQLDirect(ctx context.Context, scriptContent string) (
 		}
 	}()
 
-	// Build yasql command with @file
-	args := []string{"-S"}
-	if e.cfg.ConnectString != "" {
-		args = append(args, e.cfg.ConnectString)
-	}
-	args = append(args, "@"+tmpFile)
+	// Build command with @file
+	cmd := connector.BuildLocalSQLExecCmd(ctx, e.cfg, scriptForExec, tmpFile)
 
 	if e.cfg.DebugMode {
-		logger.Debug("Executing SQL script locally: %s %v\n", e.cfg.YasqlPath, args)
+		logger.Debug("Executing SQL script locally: %v\n", cmd.Args)
 	}
 
-	cmd := exec.CommandContext(ctx, e.cfg.YasqlPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return string(output), fmt.Errorf("yasql execution failed: %w", err)
+		return string(output), fmt.Errorf("SQL script execution failed: %w", err)
 	}
 
 	return string(output), nil
@@ -222,16 +237,13 @@ func (e *Executor) executeOSCommandViaSSH(ctx context.Context, command string) (
 		return "", fmt.Errorf("not an SSH connection")
 	}
 
-	if e.cfg.SourceCmd != "" {
-		command = e.cfg.SourceCmd + " && " + command
-	}
-
+	command = sshConn.WrapCmd(command)
 	return sshConn.ExecuteCommandRealtime(ctx, command)
 }
 
 // executeOSCommandLocal executes OS command locally with real-time output
 func (e *Executor) executeOSCommandLocal(ctx context.Context, command string) (string, error) {
-	cmd := exec.CommandContext(ctx, "bash", "-c", command)
+	cmd := connector.BuildLocalOSExecCmd(ctx, e.cfg, command)
 
 	// Set process group ID so we can kill the entire process tree (platform-specific)
 	setProcAttributes(cmd)
@@ -256,99 +268,77 @@ func (e *Executor) executeOSCommandLocal(ctx context.Context, command string) (s
 	var outputBuffer strings.Builder
 	var bufferMutex sync.Mutex
 
-	// Channel to signal completion
-	done := make(chan bool, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	// Track if context was cancelled
-	ctxDone := make(chan struct{})
+	// Context cancellation: kill process to unblock Wait() and Read()
 	go func() {
 		<-ctx.Done()
-		close(ctxDone)
-		// Kill the entire process group when context is cancelled (platform-specific)
 		killProcessGroup(cmd)
 	}()
 
 	// Read stdout in real-time byte by byte for immediate display
 	go func() {
+		defer wg.Done()
 		buf := make([]byte, 1)
 		for {
-			select {
-			case <-ctxDone:
-				// Context cancelled, stop reading
-				done <- true
+			n, err := stdout.Read(buf)
+			if n > 0 {
+				if buf[0] == '\n' {
+					os.Stdout.Write([]byte("\r\n"))
+					bufferMutex.Lock()
+					outputBuffer.WriteByte('\n')
+					bufferMutex.Unlock()
+				} else {
+					os.Stdout.Write(buf[:n])
+					bufferMutex.Lock()
+					outputBuffer.Write(buf[:n])
+					bufferMutex.Unlock()
+				}
+			}
+			if err != nil {
 				return
-			default:
-				n, err := stdout.Read(buf)
-				if n > 0 {
-					// In raw mode, convert \n to \r\n for proper line breaks
-					if buf[0] == '\n' {
-						os.Stdout.Write([]byte("\r\n"))
-						bufferMutex.Lock()
-						outputBuffer.WriteByte('\n')
-						bufferMutex.Unlock()
-					} else {
-						// Regular character (including \r)
-						os.Stdout.Write(buf[:n])
-						bufferMutex.Lock()
-						outputBuffer.Write(buf[:n])
-						bufferMutex.Unlock()
-					}
-				}
-				if err != nil {
-					done <- true
-					return
-				}
 			}
 		}
 	}()
 
 	// Read stderr in real-time byte by byte for immediate display
 	go func() {
+		defer wg.Done()
 		buf := make([]byte, 1)
 		for {
-			select {
-			case <-ctxDone:
-				// Context cancelled, stop reading
-				done <- true
+			n, err := stderr.Read(buf)
+			if n > 0 {
+				if buf[0] == '\n' {
+					os.Stderr.Write([]byte("\r\n"))
+					bufferMutex.Lock()
+					outputBuffer.WriteByte('\n')
+					bufferMutex.Unlock()
+				} else {
+					os.Stderr.Write(buf[:n])
+					bufferMutex.Lock()
+					outputBuffer.Write(buf[:n])
+					bufferMutex.Unlock()
+				}
+			}
+			if err != nil {
 				return
-			default:
-				n, err := stderr.Read(buf)
-				if n > 0 {
-					// In raw mode, convert \n to \r\n for proper line breaks
-					if buf[0] == '\n' {
-						os.Stderr.Write([]byte("\r\n"))
-						bufferMutex.Lock()
-						outputBuffer.WriteByte('\n')
-						bufferMutex.Unlock()
-					} else {
-						// Regular character (including \r)
-						os.Stderr.Write(buf[:n])
-						bufferMutex.Lock()
-						outputBuffer.Write(buf[:n])
-						bufferMutex.Unlock()
-					}
-				}
-				if err != nil {
-					done <- true
-					return
-				}
 			}
 		}
 	}()
 
-	// Wait for both goroutines to finish
-	<-done
-	<-done
+	// Wait for command to complete (unblocked by command exit or context cancel)
+	waitErr := cmd.Wait()
 
-	// Wait for command to complete
-	err = cmd.Wait()
+	// Wait for readers to drain remaining buffered data
+	wg.Wait()
 
 	if ctx.Err() == context.Canceled {
-		return outputBuffer.String(), nil // Context cancelled, not an error
+		return outputBuffer.String(), nil
 	}
 
-	if err != nil {
-		return outputBuffer.String(), fmt.Errorf("command failed: %w", err)
+	if waitErr != nil {
+		return outputBuffer.String(), fmt.Errorf("command failed: %w", waitErr)
 	}
 
 	return outputBuffer.String(), nil
@@ -403,48 +393,82 @@ func (e *Executor) executeAdHocSQLViaSSH(ctx context.Context, sql string) (strin
 		return "", fmt.Errorf("not an SSH connection")
 	}
 
-	// Build yasql command with -c flag
-	// Use ShellEscape to properly escape the SQL statement
-	yasqlCmd := fmt.Sprintf("%s -S %s -c %s",
-		e.cfg.YasqlPath,
-		utils.ShellEscape(e.cfg.ConnectString),
-		utils.ShellEscape(sql))
+	sqlExec := connector.WrapSQLSuppressScriptEcho(e.cfg.DBType, sql)
+	sqlExec = connector.EnsureSQLStatementTerminator(sqlExec, e.cfg.DBType)
 
-	if e.cfg.SourceCmd != "" {
-		yasqlCmd = e.cfg.SourceCmd + " && " + yasqlCmd
+	// If user provided a custom login command, run it via heredoc (same idea as -f path)
+	if e.cfg.LoginCmd != "" {
+		delim := randomHeredocMarker("YTOP_SQL")
+		cmd := fmt.Sprintf("%s <<'%s'\n%s\nexit\n%s", e.cfg.LoginCmd, delim, sqlExec, delim)
+		cmd = sshConn.WrapCmd(cmd)
+		if e.cfg.DebugMode {
+			logger.Debug("Executing ad-hoc SQL via SSH (login-cmd): %s\n", cmd)
+		}
+		return sshConn.ExecuteCommand(ctx, cmd)
 	}
+
+	cli := e.cfg.DefaultCLI()
+	var remoteCmd string
+	switch e.cfg.DBType {
+	case "mysql":
+		// mysql: pass SQL with -e
+		remoteCmd = fmt.Sprintf("%s %s -e %s",
+			cli,
+			e.cfg.ConnectString,
+			utils.ShellEscape(sqlExec))
+	case "postgresql":
+		// psql: pass SQL with -c
+		remoteCmd = fmt.Sprintf("%s %s -c %s",
+			cli,
+			e.cfg.ConnectString,
+			utils.ShellEscape(sqlExec))
+	default:
+		// yasql/sqlplus/disql: feed SQL via stdin so all CLIs behave consistently
+		delim := randomHeredocMarker("YTOP_SQL")
+		remoteCmd = fmt.Sprintf("%s -S %s <<'%s'\n%s\nexit\n%s",
+			cli,
+			e.cfg.ConnectString,
+			delim,
+			sqlExec,
+			delim)
+	}
+
+	remoteCmd = sshConn.WrapCmd(remoteCmd)
 
 	if e.cfg.DebugMode {
-		logger.Debug("Executing ad-hoc SQL via SSH: %s\n", yasqlCmd)
+		logger.Debug("Executing ad-hoc SQL via SSH: %s\n", remoteCmd)
 	}
 
-	return sshConn.ExecuteCommand(ctx, yasqlCmd)
+	return sshConn.ExecuteCommand(ctx, remoteCmd)
 }
 
 // executeAdHocSQLLocal executes ad-hoc SQL locally
 func (e *Executor) executeAdHocSQLLocal(ctx context.Context, sql string) (string, error) {
-	// Build yasql command with -c flag
-	args := []string{"-S"}
+	sqlExec := connector.WrapSQLSuppressScriptEcho(e.cfg.DBType, sql)
+	sqlExec = connector.EnsureSQLStatementTerminator(sqlExec, e.cfg.DBType)
 
-	// Add connection string
-	if e.cfg.ConnectString != "" {
-		args = append(args, e.cfg.ConnectString)
-	}
-
-	// Add -c flag with SQL statement
-	args = append(args, "-c", sql)
-
+	cmd := connector.BuildLocalSQLExecCmd(ctx, e.cfg, sqlExec, "")
 	if e.cfg.DebugMode {
-		logger.Debug("Executing ad-hoc SQL locally: %s %v\n", e.cfg.YasqlPath, args)
+		logger.Debug("Executing ad-hoc SQL locally: %v\n", cmd.Args)
 	}
-
-	cmd := exec.CommandContext(ctx, e.cfg.YasqlPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return string(output), fmt.Errorf("yasql execution failed: %w", err)
+		return string(output), fmt.Errorf("SQL execution failed: %w", err)
 	}
-
 	return string(output), nil
+}
+
+// yasqlDollarVar matches yasql $identifier substitution (e.g. $session in v$session).
+var yasqlDollarVar = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*)`)
+
+// escapeYasqlSubstValue rewrites $ident to #ident in user &var values before yasql runs.
+// yasql scans the script for $name; \$ is invalid (YAS-04102). Scripts such as print_table.sql
+// map # back to $ via REPLACE(..., '#', CHR(36)) inside PL/SQL.
+func escapeYasqlSubstValue(value string) string {
+	if value == "" || !strings.Contains(value, "$") {
+		return value
+	}
+	return yasqlDollarVar.ReplaceAllString(value, `#$1`)
 }
 
 // findVariables finds all &var and &&var in script

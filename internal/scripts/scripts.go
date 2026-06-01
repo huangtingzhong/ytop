@@ -10,8 +10,14 @@ import (
 	"unicode/utf8"
 )
 
+const scriptHeaderScanMaxLines = 60
+
 // ExternalEmbeddedFS is set by main package if scripts are embedded at the project root
 var ExternalEmbeddedFS fs.FS = nil
+
+// CurrentDBType controls which sql subdirectory is used for script lookups.
+// Set this before calling any script functions. Defaults to "yashandb".
+var CurrentDBType = "yashandb"
 
 // getScriptDir returns the scripts directory path
 func getScriptDir() (string, error) {
@@ -69,25 +75,25 @@ func GetSQLScript(name string) (string, error) {
 	// First try to read from filesystem
 	scriptsDir, err := getScriptDir()
 	if err == nil && scriptsDir != "" {
-		scriptPath := filepath.Join(scriptsDir, "sql", name)
+		scriptPath := filepath.Join(scriptsDir, "sql", CurrentDBType, name)
 		content, err := os.ReadFile(scriptPath)
 		if err == nil {
 			return string(content), nil
 		}
 	}
 
-	// Try default embedded FS (root scripts/sql, scripts/os copied to internal/scripts at build)
+	// Try default embedded FS
 	{
-		path := "sql/" + name
+		path := "sql/" + CurrentDBType + "/" + name
 		content, err := fs.ReadFile(defaultEmbeddedFS, path)
 		if err == nil {
 			return string(content), nil
 		}
 	}
 
-	// Try external embedded filesystem (from project root, legacy)
+	// Try external embedded filesystem (legacy)
 	if ExternalEmbeddedFS != nil {
-		scriptPath := filepath.Join("scripts", "sql", name)
+		scriptPath := filepath.Join("scripts", "sql", CurrentDBType, name)
 		content, err := fs.ReadFile(ExternalEmbeddedFS, scriptPath)
 		if err == nil {
 			return string(content), nil
@@ -194,7 +200,7 @@ func WriteSQLOutput(sqlID, output string) error {
 type ScriptInfo struct {
 	Type        string // "sql" or "os"
 	Filename    string
-	Description string
+	Description string // Purpose line (normalized)
 }
 
 // SearchScripts searches for scripts matching pattern (filesystem first, then embedded FS)
@@ -211,7 +217,7 @@ func SearchScripts(pattern string) ([]ScriptInfo, error) {
 
 	// Search in filesystem when scripts dir is available
 	if scriptsDir != "" {
-		sqlDir := filepath.Join(scriptsDir, "sql")
+		sqlDir := filepath.Join(scriptsDir, "sql", CurrentDBType)
 		searchInDirectory(sqlDir, "sql", regex, &results)
 
 		osDir := filepath.Join(scriptsDir, "os")
@@ -222,8 +228,8 @@ func SearchScripts(pattern string) ([]ScriptInfo, error) {
 		}
 	}
 
-	// Search default embedded FS (same as GetSQLScript/GetOSScript: sql/ and os/ at embed root)
-	searchInEmbeddedFS(defaultEmbeddedFS, "sql", regex, &results)
+	// Search default embedded FS
+	searchInEmbeddedFS(defaultEmbeddedFS, "sql/"+CurrentDBType, regex, &results)
 	searchInEmbeddedFS(defaultEmbeddedFS, "os", regex, &results)
 	if len(results) > 0 {
 		return results, nil
@@ -242,6 +248,9 @@ func SearchScripts(pattern string) ([]ScriptInfo, error) {
 
 // getRegexForPattern creates a regex matcher for the pattern (supports full regex, e.g. .* for all, snapshot|user for alternation)
 func getRegexForPattern(pattern string) (func(string) bool, error) {
+	if strings.TrimSpace(pattern) == "" {
+		pattern = ".*"
+	}
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("invalid regex %q: %w", pattern, err)
@@ -268,13 +277,11 @@ func searchInDirectory(dir, scriptType string, matcher func(string) bool, result
 			continue
 		}
 
-		// Read description from file
-		desc := getDescriptionFromPath(filepath.Join(dir, filename))
-		*results = append(*results, ScriptInfo{
-			Type:        scriptType,
-			Filename:    filename,
-			Description: desc,
-		})
+		content, err := os.ReadFile(filepath.Join(dir, filename))
+		if err != nil {
+			continue
+		}
+		*results = append(*results, buildScriptInfo(scriptType, filename, content))
 	}
 }
 
@@ -309,74 +316,83 @@ func searchInEmbeddedFS(embeddedFS fs.FS, basePath string, matcher func(string) 
 			return nil
 		}
 
-		desc := getDescriptionFromContent(content)
-		*results = append(*results, ScriptInfo{
-			Type:        scriptType,
-			Filename:    filename,
-			Description: desc,
-		})
+		*results = append(*results, buildScriptInfo(scriptType, filename, content))
 
 		return nil
 	})
 }
 
-// getDescriptionFromPath reads description from a file path
-func getDescriptionFromPath(filePath string) string {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return ""
+// buildScriptInfo parses Purpose from the script header for -S listing.
+func buildScriptInfo(scriptType, filename string, content []byte) ScriptInfo {
+	return ScriptInfo{
+		Type:        scriptType,
+		Filename:    filename,
+		Description: extractScriptDescription(content),
 	}
-	defer file.Close()
-
-	// Check if file is text (by reading first few bytes)
-	buf := make([]byte, 512)
-	n, err := file.Read(buf)
-	if err != nil {
-		return ""
-	}
-
-	// Check if content is valid UTF-8 (text file)
-	if !utf8.Valid(buf[:n]) {
-		return "[binary file]"
-	}
-
-	// Reset to beginning
-	file.Seek(0, 0)
-
-	// Read second line for description
-	lines := strings.Split(string(buf[:n]), "\n")
-	if len(lines) >= 2 {
-		line := strings.TrimSpace(lines[1])
-		// Remove comment markers
-		line = strings.TrimPrefix(line, "#")
-		line = strings.TrimPrefix(line, "--")
-		line = strings.TrimSpace(line)
-		return line
-	}
-
-	return ""
 }
 
-// getDescriptionFromContent extracts description from script content
-func getDescriptionFromContent(content []byte) string {
-	// Check if content is valid UTF-8 (text file)
+type scriptHeaderFields struct {
+	FileName string
+	Purpose  string
+	Created  string
+}
+
+func extractScriptDescription(content []byte) string {
 	if !utf8.Valid(content) {
 		return "[binary file]"
 	}
+	return parseScriptHeaderFields(content).Purpose
+}
 
-	// Split content into lines
+func parseScriptHeaderFields(content []byte) scriptHeaderFields {
 	lines := strings.Split(string(content), "\n")
-	if len(lines) >= 2 {
-		// Get second line for description
-		line := strings.TrimSpace(lines[1])
-		// Remove comment markers
-		line = strings.TrimPrefix(line, "#")
-		line = strings.TrimPrefix(line, "--")
-		line = strings.TrimSpace(line)
-		return line
+	if len(lines) > scriptHeaderScanMaxLines {
+		lines = lines[:scriptHeaderScanMaxLines]
 	}
+	var fields scriptHeaderFields
+	for _, raw := range lines {
+		line := stripScriptCommentLine(raw)
+		if line == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "File Name:"):
+			fields.FileName = strings.TrimSpace(strings.TrimPrefix(line, "File Name:"))
+		case strings.HasPrefix(line, "Purpose:"):
+			fields.Purpose = normalizeScriptDescription(line)
+		case strings.HasPrefix(line, "Created:"):
+			fields.Created = strings.TrimSpace(strings.TrimPrefix(line, "Created:"))
+		}
+	}
+	return fields
+}
 
+func stripScriptCommentLine(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.HasPrefix(s, "#!") {
+		return ""
+	}
+	if strings.HasPrefix(s, "--") {
+		return strings.TrimSpace(strings.TrimPrefix(s, "--"))
+	}
+	if strings.HasPrefix(s, "#") {
+		return strings.TrimSpace(strings.TrimPrefix(s, "#"))
+	}
 	return ""
+}
+
+// getDescriptionFromContent extracts Purpose from script content (for tests and callers).
+func getDescriptionFromContent(content []byte) string {
+	return extractScriptDescription(content)
+}
+
+// normalizeScriptDescription strips the standard "Purpose:" header prefix from script comments.
+func normalizeScriptDescription(line string) string {
+	line = strings.TrimSpace(line)
+	for strings.HasPrefix(line, "Purpose:") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "Purpose:"))
+	}
+	return line
 }
 
 // ReadScriptContent reads and returns the content of a script file
@@ -389,7 +405,7 @@ func ReadScriptContent(filename string) (string, bool, error) {
 
 		// Determine if it's a SQL script or OS script
 		if strings.HasSuffix(filename, ".sql") {
-			scriptPath = filepath.Join(scriptsDir, "sql", filename)
+			scriptPath = filepath.Join(scriptsDir, "sql", CurrentDBType, filename)
 		} else {
 			scriptPath = filepath.Join(scriptsDir, "os", filename)
 		}
@@ -415,7 +431,7 @@ func ReadScriptContent(filename string) (string, bool, error) {
 	{
 		var path string
 		if strings.HasSuffix(filename, ".sql") {
-			path = "sql/" + filename
+			path = "sql/" + CurrentDBType + "/" + filename
 		} else {
 			path = "os/" + filename
 		}
@@ -432,7 +448,7 @@ func ReadScriptContent(filename string) (string, bool, error) {
 	if ExternalEmbeddedFS != nil {
 		var scriptPath string
 		if strings.HasSuffix(filename, ".sql") {
-			scriptPath = filepath.Join("scripts", "sql", filename)
+			scriptPath = filepath.Join("scripts", "sql", CurrentDBType, filename)
 		} else {
 			scriptPath = filepath.Join("scripts", "os", filename)
 		}

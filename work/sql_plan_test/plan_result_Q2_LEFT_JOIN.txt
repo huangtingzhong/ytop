@@ -1,0 +1,18 @@
+============================================================================
+Plan Hash Value: 1162432196
+============================================================================
+|  Id| Pid| Ord|Operation                              |Name                         |Rows       |Cost     |Time     |
+|----|----|----|---------------------------------------|-----------------------------|-----------|---------|---------|
+|   0|    |   9|SELECT STATEMENT                       |                             |           |         |         |
+|   1|   0|   8|  NESTED LOOPS LEFT OUTER              |                             |           |132      |         |
+|   2|   1|   5|    SORT                               |                             |           |132      |         |
+|   3|   2|   4|      NESTED LOOPS LEFT OUTER          |                             |           |129      |         |
+|   4|   3|   1|        TABLE ACCESS FULL              |SYS.PT_PLAN_T1_DEPT [TABLE]  |           |129      |         |
+|   5|   3|   3|        TABLE ACCESS BY INDEX ROWID    |SYS.PT_PLAN_T2_EMP [TABLE]   |           |1        |         |
+|   6|   5|   2|          INDEX RANGE SCAN             |SYS.PT_EMP_DEPT_IX           |           |1        |         |
+|   7|   1|   7|    TABLE ACCESS BY INDEX ROWID        |SYS.PT_PLAN_T5_SALES [TABLE] |           |1        |         |
+|   8|   7|   6|      INDEX RANGE SCAN                 |SYS.PT_SALE_EMP_IX           |           |1        |         |
+============================================================================
+
+PL/SQL Succeed.
+

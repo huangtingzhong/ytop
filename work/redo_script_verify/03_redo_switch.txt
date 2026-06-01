@@ -1,0 +1,11 @@
+log_mode=ARCHIVELOG, instance=1
+Executing: ALTER SYSTEM ARCHIVE LOG CURRENT
+Done in 0 ms
+--- Current redo (V$LOGFILE) ---
+THREAD#=1 ID=4 STATUS=INACTIVE /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_4.log
+THREAD#=1 ID=5 STATUS=ACTIVE /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_5.log
+THREAD#=1 ID=6 STATUS=CURRENT /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_6.log
+THREAD#=1 ID=7 STATUS=INACTIVE /data/yashan/yasdb_data/db-1-1/dbfiles/redo_tpcc_i1_7.log
+
+PL/SQL Succeed.
+
