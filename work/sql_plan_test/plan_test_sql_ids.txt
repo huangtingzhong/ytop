@@ -1,6 +1,0 @@
-# Latest sql_id for each test query (YashanDB 10.10.10.130)
-Q1_FILTER_SUBQ=4r45cmukz9dgs
-Q2_LEFT_JOIN=3b5yjk80p48ky
-Q3_RIGHT_JOIN=9y5n9372aaur5
-Q4_EXISTS_SUBQ=517ja490d9j9r
-Q5_FULL_FILTER=85zp37r5ugh37
