@@ -138,7 +138,7 @@ func (c *SSHConnector) buildSSHSQLExecCmd(tmpFile string) string {
 		cli := c.cfg.DefaultCLI()
 		switch c.cfg.DBType {
 		case "mysql":
-			cmd = fmt.Sprintf("%s %s < %s", cli, c.cfg.ConnectString, tmpFile)
+			cmd = FormatMySQLScriptRedirect(cli, c.cfg.ConnectString, tmpFile)
 		case "postgresql":
 			cmd = fmt.Sprintf("%s %s -f %s", cli, c.cfg.ConnectString, tmpFile)
 		default:
@@ -218,10 +218,6 @@ func (c *SSHConnector) executeSQLTwoStep(ctx context.Context, sql string) (strin
 		c.ExecuteCommand(ctx, fmt.Sprintf("rm -f %s", tmpFile))
 	}
 
-	if c.cfg.DebugMode {
-		logger.Debug("[ssh] Output (%d bytes):\n%s\n", len(output), output)
-	}
-
 	return output, nil
 }
 
@@ -257,15 +253,15 @@ func (c *SSHConnector) ExecuteCommand(ctx context.Context, command string) (stri
 
 	// Execute command
 	output, err := c.runCmd(session, command)
-	if err != nil {
-		return string(output), fmt.Errorf("SSH command execution failed: %w", err)
-	}
-
+	outputStr := string(output)
 	if c.cfg.DebugMode {
-		logger.Debug("Output: %s\n", string(output))
+		logger.DebugCommandOutput("ssh", outputStr, err)
+	}
+	if err != nil {
+		return outputStr, fmt.Errorf("SSH command execution failed: %w", err)
 	}
 
-	return string(output), nil
+	return outputStr, nil
 }
 
 // ExecuteCommandRealtime executes a command via SSH with real-time output streaming
@@ -372,13 +368,25 @@ func (c *SSHConnector) ExecuteCommandRealtime(ctx context.Context, command strin
 	wg.Wait()
 
 	if ctx.Err() == context.Canceled {
-		return outputBuffer.String(), nil
+		result := outputBuffer.String()
+		if c.cfg.DebugMode {
+			logger.DebugCommandOutput("ssh-realtime", result, ctx.Err())
+		}
+		return result, nil
 	}
 
 	if waitErr != nil {
-		return outputBuffer.String(), fmt.Errorf("SSH command execution failed: %w", waitErr)
+		result := outputBuffer.String()
+		if c.cfg.DebugMode {
+			logger.DebugCommandOutput("ssh-realtime", result, waitErr)
+		}
+		return result, fmt.Errorf("SSH command execution failed: %w", waitErr)
 	}
 
-	return outputBuffer.String(), nil
+	result := outputBuffer.String()
+	if c.cfg.DebugMode {
+		logger.DebugCommandOutput("ssh-realtime", result, nil)
+	}
+	return result, nil
 }
 

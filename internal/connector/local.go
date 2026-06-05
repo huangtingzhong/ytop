@@ -61,7 +61,7 @@ func (c *LocalConnector) ExecuteQuery(ctx context.Context, sql string) ([][]stri
 
 	output, err := cmd.CombinedOutput()
 	if c.cfg.DebugMode {
-		logger.Debug("[local] Output (%d bytes):\n%s\n", len(output), string(output))
+		logger.DebugCommandOutput("local-query", string(output), err)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("SQL execution failed: %w, output: %s", err, string(output))
@@ -88,7 +88,7 @@ func (c *LocalConnector) ExecuteQueryWithHeader(ctx context.Context, sql string)
 
 	output, err := cmd.CombinedOutput()
 	if c.cfg.DebugMode {
-		logger.Debug("[local] Output (%d bytes):\n%s\n", len(output), string(output))
+		logger.DebugCommandOutput("local-query", string(output), err)
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("SQL execution failed: %w, output: %s", err, string(output))

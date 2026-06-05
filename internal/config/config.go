@@ -74,7 +74,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		ConnectionMode:    "local", // Default to local mode
 		YasqlPath:         "yasql",
-		ConnectString:     "/ as sysdba",
+		ConnectString:     defaultOracleConnectString,
 		SSHPort:           22,
 		Interval:          5,
 		Count:             0,
@@ -122,6 +122,33 @@ func (c *Config) DefaultCLI() string {
 		return "psql"
 	default:
 		return c.YasqlPath
+	}
+}
+
+const defaultOracleConnectString = "/ as sysdba"
+
+// IsOracleStyleConnectString reports whether s is an Oracle/YashanDB sqlplus-style connect string.
+func IsOracleStyleConnectString(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	return lower == defaultOracleConnectString ||
+		lower == "/ as sysoper" ||
+		strings.HasPrefix(lower, "/ as sys")
+}
+
+// ApplyDBTypeConnectDefaults adjusts ConnectString for the selected DB CLI.
+func (c *Config) ApplyDBTypeConnectDefaults() {
+	if c.LoginCmd != "" {
+		return
+	}
+	switch c.DBType {
+	case "mysql", "postgresql":
+		if IsOracleStyleConnectString(c.ConnectString) {
+			c.ConnectString = ""
+		}
 	}
 }
 
@@ -326,6 +353,8 @@ func LoadConfig() (*Config, error) {
 	if *loginCmd != "" {
 		cfg.LoginCmd = *loginCmd
 	}
+
+	cfg.ApplyDBTypeConnectDefaults()
 
 	// Auto-detect connection mode based on SSH host (needed before normalizing -s paths)
 	// If user explicitly set mode, use that; otherwise auto-detect

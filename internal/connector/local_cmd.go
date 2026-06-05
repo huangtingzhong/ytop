@@ -26,6 +26,40 @@ func FormatCLIInvocation(cli string, args ...string) string {
 	return strings.Join(parts, " ")
 }
 
+// MySQLDefaultClientArgs are always passed to the mysql CLI (table output for aligned columns).
+var MySQLDefaultClientArgs = []string{"-t"}
+
+// MySQLConnectArgs splits ConnectString into separate mysql client flags.
+func MySQLConnectArgs(connectString string) []string {
+	return strings.Fields(strings.TrimSpace(connectString))
+}
+
+// FormatMySQLCLIInvocation builds a shell-safe mysql command with split connect flags.
+func FormatMySQLCLIInvocation(cli, connectString string, extra ...string) string {
+	parts := make([]string, 0, 2+len(extra)+4)
+	parts = append(parts, cli)
+	parts = append(parts, MySQLDefaultClientArgs...)
+	parts = append(parts, MySQLConnectArgs(connectString)...)
+	parts = append(parts, extra...)
+	quoted := make([]string, len(parts))
+	for i, p := range parts {
+		quoted[i] = shellQuote(p)
+	}
+	return strings.Join(quoted, " ")
+}
+
+// FormatMySQLScriptRedirect builds: mysql [flags...] < 'script.sql'
+func FormatMySQLScriptRedirect(cli, connectString, scriptFile string) string {
+	return FormatMySQLCLIInvocation(cli, connectString) + " < " + shellQuote(scriptFile)
+}
+
+// MySQLExecArgv returns argv for exec.Command(mysql, argv...).
+func MySQLExecArgv(connectString string, extra ...string) []string {
+	args := append([]string{}, MySQLDefaultClientArgs...)
+	args = append(args, MySQLConnectArgs(connectString)...)
+	return append(args, extra...)
+}
+
 // BuildLocalSQLExecCmd builds exec.Cmd for local SQL execution.
 // scriptFile is optional; when set the CLI reads SQL from that path (@file, -f, or redirect).
 // sql is used for stdin-based execution (login-cmd and yasql/sqlplus ad-hoc).
@@ -48,10 +82,10 @@ func buildLocalDirectSQLExec(ctx context.Context, cfg *config.Config, cli, sql, 
 	switch cfg.DBType {
 	case "mysql":
 		if scriptFile != "" {
-			fullCmd := FormatCLIInvocation(cli, cfg.ConnectString) + " < " + shellQuote(scriptFile)
+			fullCmd := FormatMySQLScriptRedirect(cli, cfg.ConnectString, scriptFile)
 			return exec.CommandContext(ctx, "bash", "-c", fullCmd)
 		}
-		return exec.CommandContext(ctx, cli, cfg.ConnectString, "-e", sql)
+		return exec.CommandContext(ctx, cli, MySQLExecArgv(cfg.ConnectString, "-e", sql)...)
 	case "postgresql":
 		if scriptFile != "" {
 			return exec.CommandContext(ctx, cli, cfg.ConnectString, "-f", scriptFile)
@@ -80,10 +114,10 @@ func buildLocalSourcedSQLExec(ctx context.Context, cfg *config.Config, cli, sql,
 	case "mysql":
 		if scriptFile != "" {
 			fullCmd = WrapSourceCmd(cfg.SourceCmd,
-				FormatCLIInvocation(cli, cfg.ConnectString)+" < "+shellQuote(scriptFile))
+				FormatMySQLScriptRedirect(cli, cfg.ConnectString, scriptFile))
 		} else {
 			fullCmd = WrapSourceCmd(cfg.SourceCmd,
-				FormatCLIInvocation(cli, cfg.ConnectString, "-e", sql))
+				FormatMySQLCLIInvocation(cli, cfg.ConnectString, "-e", sql))
 		}
 	case "postgresql":
 		if scriptFile != "" {

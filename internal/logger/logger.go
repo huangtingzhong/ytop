@@ -46,6 +46,24 @@ func Close() {
 	}
 }
 
+// DebugCommandOutput logs captured command stdout/stderr to ytop_debug.log.
+func DebugCommandOutput(scope, output string, execErr error) {
+	if !debugEnabled {
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if debugLogger == nil {
+		return
+	}
+	if execErr != nil {
+		debugLogger.Printf("[DEBUG] [%s] execution error: %v\n", scope, execErr)
+	}
+	debugLogger.Printf("[DEBUG] [%s] Output (%d bytes):\n%s\n", scope, len(output), output)
+}
+
 // Debug logs a debug message
 func Debug(format string, args ...interface{}) {
 	if !debugEnabled {

@@ -125,7 +125,7 @@ func (e *Executor) executeSQLViaSSHUpload(ctx context.Context, scriptContent, sc
 		cli := e.cfg.DefaultCLI()
 		switch e.cfg.DBType {
 		case "mysql":
-			execCmd = fmt.Sprintf("%s %s < %s", cli, e.cfg.ConnectString, tmpFile)
+			execCmd = connector.FormatMySQLScriptRedirect(cli, e.cfg.ConnectString, tmpFile)
 		case "postgresql":
 			execCmd = fmt.Sprintf("%s %s -f %s", cli, e.cfg.ConnectString, tmpFile)
 		default:
@@ -170,11 +170,15 @@ func (e *Executor) executeSQLDirect(ctx context.Context, scriptContent string) (
 	}
 
 	output, err := cmd.CombinedOutput()
+	outStr := string(output)
+	if e.cfg.DebugMode {
+		logger.DebugCommandOutput("local-sql-script", outStr, err)
+	}
 	if err != nil {
-		return string(output), fmt.Errorf("SQL script execution failed: %w", err)
+		return outStr, fmt.Errorf("SQL script execution failed: %w", err)
 	}
 
-	return string(output), nil
+	return outStr, nil
 }
 
 // executeOSCommand executes an OS command or script
@@ -334,14 +338,26 @@ func (e *Executor) executeOSCommandLocal(ctx context.Context, command string) (s
 	wg.Wait()
 
 	if ctx.Err() == context.Canceled {
-		return outputBuffer.String(), nil
+		result := outputBuffer.String()
+		if e.cfg.DebugMode {
+			logger.DebugCommandOutput("local-os-command", result, ctx.Err())
+		}
+		return result, nil
 	}
 
 	if waitErr != nil {
-		return outputBuffer.String(), fmt.Errorf("command failed: %w", waitErr)
+		result := outputBuffer.String()
+		if e.cfg.DebugMode {
+			logger.DebugCommandOutput("local-os-command", result, waitErr)
+		}
+		return result, fmt.Errorf("command failed: %w", waitErr)
 	}
 
-	return outputBuffer.String(), nil
+	result := outputBuffer.String()
+	if e.cfg.DebugMode {
+		logger.DebugCommandOutput("local-os-command", result, nil)
+	}
+	return result, nil
 }
 
 // executeOSScript executes an OS script (optional args passed to the script as positional parameters)
@@ -411,11 +427,7 @@ func (e *Executor) executeAdHocSQLViaSSH(ctx context.Context, sql string) (strin
 	var remoteCmd string
 	switch e.cfg.DBType {
 	case "mysql":
-		// mysql: pass SQL with -e
-		remoteCmd = fmt.Sprintf("%s %s -e %s",
-			cli,
-			e.cfg.ConnectString,
-			utils.ShellEscape(sqlExec))
+		remoteCmd = connector.FormatMySQLCLIInvocation(cli, e.cfg.ConnectString, "-e", sqlExec)
 	case "postgresql":
 		// psql: pass SQL with -c
 		remoteCmd = fmt.Sprintf("%s %s -c %s",
@@ -452,10 +464,14 @@ func (e *Executor) executeAdHocSQLLocal(ctx context.Context, sql string) (string
 		logger.Debug("Executing ad-hoc SQL locally: %v\n", cmd.Args)
 	}
 	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(output), fmt.Errorf("SQL execution failed: %w", err)
+	outStr := string(output)
+	if e.cfg.DebugMode {
+		logger.DebugCommandOutput("local-sql-adhoc", outStr, err)
 	}
-	return string(output), nil
+	if err != nil {
+		return outStr, fmt.Errorf("SQL execution failed: %w", err)
+	}
+	return outStr, nil
 }
 
 // yasqlDollarVar matches yasql $identifier substitution (e.g. $session in v$session).
