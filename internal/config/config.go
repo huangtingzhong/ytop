@@ -67,6 +67,21 @@ type Config struct {
 
 	// Custom login command (overrides default CLI login)
 	LoginCmd string
+
+	// TargetOS is the OS of the machine where SQL is executed.
+	//   "unix"    — Linux/macOS/AIX (default)
+	//   "windows" — Remote Windows via SSH
+	// For local mode: derived from runtime.GOOS by the connector.
+	// For SSH mode: auto-detected during Connect(); can be overridden with --target-os.
+	TargetOS string
+
+	// RemoteTempDir is the absolute temp directory on the SSH target host.
+	// Populated during SSHConnector.Connect (echo %TEMP% on Windows, /tmp on Unix).
+	RemoteTempDir string
+
+	// RemoteCLIPath is the absolute path to the DB CLI on the SSH target host.
+	// Populated during SSHConnector.Connect (which/where output); empty in local mode.
+	RemoteCLIPath string
 }
 
 // DefaultConfig returns a config with default values
@@ -107,6 +122,14 @@ func DefaultConfig() *Config {
 		DebugMode:    false,
 		DBType:       "yashandb",
 	}
+}
+
+// ResolveCLIForExec returns the CLI executable to invoke: RemoteCLIPath when set (SSH), else DefaultCLI().
+func (c *Config) ResolveCLIForExec() string {
+	if c.RemoteCLIPath != "" {
+		return c.RemoteCLIPath
+	}
+	return c.DefaultCLI()
 }
 
 // DefaultCLI returns the default CLI tool name for the given DB type
@@ -238,6 +261,7 @@ func LoadConfig() (*Config, error) {
 	dbType := flag.String("d", "", "Database type: y/yas/yashandb, o/ora/oracle, d/dm/dameng, m/my/mysql, p/pg/postgres")
 	dbTypeLong := flag.String("db-type", "", "Database type (long form)")
 	loginCmd := flag.String("login-cmd", "", "Custom login command (e.g. 'sqlplus / as sysdba')")
+	targetOS := flag.String("target-os", "", "Remote OS type for SSH mode: windows or unix (default: auto-detect)")
 
 	if err := flag.CommandLine.Parse(normalizeFindScriptFlagArgs(os.Args)[1:]); err != nil {
 		return nil, err
@@ -352,6 +376,16 @@ func LoadConfig() (*Config, error) {
 	}
 	if *loginCmd != "" {
 		cfg.LoginCmd = *loginCmd
+	}
+	if *targetOS != "" {
+		switch strings.ToLower(*targetOS) {
+		case "windows", "win":
+			cfg.TargetOS = "windows"
+		case "unix", "linux":
+			cfg.TargetOS = "unix"
+		default:
+			return nil, fmt.Errorf("invalid --target-os %q: must be 'windows' or 'unix'", *targetOS)
+		}
 	}
 
 	cfg.ApplyDBTypeConnectDefaults()
@@ -512,6 +546,21 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("connection_mode must be 'local' or 'ssh'")
 	}
 
+	// YashanDB is not supported on Windows (local or explicit target-os=windows).
+	// SSH auto-detection is done later in Connect(); block only the explicit case here.
+	if c.DBType == "yashandb" {
+		if c.ConnectionMode == "local" && isLocalWindows() {
+			return fmt.Errorf(
+				"YashanDB is not supported on Windows.\n" +
+					"  Run ytop on a Linux/Unix host, or use SSH mode (-t <linux_host>) to connect remotely.")
+		}
+		if c.TargetOS == "windows" {
+			return fmt.Errorf(
+				"YashanDB is not supported on a Windows target (--target-os windows).\n" +
+					"  Use SSH to a Linux/Unix host instead.")
+		}
+	}
+
 	if c.ConnectionMode == "ssh" {
 		if c.SSHHost == "" {
 			return fmt.Errorf("ssh_host is required when connection_mode is 'ssh'")
@@ -576,6 +625,14 @@ func checkSSHCommand() error {
 		return fmt.Errorf("ssh command not found in PATH. Please install OpenSSH client to use SSH connection mode")
 	}
 	return nil
+}
+
+// isLocalWindows returns true when the current process is running on Windows.
+func isLocalWindows() bool {
+	return strings.EqualFold(os.Getenv("GOOS"), "windows") ||
+		// Use runtime constant via the platform package would create an import cycle,
+		// so check env/os markers instead.
+		(os.PathSeparator == '\\')
 }
 
 // PrintUsage prints brief usage with mode overview

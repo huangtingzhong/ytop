@@ -2,9 +2,9 @@ package main
 
 // Version information
 // This file is automatically updated by build.sh
-// Last updated: 2026-06-04 17:08:37 CST
+// Last updated: 2026-06-08 22:23:42 CST
 var (
-	Version   = "20260604_170837"
-	BuildTime = "2026-06-04 17:08:37 CST"
-	GitCommit = "f7e0d51"
+	Version   = "20260608_222342"
+	BuildTime = "2026-06-08 22:23:42 CST"
+	GitCommit = "c05be93"
 )

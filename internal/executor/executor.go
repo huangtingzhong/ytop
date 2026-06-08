@@ -14,6 +14,7 @@ import (
 	"github.com/yihan/ytop/internal/config"
 	"github.com/yihan/ytop/internal/connector"
 	"github.com/yihan/ytop/internal/logger"
+	"github.com/yihan/ytop/internal/platform"
 	"github.com/yihan/ytop/internal/scripts"
 	"github.com/yihan/ytop/internal/terminal"
 	"github.com/yihan/ytop/internal/utils"
@@ -79,74 +80,43 @@ func (e *Executor) executeSQLScript(ctx context.Context, scriptName string) (str
 		}
 	}
 
-	// Execute based on connection mode
-	if e.cfg.ConnectionMode == "ssh" && e.isLocalAuth() {
+	// SSH mode: always upload and run on the remote host (respects TargetOS for Windows cmd vs Unix bash).
+	if sqlScriptUsesSSH(e.cfg) {
 		return e.executeSQLViaSSHUpload(ctx, scriptContent, scriptName)
 	}
 
 	return e.executeSQLDirect(ctx, scriptContent)
 }
 
-// executeSQLViaSSHUpload uploads script to remote host and executes
+// executeSQLViaSSHUpload uploads script to remote host via SFTP and executes.
 func (e *Executor) executeSQLViaSSHUpload(ctx context.Context, scriptContent, scriptName string) (string, error) {
-	// Create temporary script file
-	tmpFile := fmt.Sprintf("/tmp/ytop_%s_%d.sql", filepath.Base(scriptName), os.Getpid())
-
-	// Upload script content via SSH
 	sshConn, ok := e.conn.(*connector.SSHConnector)
 	if !ok {
 		return "", fmt.Errorf("not an SSH connection")
 	}
 
-	// Ensure cleanup happens unless debug mode
-	defer func() {
-		if !e.cfg.DebugMode {
-			cleanupCmd := fmt.Sprintf("rm -f %s", tmpFile)
-			sshConn.ExecuteCommand(ctx, cleanupCmd)
-		}
-	}()
-
 	scriptForExec := connector.WrapSQLSuppressScriptEcho(e.cfg.DBType, scriptContent)
 	scriptForExec = connector.EnsureSQLStatementTerminator(scriptForExec, e.cfg.DBType)
 
-	// Write script to remote host
-	delim := randomHeredocMarker("YASTOP")
-	uploadCmd := fmt.Sprintf("cat > %s << '%s'\n%s\nexit\n%s", tmpFile, delim, scriptForExec, delim)
-	if _, err := sshConn.ExecuteCommand(ctx, uploadCmd); err != nil {
-		return "", fmt.Errorf("failed to upload script: %w", err)
-	}
+	logger.DebugStep("executor-ssh-script", scriptName)
+	logger.DebugKeyVal("TargetOS", e.cfg.TargetOS)
+	logger.DebugKeyVal("bytes", fmt.Sprintf("%d", len(scriptForExec)))
 
-	// Execute script
-	var execCmd string
-	if e.cfg.LoginCmd != "" {
-		delim := randomHeredocMarker("YTOP_SQL")
-		execCmd = fmt.Sprintf("%s <<'%s'\n%s\nexit\n%s", e.cfg.LoginCmd, delim, scriptForExec, delim)
-	} else {
-		cli := e.cfg.DefaultCLI()
-		switch e.cfg.DBType {
-		case "mysql":
-			execCmd = connector.FormatMySQLScriptRedirect(cli, e.cfg.ConnectString, tmpFile)
-		case "postgresql":
-			execCmd = fmt.Sprintf("%s %s -f %s", cli, e.cfg.ConnectString, tmpFile)
-		default:
-			// yasql, sqlplus, disql: @file syntax
-			execCmd = fmt.Sprintf("%s -S %s @%s", cli, e.cfg.ConnectString, tmpFile)
-		}
-	}
-	execCmd = sshConn.WrapCmd(execCmd)
-
+	basename := fmt.Sprintf("ytop_%s_%d.sql", filepath.Base(scriptName), os.Getpid())
+	output, err := sshConn.ExecuteRemoteSQLScript(ctx, []byte(scriptForExec), basename)
 	if e.cfg.DebugMode {
-		logger.Debug("Executing SQL script via SSH: %s\n", execCmd)
+		logger.DebugCommandOutput("executor-ssh-script", output, err)
 	}
-
-	output, err := sshConn.ExecuteCommand(ctx, execCmd)
-	return output, err
+	if err != nil {
+		return output, fmt.Errorf("failed to execute script via SSH: %w", err)
+	}
+	return output, nil
 }
 
 // executeSQLDirect executes SQL directly via local yasql with temp file
 func (e *Executor) executeSQLDirect(ctx context.Context, scriptContent string) (string, error) {
 	// Create temporary script file
-	tmpFile := fmt.Sprintf("/tmp/ytop_%d.sql", os.Getpid())
+	tmpFile := platform.LocalTempPath(fmt.Sprintf("ytop_%d.sql", os.Getpid()))
 
 	// Write script content to temp file (suppress CLI echo of script text for Oracle-style tools)
 	scriptForExec := connector.WrapSQLSuppressScriptEcho(e.cfg.DBType, scriptContent)
@@ -423,11 +393,11 @@ func (e *Executor) executeAdHocSQLViaSSH(ctx context.Context, sql string) (strin
 		return sshConn.ExecuteCommand(ctx, cmd)
 	}
 
-	cli := e.cfg.DefaultCLI()
+	cli := e.cfg.ResolveCLIForExec()
 	var remoteCmd string
 	switch e.cfg.DBType {
 	case "mysql":
-		remoteCmd = connector.FormatMySQLCLIInvocation(cli, e.cfg.ConnectString, "-e", sqlExec)
+		remoteCmd = connector.FormatMySQLAdHocRemoteCmd(e.cfg.TargetOS, cli, e.cfg.ConnectString, sqlExec)
 	case "postgresql":
 		// psql: pass SQL with -c
 		remoteCmd = fmt.Sprintf("%s %s -c %s",
@@ -435,7 +405,10 @@ func (e *Executor) executeAdHocSQLViaSSH(ctx context.Context, sql string) (strin
 			e.cfg.ConnectString,
 			utils.ShellEscape(sqlExec))
 	default:
-		// yasql/sqlplus/disql: feed SQL via stdin so all CLIs behave consistently
+		// Windows remote has no bash heredoc; upload script and run via @file / disql.
+		if e.cfg.TargetOS == platform.OSWindows {
+			return sshConn.ExecuteRemoteSQLScript(ctx, []byte(sqlExec), connector.RemoteScriptBasename("q"))
+		}
 		delim := randomHeredocMarker("YTOP_SQL")
 		remoteCmd = fmt.Sprintf("%s -S %s <<'%s'\n%s\nexit\n%s",
 			cli,
@@ -556,18 +529,15 @@ func (e *Executor) splitSQLStatements(script string) []string {
 	return result
 }
 
+// sqlScriptUsesSSH reports whether -f SQL scripts should be uploaded and executed on the SSH target.
+func sqlScriptUsesSSH(cfg *config.Config) bool {
+	return cfg.ConnectionMode == "ssh"
+}
+
 // isSQLPlusCommand checks if statement is a SQL*Plus command
 func (e *Executor) isSQLPlusCommand(stmt string) bool {
 	// Don't filter any commands - all SQL scripts have been tested and can be executed directly
 	return false
-}
-
-// isLocalAuth checks if using local authentication (/ as sysdba)
-func (e *Executor) isLocalAuth() bool {
-	connectStr := strings.ToLower(strings.TrimSpace(e.cfg.ConnectString))
-	return strings.Contains(connectStr, "/ as sysdba") ||
-	       strings.Contains(connectStr, "/as sysdba") ||
-	       connectStr == "/"
 }
 
 // CopyScript copies a script file to specified destination
@@ -609,39 +579,15 @@ func (e *Executor) CopyScript(ctx context.Context, scriptName, destPath string) 
 	return destFile, e.copyScriptLocal(scriptContent, destFile)
 }
 
-// copyScriptViaSSH copies script to remote server via SSH
+// copyScriptViaSSH copies script to remote server via SFTP (works on Unix and Windows targets).
 func (e *Executor) copyScriptViaSSH(ctx context.Context, scriptContent, destFile string) error {
 	sshConn, ok := e.conn.(*connector.SSHConnector)
 	if !ok {
 		return fmt.Errorf("not an SSH connection")
 	}
 
-	// Upload script content via SSH using printf to avoid extra newline
-	// Escape single quotes in content for shell
-	escapedContent := strings.ReplaceAll(scriptContent, "'", "'\\''")
-	uploadCmd := fmt.Sprintf("printf '%%s' '%s' > %s", escapedContent, destFile)
-	if _, err := sshConn.ExecuteCommand(ctx, uploadCmd); err != nil {
+	if err := sshConn.UploadFileToPath(ctx, []byte(scriptContent), destFile); err != nil {
 		return fmt.Errorf("failed to copy script to remote server: %w", err)
-	}
-
-	// Set file permissions
-	chmodCmd := fmt.Sprintf("chmod 644 %s", destFile)
-	if _, err := sshConn.ExecuteCommand(ctx, chmodCmd); err != nil {
-		logger.Debug("Failed to set file permissions: %v", err)
-	}
-
-	// Verify file exists and check size
-	verifyCmd := fmt.Sprintf("test -f %s && wc -c < %s", destFile, destFile)
-	output, err := sshConn.ExecuteCommand(ctx, verifyCmd)
-	if err != nil {
-		return fmt.Errorf("failed to verify copied file: %w", err)
-	}
-
-	// Check if file size matches
-	remoteSize := strings.TrimSpace(output)
-	expectedSize := fmt.Sprintf("%d", len(scriptContent))
-	if remoteSize != expectedSize {
-		return fmt.Errorf("file size mismatch: expected %s bytes, got %s bytes", expectedSize, remoteSize)
 	}
 
 	return nil

@@ -191,3 +191,12 @@ func (p *SSHConnectionPool) IsConnected() bool {
 	return p.connected && p.client != nil
 }
 
+// Client returns the underlying *ssh.Client for operations that require direct
+// access to the SSH connection, such as SFTP file transfers.
+// Returns nil when the pool is not connected.
+func (p *SSHConnectionPool) Client() *ssh.Client {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.client
+}
+

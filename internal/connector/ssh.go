@@ -2,8 +2,6 @@ package connector
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
@@ -14,6 +12,7 @@ import (
 
 	"github.com/yihan/ytop/internal/config"
 	"github.com/yihan/ytop/internal/logger"
+	"github.com/yihan/ytop/internal/platform"
 )
 
 // SSHConnector implements Connector for SSH-based yasql execution
@@ -23,36 +22,13 @@ type SSHConnector struct {
 	connected bool
 }
 
-// WrapCmd wraps a command so that the user's shell profile is loaded first.
-// If SourceCmd is set (-s flag), use that; otherwise use "bash --login" to
-// auto-load the user's .bash_profile / .profile regardless of OS.
-// Remote env file existence is checked once in Connect, not on every wrapped command.
+// WrapCmd wraps a command for the remote target OS (Unix bash or Windows cmd /C).
 // Exported so executor can use it via type assertion.
 func (c *SSHConnector) WrapCmd(cmd string) string {
-	if c.cfg.SourceCmd != "" {
-		return c.cfg.SourceCmd + " && " + cmd
-	}
-	// bash --login loads user profile automatically (.bash_profile, .profile, etc.)
-	// This works across Linux, AIX, and other Unix systems.
-	return fmt.Sprintf("bash --login -c %s", shellQuote(cmd))
+	return platform.WrapRemoteCmd(c.cfg.TargetOS, c.cfg.SourceCmd, cmd)
 }
 
-// shellQuote wraps a string in single quotes, escaping embedded single quotes.
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
-}
-
-// randomHeredocMarker generates a unique heredoc marker to avoid collision with content
-func randomHeredocMarker(prefix string) string {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err == nil {
-		return fmt.Sprintf("%s_%s", prefix, hex.EncodeToString(b[:]))
-	}
-	return fmt.Sprintf("%s_%d", prefix, os.Getpid())
-}
-
-// runCmd executes a command on the remote host.
-// Uses the command directly via SSH session (heredoc/pipe commands work natively).
+// runCmd executes a command on the remote host via SSH session.
 func (c *SSHConnector) runCmd(session *ssh.Session, cmd string) ([]byte, error) {
 	logger.Debug("[ssh] runCmd: executing %d bytes\n", len(cmd))
 	output, err := session.CombinedOutput(cmd)
@@ -71,12 +47,43 @@ func NewSSHConnector(cfg *config.Config) *SSHConnector {
 
 // Connect establishes SSH connection
 func (c *SSHConnector) Connect(ctx context.Context) error {
+	logger.DebugStep("ssh-connect", fmt.Sprintf("host=%s user=%s db=%s", c.cfg.SSHHost, c.cfg.SSHUser, c.cfg.DBType))
+	logger.DebugKeyVal("SSHHost", c.cfg.SSHHost)
+	logger.DebugKeyVal("SSHUser", c.cfg.SSHUser)
+	logger.DebugKeyVal("DBType", c.cfg.DBType)
+	logger.DebugKeyVal("ConnectString", c.cfg.ConnectString)
+	logger.DebugKeyVal("LoginCmd", c.cfg.LoginCmd)
+	logger.DebugKeyVal("SourceCmd", c.cfg.SourceCmd)
+
 	// Connect the pool
 	if err := c.pool.Connect(ctx); err != nil {
+		logger.DebugStep("ssh-connect FAILED", err.Error())
 		return err
 	}
 
 	c.connected = true
+
+	// Resolve target OS (auto-detect unless --target-os was set).
+	if c.cfg.TargetOS == "" {
+		client := c.pool.Client()
+		c.cfg.TargetOS = platform.DetectRemoteOS(ctx, client, logger.Debug)
+	} else {
+		logger.DebugKeyVal("TargetOS", c.cfg.TargetOS+" (explicit)")
+	}
+	logger.DebugKeyVal("TargetOS", c.cfg.TargetOS)
+
+	config.AdaptSourceCmdForWindowsSSH(c.cfg)
+	if c.cfg.DebugMode && c.cfg.SourceCmd != "" {
+		logger.DebugKeyVal("SourceCmd(final)", c.cfg.SourceCmd)
+	}
+
+	if c.cfg.DBType == "yashandb" && c.cfg.TargetOS == platform.OSWindows {
+		err := fmt.Errorf(
+			"YashanDB is not supported on a Windows SSH target (detected OS=windows).\n" +
+				"  Use SSH to a Linux/Unix host, or set --target-os unix only when the remote is Unix.")
+		logger.DebugStep("ssh-connect FAILED", err.Error())
+		return err
+	}
 
 	if c.cfg.DebugMode {
 		logger.Debug("SSH connector initialized with connection pool\n")
@@ -87,10 +94,11 @@ func (c *SSHConnector) Connect(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to create SSH session for source file check: %w", err)
 		}
+		checkCmd := platform.SourceEnvFileCheckCmd(c.cfg.TargetOS, c.cfg.SSHSourceExistenceCheck)
 		if c.cfg.DebugMode {
-			logger.Debug("Verifying remote -s file: %s\n", c.cfg.SSHSourceExistenceCheck)
+			logger.Debug("Verifying remote -s file: %s\n", checkCmd)
 		}
-		out, err := c.runCmd(sTest, c.cfg.SSHSourceExistenceCheck)
+		out, err := c.runCmd(sTest, checkCmd)
 		sTest.Close()
 		if err != nil {
 			return fmt.Errorf("source file not found on remote host (check -s path): %w\n%s", err, string(out))
@@ -99,54 +107,53 @@ func (c *SSHConnector) Connect(ctx context.Context) error {
 
 	// Skip CLI check if using custom login command
 	if c.cfg.LoginCmd != "" {
+		logger.DebugStep("ssh-connect OK", "login-cmd provided; skipped CLI check")
 		return nil
 	}
 
 	// Verify DB CLI is available on remote host (new session; SSH Session is one-shot per Run)
 	session, err := c.pool.NewSession()
 	if err != nil {
+		logger.DebugStep("ssh-connect FAILED", err.Error())
 		return fmt.Errorf("failed to create SSH session for CLI verification: %w", err)
 	}
 	defer session.Close()
 
 	cli := c.cfg.DefaultCLI()
-	checkCmd := c.WrapCmd(fmt.Sprintf("which %s", cli))
+	checkInner := platform.CheckRemoteCLICmd(c.cfg.TargetOS, cli)
+	checkCmd := c.WrapCmd(checkInner)
 
-	if c.cfg.DebugMode {
-		logger.Debug("Checking DB CLI command: %s\n", checkCmd)
-	}
+	logger.DebugSection("ssh-cli-check")
+	logger.DebugKeyVal("CLI", cli)
+	logger.DebugKeyVal("TargetOS", c.cfg.TargetOS)
+	logger.DebugKeyVal("CheckCmd", checkCmd)
 
 	output, err := c.runCmd(session, checkCmd)
+	outStr := strings.TrimSpace(string(output))
 	if err != nil {
-		return fmt.Errorf("DB CLI '%s' not found on remote host '%s'.\nPlease ensure it is installed, or use --login-cmd to specify a custom login command.\nOutput: %s", cli, c.cfg.SSHHost, string(output))
+		hint := buildCLIHint(c.cfg.DBType, c.cfg.TargetOS, c.cfg.SourceCmd)
+		logger.DebugStep("ssh-cli-check FAILED", err.Error())
+		logger.DebugCommandOutput("ssh-cli-check", outStr, err)
+		return fmt.Errorf(
+			"DB CLI '%s' not found on remote host '%s' (targetOS=%s).\n"+
+				"  Check command: %s\n"+
+				"  Remote output: %s\n"+
+				"%s",
+			cli, c.cfg.SSHHost, c.cfg.TargetOS, checkCmd, outStr, hint,
+		)
 	}
 
-	if c.cfg.DebugMode {
-		logger.Debug("DB CLI found: %s\n", strings.TrimSpace(string(output)))
-	}
-
+	cliPath := trimCLICheckOutput(outStr)
+	c.cfg.RemoteCLIPath = cliPath
+	logger.DebugStep("ssh-connect OK", "CLI="+cliPath)
+	logger.DebugKeyVal("CLIPath", cliPath)
 	return nil
 }
 
 // buildSSHSQLExecCmd builds the command string to execute a SQL temp file on remote host.
-// The returned command is already wrapped with profile loading via wrapCmd.
+// The returned command is already wrapped with profile loading via WrapCmd.
 func (c *SSHConnector) buildSSHSQLExecCmd(tmpFile string) string {
-	var cmd string
-	if c.cfg.LoginCmd != "" {
-		cmd = fmt.Sprintf("%s < %s", c.cfg.LoginCmd, tmpFile)
-	} else {
-		cli := c.cfg.DefaultCLI()
-		switch c.cfg.DBType {
-		case "mysql":
-			cmd = FormatMySQLScriptRedirect(cli, c.cfg.ConnectString, tmpFile)
-		case "postgresql":
-			cmd = fmt.Sprintf("%s %s -f %s", cli, c.cfg.ConnectString, tmpFile)
-		default:
-			// yasql, sqlplus, disql: @file syntax
-			cmd = fmt.Sprintf("%s -S %s @%s", cli, c.cfg.ConnectString, tmpFile)
-		}
-	}
-	return c.WrapCmd(cmd)
+	return c.WrapCmd(BuildRemoteSQLExecCmd(c.cfg, c.cfg.TargetOS, tmpFile))
 }
 
 // ExecuteQuery executes a SQL query via SSH using two-step upload+execute pattern
@@ -181,44 +188,15 @@ func (c *SSHConnector) ExecuteQueryWithHeader(ctx context.Context, sql string) (
 	return ParseYasqlOutputWithHeader(output)
 }
 
-// executeSQLTwoStep uploads SQL to remote temp file then executes it.
-// This matches the proven working pattern from executor.executeSQLViaSSHUpload.
+// executeSQLTwoStep uploads SQL via SFTP and executes it on the remote host.
 func (c *SSHConnector) executeSQLTwoStep(ctx context.Context, sql string) (string, error) {
-	tmpFile := fmt.Sprintf("/tmp/ytop_q_%d.sql", os.Getpid())
-
 	sql = WrapSQLSuppressScriptEcho(c.cfg.DBType, sql)
 	sql = EnsureSQLStatementTerminator(sql, c.cfg.DBType)
 
-	// Step 1: Upload SQL to remote temp file using heredoc (no profile needed for cat)
-	delim := randomHeredocMarker("YASTOP")
-	uploadCmd := fmt.Sprintf("cat > %s << '%s'\n%s\nexit\n%s", tmpFile, delim, sql, delim)
-	if c.cfg.DebugMode {
-		logger.Debug("[ssh] SQL: %s\n", strings.ReplaceAll(sql, "\n", " "))
-		logger.Debug("[ssh] Upload command: cat > %s << 'YASTOP_EOF' ...\n", tmpFile)
-	}
+	logger.DebugSection("ssh-sql-query")
+	logger.Debug("[ssh] SQL: %s\n", strings.ReplaceAll(sql, "\n", " "))
 
-	uploadOutput, err := c.ExecuteCommand(ctx, uploadCmd)
-	if err != nil {
-		return "", fmt.Errorf("failed to upload SQL to remote host: %w, output: %s", err, uploadOutput)
-	}
-
-	// Step 2: Execute the temp file (profile loaded via buildSSHSQLExecCmd -> wrapCmd)
-	execCmd := c.buildSSHSQLExecCmd(tmpFile)
-	if c.cfg.DebugMode {
-		logger.Debug("[ssh] Execute command: %s\n", execCmd)
-	}
-
-	output, err := c.ExecuteCommand(ctx, execCmd)
-	if err != nil {
-		return output, fmt.Errorf("SSH SQL execution failed: %w", err)
-	}
-
-	// Step 3: Cleanup temp file (best effort, ignore errors)
-	if !c.cfg.DebugMode {
-		c.ExecuteCommand(ctx, fmt.Sprintf("rm -f %s", tmpFile))
-	}
-
-	return output, nil
+	return c.ExecuteRemoteSQLScript(ctx, []byte(sql), remoteScriptBasename("q"))
 }
 
 // Close closes the SSH connection

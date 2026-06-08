@@ -78,7 +78,38 @@ func Debug(format string, args ...interface{}) {
 	}
 }
 
-// Debugf is an alias for Debug
+// Debugf is an alias for Debug.
 func Debugf(format string, args ...interface{}) {
 	Debug(format, args...)
+}
+
+// DebugStep logs a major named step with optional detail to ytop_debug.log and stderr (-D).
+func DebugStep(step, detail string) {
+	var line string
+	if detail != "" {
+		line = fmt.Sprintf("=== [STEP] %s: %s ===", step, detail)
+	} else {
+		line = fmt.Sprintf("=== [STEP] %s ===", step)
+	}
+	Debug("%s\n", line)
+	if debugEnabled {
+		fmt.Fprintf(os.Stderr, "[DEBUG] %s\n", line)
+	}
+}
+
+// DebugSection prints a lightweight section separator to log and stderr (-D).
+func DebugSection(name string) {
+	line := fmt.Sprintf("--- [%s] ---", name)
+	Debug("%s\n", line)
+	if debugEnabled {
+		fmt.Fprintf(os.Stderr, "[DEBUG] %s\n", line)
+	}
+}
+
+// DebugKeyVal logs a single key=value pair indented under the current step.
+func DebugKeyVal(key, val string) {
+	Debug("  %s=%s\n", key, val)
+	if debugEnabled {
+		fmt.Fprintf(os.Stderr, "[DEBUG]   %s=%s\n", key, val)
+	}
 }
