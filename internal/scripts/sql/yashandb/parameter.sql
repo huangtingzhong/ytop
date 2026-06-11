@@ -9,9 +9,9 @@ col IS_DEPRECATED  for a10
 
 select inst_id||'' i,
 name,value,default_value,
-IS_DEPRECATED,ISPDB_MODIFIABLE PDB_MODIFY ,ISPDB_PRIVATE PDB_PRIVATE
+IS_DEPRECATED
  from (
- SELECT inst_id,name,value,default_value, IS_DEPRECATED,ISPDB_MODIFIABLE,ISPDB_PRIVATE FROM GV_$PARAMETER
+ SELECT inst_id,name,value,default_value, IS_DEPRECATED FROM GV_$PARAMETER
  UNION 
- SELECT inst_id,name,value,default_value, IS_DEPRECATED,ISPDB_MODIFIABLE,ISPDB_PRIVATE FROM GX_$PARAMETER) a where (a.name LIKE  '%'||upper('&parameter')||'%') or (a.name=decode(upper('&parameter'),'',a.name) and a.default_value=a.value)
+ SELECT inst_id,name,value,default_value, IS_DEPRECATED FROM GX_$PARAMETER) a where (a.name LIKE  '%'||upper('&parameter')||'%') or (a.name=decode(upper('&parameter'),'',a.name) and a.default_value=a.value)
  order by inst_id,name;
