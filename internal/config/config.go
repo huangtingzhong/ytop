@@ -24,46 +24,46 @@ type Config struct {
 	SSHUser     string
 	SSHPassword string
 	SSHKeyFile  string
-	SourceCmd string
+	SourceCmd   string
 
 	// SSHSourceExistenceCheck is a remote `test -f <path>` fragment produced when -s is a simple env file path (SSH mode).
 	// Executed once in SSHConnector.Connect; empty when using a custom shell snippet or local mode.
 	SSHSourceExistenceCheck string
 
 	// Display settings
-	Interval           int
-	Count              int
-	OutputFile         string
-	SessionTopN        int
-	SessionSortBy      string
-	SessionDetailTopN  int
-	ShowTimestamp      bool
-	ColorEnabled       bool
-	InstanceID         int // 0 = all instances, 1,2,... = specific instance
+	Interval          int
+	Count             int
+	OutputFile        string
+	SessionTopN       int
+	SessionSortBy     string
+	SessionDetailTopN int
+	ShowTimestamp     bool
+	ColorEnabled      bool
+	InstanceID        int // 0 = all instances, 1,2,... = specific instance
 
 	// Metric settings
 	SysStatMetrics []string
 	EventTopN      int
 
 	// Advanced settings
-	QueryTimeout   int
-	SSHTimeout     int
-	ReuseSSH       bool
-	DebugMode      bool
+	QueryTimeout int
+	SSHTimeout   int
+	ReuseSSH     bool
+	DebugMode    bool
 
 	// Direct execution mode (non-interactive)
-	ExecuteScript  string // -f: script file to execute
-	ExecuteSQL     string // -q: SQL query to execute
-	ReadScript     string // -r: read/view script content
-	CopyScript     string // -c: copy script (format: "script dest")
-	FindScript     string // -S: find/search scripts (pattern; empty means all)
-	FindScriptSet  bool   // true when -S was passed on the command line
+	ExecuteScript string // -f: script file to execute
+	ExecuteSQL    string // -q: SQL query to execute
+	ReadScript    string // -r: read/view script content
+	CopyScript    string // -c: copy script (format: "script dest")
+	FindScript    string // -S: find/search scripts (pattern; empty means all)
+	FindScriptSet bool   // true when -S was passed on the command line
 
 	// Metric mode (delta/per-second calculation)
 	MetricMode bool // --metric: enable metric collection with delta calculation
 
 	// Database type
-	DBType string // "yashandb", "oracle", "dameng", "mysql", "postgresql"
+	DBType string // "yashandb", "oracle", "dameng", "mysql", "postgresql", "mssql"
 
 	// Custom login command (overrides default CLI login)
 	LoginCmd string
@@ -82,6 +82,12 @@ type Config struct {
 	// RemoteCLIPath is the absolute path to the DB CLI on the SSH target host.
 	// Populated during SSHConnector.Connect (which/where output); empty in local mode.
 	RemoteCLIPath string
+
+	// C / Python source execution (-f memtest.c / probe.py)
+	CC      string // C compiler (default gcc)
+	CFLAGS  string // C compiler flags
+	LDFLAGS string // C linker flags (e.g. -lm)
+	Python  string // Python interpreter (default python3)
 }
 
 // DefaultConfig returns a config with default values
@@ -121,6 +127,8 @@ func DefaultConfig() *Config {
 		ReuseSSH:     true,
 		DebugMode:    false,
 		DBType:       "yashandb",
+		CC:           "gcc",
+		Python:       "python3",
 	}
 }
 
@@ -143,6 +151,8 @@ func (c *Config) DefaultCLI() string {
 		return "mysql"
 	case "postgresql":
 		return "psql"
+	case "mssql":
+		return "sqlcmd"
 	default:
 		return c.YasqlPath
 	}
@@ -168,28 +178,66 @@ func (c *Config) ApplyDBTypeConnectDefaults() {
 		return
 	}
 	switch c.DBType {
-	case "mysql", "postgresql":
+	case "mysql", "postgresql", "mssql":
 		if IsOracleStyleConnectString(c.ConnectString) {
 			c.ConnectString = ""
 		}
 	}
 }
 
-// parseDBType normalizes db type shorthand to canonical name
-func parseDBType(s string) string {
+const defaultMssqlSSHWindowsConnectString = "-S localhost -E"
+
+// ApplyMssqlSSHWindowsConnectDefaults sets sqlcmd Windows integrated auth for SSH remotes
+// when the user did not pass -C/--connect (ConnectString empty after DB-type cleanup).
+// Call after TargetOS is known (SSH Connect).
+func (c *Config) ApplyMssqlSSHWindowsConnectDefaults() {
+	if c.LoginCmd != "" {
+		return
+	}
+	if c.DBType != "mssql" || c.ConnectionMode != "ssh" || c.TargetOS != "windows" {
+		return
+	}
+	if strings.TrimSpace(c.ConnectString) != "" {
+		return
+	}
+	c.ConnectString = defaultMssqlSSHWindowsConnectString
+}
+
+// ApplyMssqlRegistryPort patches default OS-auth ConnectString with a non-default TCP port from registry.
+func (c *Config) ApplyMssqlRegistryPort(tcpPort string) {
+	if c.LoginCmd != "" {
+		return
+	}
+	if c.DBType != "mssql" || c.ConnectionMode != "ssh" || c.TargetOS != "windows" {
+		return
+	}
+	port := strings.TrimSpace(tcpPort)
+	if port == "" || port == "1433" {
+		return
+	}
+	if strings.TrimSpace(c.ConnectString) != defaultMssqlSSHWindowsConnectString {
+		return
+	}
+	c.ConnectString = fmt.Sprintf("-S localhost,%s -E", port)
+}
+
+// parseDBType normalizes db type shorthand to canonical name.
+func parseDBType(s string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "y", "yas", "yashandb":
-		return "yashandb"
+		return "yashandb", nil
 	case "o", "ora", "oracle":
-		return "oracle"
+		return "oracle", nil
 	case "d", "dm", "dameng":
-		return "dameng"
+		return "dameng", nil
 	case "m", "my", "mysql":
-		return "mysql"
+		return "mysql", nil
 	case "p", "pg", "postgres", "postgresql":
-		return "postgresql"
+		return "postgresql", nil
+	case "s", "ms", "mssql", "sqlserver":
+		return "mssql", nil
 	default:
-		return "yashandb"
+		return "", fmt.Errorf("unknown database type %q (use y/o/d/m/p/s or yashandb/oracle/dameng/mysql/postgresql/mssql)", s)
 	}
 }
 
@@ -258,10 +306,14 @@ func LoadConfig() (*Config, error) {
 	findScript := flag.String("S", "", "Find/search scripts by pattern (non-interactive mode)")
 	metricMode := flag.Bool("m", false, "Enable metric mode with delta/per-second calculation (use with -f)")
 	metricModeLong := flag.Bool("metric", false, "Enable metric mode with delta/per-second calculation (use with -f)")
-	dbType := flag.String("d", "", "Database type: y/yas/yashandb, o/ora/oracle, d/dm/dameng, m/my/mysql, p/pg/postgres")
+	dbType := flag.String("d", "", "Database type: y/yas/yashandb, o/ora/oracle, d/dm/dameng, m/my/mysql, p/pg/postgres, s/ms/mssql")
 	dbTypeLong := flag.String("db-type", "", "Database type (long form)")
 	loginCmd := flag.String("login-cmd", "", "Custom login command (e.g. 'sqlplus / as sysdba')")
 	targetOS := flag.String("target-os", "", "Remote OS type for SSH mode: windows or unix (default: auto-detect)")
+	cc := flag.String("cc", "", "C compiler for -f *.c (default: gcc)")
+	cflags := flag.String("cflags", "", "C compiler flags for -f *.c")
+	ldflags := flag.String("ldflags", "", "C linker flags for -f *.c (e.g. -lm)")
+	python := flag.String("python", "", "Python interpreter for -f *.py (default: python3)")
 
 	if err := flag.CommandLine.Parse(normalizeFindScriptFlagArgs(os.Args)[1:]); err != nil {
 		return nil, err
@@ -293,10 +345,10 @@ func LoadConfig() (*Config, error) {
 	if *sshHostShort != "" {
 		cfg.SSHHost = *sshHostShort
 	}
-	if *port != 0 {  // Changed from > 0 to != 0 to handle both positive and default values
+	if *port != 0 { // Changed from > 0 to != 0 to handle both positive and default values
 		cfg.SSHPort = *port
 	}
-	if *portShort != 0 {  // Handle short parameter -P
+	if *portShort != 0 { // Handle short parameter -P
 		cfg.SSHPort = *portShort
 	}
 	if *sshUser != "" {
@@ -369,10 +421,18 @@ func LoadConfig() (*Config, error) {
 		cfg.MetricMode = true
 	}
 	if *dbTypeLong != "" {
-		cfg.DBType = parseDBType(*dbTypeLong)
+		parsed, err := parseDBType(*dbTypeLong)
+		if err != nil {
+			return nil, err
+		}
+		cfg.DBType = parsed
 	}
 	if *dbType != "" {
-		cfg.DBType = parseDBType(*dbType)
+		parsed, err := parseDBType(*dbType)
+		if err != nil {
+			return nil, err
+		}
+		cfg.DBType = parsed
 	}
 	if *loginCmd != "" {
 		cfg.LoginCmd = *loginCmd
@@ -386,6 +446,18 @@ func LoadConfig() (*Config, error) {
 		default:
 			return nil, fmt.Errorf("invalid --target-os %q: must be 'windows' or 'unix'", *targetOS)
 		}
+	}
+	if *cc != "" {
+		cfg.CC = *cc
+	}
+	if *cflags != "" {
+		cfg.CFLAGS = *cflags
+	}
+	if *ldflags != "" {
+		cfg.LDFLAGS = *ldflags
+	}
+	if *python != "" {
+		cfg.Python = *python
 	}
 
 	cfg.ApplyDBTypeConnectDefaults()
@@ -582,6 +654,8 @@ func (c *Config) Validate() error {
 				c.SSHUser = "root"
 			case "postgresql":
 				c.SSHUser = "postgres"
+			case "mssql":
+				c.SSHUser = "Administrator"
 			default:
 				c.SSHUser = "yashan"
 			}
@@ -664,7 +738,7 @@ func PrintUsage() {
 	fmt.Println("  --config <file>           Path to config file")
 	fmt.Println()
 	fmt.Println("Database:")
-	fmt.Println("  -d, --db-type <type>      DB type: yas(han)(default), o(ra), d(m), m(y), p(g)")
+	fmt.Println("  -d, --db-type <type>      DB type: yas(han)(default), o(ra), d(m), m(y), p(g), s(ms)")
 	fmt.Println("  --login-cmd <cmd>         Custom DB login command")
 	fmt.Println()
 	fmt.Println("Output:")
@@ -697,7 +771,7 @@ func PrintMonitorUsage() {
 	fmt.Println("  --config <file>           Path to config file")
 	fmt.Println()
 	fmt.Println("Database:")
-	fmt.Println("  -d, --db-type <type>      DB type: yas(han)(default), o(ra), d(m), m(y), p(g)")
+	fmt.Println("  -d, --db-type <type>      DB type: yas(han)(default), o(ra), d(m), m(y), p(g), s(ms)")
 	fmt.Println("  --login-cmd <cmd>         Custom DB login command")
 	fmt.Println()
 	fmt.Println("Output:")
@@ -734,10 +808,12 @@ func PrintScriptUsage() {
 	fmt.Println("Usage:  ytop -f <script>|-q <sql> [options] [interval] [count]")
 	fmt.Println()
 	fmt.Println("Execution:")
-	fmt.Println("  -f <script>               Execute script (SQL or OS)")
-	fmt.Println("                             SQL scripts: search in embedded sql/ directory")
-	fmt.Println("                             OS scripts: search in embedded os/ directory")
-	fmt.Println("                             Full path: /path/to/script.sql or ./script.sql")
+	fmt.Println("  -f <script>               Execute script (SQL, OS, C, or Python)")
+	fmt.Println("                             SQL: embedded sql/<dbtype>/ or path ending .sql")
+	fmt.Println("                             OS: embedded os/ or shell command")
+	fmt.Println("                             C/Py: embedded os/ (.c compile, .py interpret)")
+	fmt.Println("                             Full path: /path/to/file or ./file")
+	fmt.Println("                             With args: -f \"memtest.c -i 1 -t 2\"")
 	fmt.Println("  -q <sql>                  Execute SQL query directly")
 	fmt.Println("  -r <script>               View script content")
 	fmt.Println("  --copy <script> [dest]    Copy script to destination (default: /tmp)")
@@ -755,8 +831,12 @@ func PrintScriptUsage() {
 	fmt.Println("  --config <file>           Path to config file")
 	fmt.Println()
 	fmt.Println("Database:")
-	fmt.Println("  -d, --db-type <type>      DB type: yas(han)(default), o(ra), d(m), m(y), p(g)")
+	fmt.Println("  -d, --db-type <type>      DB type: yas(han)(default), o(ra), d(m), m(y), p(g), s(ms)")
 	fmt.Println("  --login-cmd <cmd>         Custom DB login command")
+	fmt.Println("  --cc <compiler>           C compiler for -f *.c (default: gcc)")
+	fmt.Println("  --cflags <flags>          C compile flags for -f *.c")
+	fmt.Println("  --ldflags <flags>         C link flags for -f *.c (e.g. -lm)")
+	fmt.Println("  --python <path>           Python for -f *.py (default: python3)")
 	fmt.Println()
 	fmt.Println("Output:")
 	fmt.Println("  -o, --output <file>       Append output to file")
@@ -774,6 +854,9 @@ func PrintScriptUsage() {
 	fmt.Println("  ytop -q \"select * from v$version\"            # Execute SQL query once")
 	fmt.Println("  ytop -q \"select count(*) from v$session\" 2 5 # Query every 2s, 5 times")
 	fmt.Println("  ytop -t 10.10.10.130 -f iostat.sh           # Execute OS script on remote")
+	fmt.Println("  ytop -f \"hello.c -i 1 -t 2\"               # Compile and run C on target")
+	fmt.Println("  ytop -f \"hello.py --verbose\"                # Run Python script on target")
+	fmt.Println("  ytop --ldflags \"-lm\" -f memtest.c           # C with link flags")
 	fmt.Println("  ytop -r we.sql                              # View script content")
 	fmt.Println("  ytop --copy 'we.sql /tmp'                   # Copy script")
 	fmt.Println("  ytop -S 'awr'                               # Search scripts")

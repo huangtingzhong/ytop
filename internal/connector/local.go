@@ -161,6 +161,9 @@ func buildCLIHint(dbType, localOS, sourceCmd string) string {
 			sb.WriteString(`     --login-cmd "C:\Program Files\PostgreSQL\16\bin\psql.exe -U postgres"` + "\n")
 		case "dameng":
 			sb.WriteString(`     --login-cmd "C:\dmdbms\bin\disql.exe SYSDBA/SYSDBA"` + "\n")
+		case "mssql":
+			sb.WriteString(`     --login-cmd "C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn\sqlcmd.exe -S localhost -U sa"` + "\n")
+			sb.WriteString("  3. On SSH to Windows, ytop also tries SQL Server registry keys to locate sqlcmd when it is not in PATH.\n")
 		}
 		if sourceCmd != "" {
 			sb.WriteString("  3. If the CLI is installed but needs env setup, check the -s bat file path.\n")

@@ -27,12 +27,12 @@ col connection         for a16
 col peer_role          for a12
 col peer_mode          for a12
 col peer_addr          for a25
-col peer_point         for a20
-col received_point     for a20
-col applied_point      for a20
-col error              for a80
-col transp_lag         for a14
-col apply_lag          for a14
+col peer_point         for a15
+col received_point     for a15
+col applied_point      for a15
+col error              for a60
+col t_lag              for a10
+col a_lag              for a10
 col gap_seq            for a8
 col last_msg_sec       for a10
 
@@ -44,13 +44,25 @@ SELECT connection,
        peer_point,
        received_point,
        applied_point,
-       transport_lag || '' AS transp_lag,
-       apply_lag     || '' AS apply_lag,
+       transport_lag || '' AS t_lag,
+       apply_lag     || '' AS a_lag,
        gap_seq#      || '' AS gap_seq,
        time_since_last_msg || '' AS last_msg_sec,
        error
 FROM v$replication_status;
 
-col peer_addr for a25
-select * from v$recovery_status;
-SELECT item,units,value FROM GV$RECOVERY_PROGRESS;
+SELECT inst_id, id AS gap_id, low_sequence#, high_sequence#
+FROM gv$archive_gap
+ORDER BY inst_id, gap_id;
+
+SELECT g.inst_id,
+       g.id AS gap_id,
+       g.low_sequence# + n.n - 1 AS missing_seq#
+FROM gv$archive_gap g
+CROSS JOIN (SELECT LEVEL AS n FROM dual CONNECT BY LEVEL <= 9999) n
+WHERE g.low_sequence# + n.n - 1 <= g.high_sequence#
+ORDER BY g.inst_id, g.id, missing_seq#;
+
+
+SELECT * FROM v$recovery_status;
+SELECT item, units, value FROM gv$recovery_progress;

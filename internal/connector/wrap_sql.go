@@ -11,7 +11,7 @@ func WrapSQLSuppressScriptEcho(dbType string, sql string) string {
 		return sql
 	}
 	switch dbType {
-	case "mysql", "postgresql", "yashandb":
+	case "mysql", "postgresql", "yashandb", "mssql":
 		return sql
 	default:
 		return "SET ECHO OFF\nSET VERIFY OFF\n" + sql
@@ -34,6 +34,8 @@ func EnsureSQLStatementTerminator(sql string, dbType string) string {
 	switch dbType {
 	case "mysql", "postgresql":
 		return sql + ";"
+	case "mssql":
+		return sql
 	default:
 		if endsWithSlashOnlyLine(sql) {
 			return sql

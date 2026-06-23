@@ -167,7 +167,7 @@ func runMonitor() {
 
 	// Check if in direct execution mode (-f or -q or -r)
 	if cfg.ExecuteScript != "" || cfg.ExecuteSQL != "" || cfg.ReadScript != "" ||
-	   cfg.CopyScript != "" {
+		cfg.CopyScript != "" {
 		runDirectExecution(ctx, cfg, conn)
 		return
 	}
@@ -205,7 +205,7 @@ func runDirectExecution(ctx context.Context, cfg *config.Config, conn connector.
 	// Execute script or SQL with interval/count support
 	count := cfg.Count
 	// OS commands default to running once; SQL scripts/queries can loop
-	if count == 0 && cfg.ExecuteScript != "" && !strings.HasSuffix(cfg.ExecuteScript, ".sql") {
+	if count == 0 && cfg.ExecuteScript != "" && !scripts.IsSQLScriptInput(cfg.ExecuteScript) {
 		count = 1
 	}
 	interval := cfg.Interval
@@ -234,7 +234,7 @@ func runDirectExecution(ctx context.Context, cfg *config.Config, conn connector.
 
 		// Display output (SQL only; OS commands already printed via real-time streaming)
 		if output != "" {
-			isSQL := cfg.ExecuteSQL != "" || strings.HasSuffix(cfg.ExecuteScript, ".sql")
+			isSQL := cfg.ExecuteSQL != "" || scripts.IsSQLScriptInput(cfg.ExecuteScript)
 			if isSQL {
 				fmt.Print(output)
 				if !strings.HasSuffix(output, "\n") {
@@ -392,9 +392,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 
 	// Channel for keyboard input (only in interactive mode)
 	keyChan := make(chan byte, 10)
-	rawInputChan := make(chan byte, 100)  // Raw input from stdin
-	globalInputChan = rawInputChan         // Set global for terminal.PromptInput
-	pauseReadChan := make(chan bool, 1)   // Channel to pause/resume keyboard reading
+	rawInputChan := make(chan byte, 100) // Raw input from stdin
+	globalInputChan = rawInputChan       // Set global for terminal.PromptInput
+	pauseReadChan := make(chan bool, 1)  // Channel to pause/resume keyboard reading
 	stopChan := make(chan struct{})
 	globalStopChan = stopChan
 	if isTerminal {
@@ -608,7 +608,7 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 						// Display output if available (SQL scripts only;
 						// OS commands already printed via real-time streaming)
 						if output != "" && !cancelled {
-							isSQLScript := strings.HasSuffix(command, ".sql")
+							isSQLScript := scripts.IsSQLScriptInput(command)
 							if isSQLScript {
 								fmt.Print("\r\n")
 								displayOutput := strings.ReplaceAll(output, "\n", "\r\n")

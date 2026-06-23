@@ -378,6 +378,9 @@ func stripScriptCommentLine(s string) string {
 	if strings.HasPrefix(s, "#") {
 		return strings.TrimSpace(strings.TrimPrefix(s, "#"))
 	}
+	if strings.HasPrefix(s, "//") {
+		return strings.TrimSpace(strings.TrimPrefix(s, "//"))
+	}
 	return ""
 }
 
@@ -398,7 +401,26 @@ func normalizeScriptDescription(line string) string {
 // ReadScriptContent reads and returns the content of a script file
 // Returns content, isBinary flag, and error
 func ReadScriptContent(filename string) (string, bool, error) {
-	// First try filesystem
+	if isExplicitPath(filename) {
+		content, err := os.ReadFile(filename)
+		if err != nil {
+			return "", false, fmt.Errorf("failed to read script file: %w", err)
+		}
+		if !utf8.Valid(content) {
+			return "", true, nil
+		}
+		return string(content), false, nil
+	}
+
+	// Try typed loaders (embedded + filesystem scripts dir)
+	if content, err := LoadScriptByName(filename); err == nil {
+		if !utf8.Valid([]byte(content)) {
+			return "", true, nil
+		}
+		return content, false, nil
+	}
+
+	// First try filesystem legacy paths
 	scriptsDir, err := getScriptDir()
 	if err == nil && scriptsDir != "" {
 		var scriptPath string

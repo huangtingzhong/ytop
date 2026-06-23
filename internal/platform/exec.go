@@ -51,6 +51,8 @@ func defaultCLIName(dbType, yasqlPath string) string {
 		return "disql"
 	case "postgresql":
 		return "psql"
+	case "mssql":
+		return "sqlcmd"
 	default: // yashandb
 		if yasqlPath != "" {
 			return yasqlPath

@@ -33,9 +33,9 @@ type Result struct {
 
 // GroupData represents metrics for a single group
 type GroupData struct {
-	GroupKey    string              // e.g., "1", "2" or "ALL"
-	NumericVals map[string]float64  // column -> per_sec value (for numeric columns)
-	StringVals  map[string]string   // column -> current value (for string/time columns)
+	GroupKey    string             // e.g., "1", "2" or "ALL"
+	NumericVals map[string]float64 // column -> per_sec value (for numeric columns)
+	StringVals  map[string]string  // column -> current value (for string/time columns)
 }
 
 // Calculate computes deltas and per-second rates

@@ -199,4 +199,3 @@ func (p *SSHConnectionPool) Client() *ssh.Client {
 	defer p.mu.Unlock()
 	return p.client
 }
-

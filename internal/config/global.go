@@ -98,7 +98,7 @@ func (gf *GlobalFlags) ApplyToConfig(cfg *Config) {
 	if gf.SSHHost != "" {
 		cfg.SSHHost = gf.SSHHost
 	}
-	if gf.SSHPort != 0 {  // Changed from > 0 to != 0 to handle default value properly
+	if gf.SSHPort != 0 { // Changed from > 0 to != 0 to handle default value properly
 		cfg.SSHPort = gf.SSHPort
 	}
 	if gf.SSHUser != "" {

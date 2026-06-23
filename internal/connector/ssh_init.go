@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/yihan/ytop/internal/config"
 	"github.com/yihan/ytop/internal/logger"
+	"github.com/yihan/ytop/internal/platform"
 )
 
 // FindLocalKey returns the path to an existing default SSH private key,
@@ -148,63 +150,24 @@ func generateRSAKeyPair(basePath string) error {
 }
 
 // CopyPublicKeyToHost connects to the remote host using password authentication
-// and appends the public key to ~/.ssh/authorized_keys.
+// and appends the public key to the OS-appropriate authorized_keys file.
 func CopyPublicKeyToHost(cfg *config.Config, pubKey string) error {
-	sshConfig := &ssh.ClientConfig{
-		User:            cfg.SSHUser,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         time.Duration(cfg.SSHTimeout) * time.Second,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(cfg.SSHPassword),
-			ssh.KeyboardInteractive(func(user, instruction string, questions []string, echos []bool) ([]string, error) {
-				answers := make([]string, len(questions))
-				for i := range answers {
-					answers[i] = cfg.SSHPassword
-				}
-				return answers, nil
-			}),
-		},
-	}
-
-	addr := fmt.Sprintf("%s:%d", cfg.SSHHost, cfg.SSHPort)
-	logger.Debug("[ssh-init] connecting to %s (user=%s, auth=password)\n", addr, cfg.SSHUser)
-
-	client, err := ssh.Dial("tcp", addr, sshConfig)
+	client, addr, err := dialPasswordSSH(cfg)
 	if err != nil {
-		logger.Debug("[ssh-init] connection failed: %v\n", err)
-		return fmt.Errorf("SSH connection to %s failed: %w", addr, err)
+		return err
 	}
 	defer client.Close()
-	logger.Debug("[ssh-init] connected to %s\n", addr)
 
-	session, err := client.NewSession()
-	if err != nil {
-		return fmt.Errorf("failed to create SSH session: %w", err)
-	}
-	defer session.Close()
+	targetOS := resolveSSHTargetOS(cfg, client)
+	logger.Debug("[ssh-init] target OS for key install: %s\n", targetOS)
 
-	// Build remote command: ensure ~/.ssh dir, append key, deduplicate, set permissions.
-	// Use base64 to safely transfer the public key (avoids shell injection from key comments).
 	encoded := base64.StdEncoding.EncodeToString([]byte(pubKey))
-	remoteCmd := fmt.Sprintf(
-		"mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '%s' | base64 -d >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys",
-		encoded,
-	)
-
-	logger.Debug("[ssh-init] remote command: %s\n", remoteCmd)
-
-	output, err := session.CombinedOutput(remoteCmd)
-	if err != nil {
-		logger.Debug("[ssh-init] remote command failed: %v, output: %s\n", err, string(output))
-		return fmt.Errorf("failed to write public key to remote host: %w\n%s", err, string(output))
-	}
-
-	logger.Debug("[ssh-init] public key written successfully, output: %s\n", strings.TrimSpace(string(output)))
-	return nil
+	remoteCmd := platform.CopyPublicKeyRemoteCmd(targetOS, encoded)
+	return runSSHInitRemoteCmd(client, addr, "write public key to remote host", remoteCmd)
 }
 
 // DeletePublicKeyFromHost connects to the remote host using key authentication
-// and removes the matching public key line from ~/.ssh/authorized_keys.
+// and removes the matching public key line from the OS-appropriate authorized_keys file.
 func DeletePublicKeyFromHost(cfg *config.Config, keyFile string, pubKey string) error {
 	logger.Debug("[ssh-init] reading private key: %s\n", keyFile)
 
@@ -238,31 +201,12 @@ func DeletePublicKeyFromHost(cfg *config.Config, keyFile string, pubKey string) 
 	defer client.Close()
 	logger.Debug("[ssh-init] connected to %s\n", addr)
 
-	session, err := client.NewSession()
-	if err != nil {
-		return fmt.Errorf("failed to create SSH session: %w", err)
-	}
-	defer session.Close()
+	targetOS := resolveSSHTargetOS(cfg, client)
+	logger.Debug("[ssh-init] target OS for key delete: %s\n", targetOS)
 
-	// Remove the matching line from authorized_keys.
-	// Use base64 + grep -vF to safely match the key (avoids shell injection).
-	// Append "|| true" so grep exit 1 (no remaining lines) does not abort the chain.
 	encoded := base64.StdEncoding.EncodeToString([]byte(pubKey))
-	remoteCmd := fmt.Sprintf(
-		"grep -vF \"$(echo '%s' | base64 -d)\" ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true; mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys",
-		encoded,
-	)
-
-	logger.Debug("[ssh-init] remote command: %s\n", remoteCmd)
-
-	output, err := session.CombinedOutput(remoteCmd)
-	if err != nil {
-		logger.Debug("[ssh-init] remote command failed: %v, output: %s\n", err, string(output))
-		return fmt.Errorf("failed to remove public key from remote host: %w\n%s", err, string(output))
-	}
-
-	logger.Debug("[ssh-init] public key removed successfully, output: %s\n", strings.TrimSpace(string(output)))
-	return nil
+	remoteCmd := platform.DeletePublicKeyRemoteCmd(targetOS, encoded)
+	return runSSHInitRemoteCmd(client, addr, "remove public key from remote host", remoteCmd)
 }
 
 // TestKeyAuth tests that key-based authentication works by connecting with the private key.
@@ -299,5 +243,61 @@ func TestKeyAuth(cfg *config.Config, keyFile string) error {
 	client.Close()
 
 	logger.Debug("[ssh-init] key auth test passed\n")
+	return nil
+}
+
+func dialPasswordSSH(cfg *config.Config) (*ssh.Client, string, error) {
+	sshConfig := &ssh.ClientConfig{
+		User:            cfg.SSHUser,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         time.Duration(cfg.SSHTimeout) * time.Second,
+		Auth: []ssh.AuthMethod{
+			ssh.Password(cfg.SSHPassword),
+			ssh.KeyboardInteractive(func(user, instruction string, questions []string, echos []bool) ([]string, error) {
+				answers := make([]string, len(questions))
+				for i := range answers {
+					answers[i] = cfg.SSHPassword
+				}
+				return answers, nil
+			}),
+		},
+	}
+
+	addr := fmt.Sprintf("%s:%d", cfg.SSHHost, cfg.SSHPort)
+	logger.Debug("[ssh-init] connecting to %s (user=%s, auth=password)\n", addr, cfg.SSHUser)
+
+	client, err := ssh.Dial("tcp", addr, sshConfig)
+	if err != nil {
+		logger.Debug("[ssh-init] connection failed: %v\n", err)
+		return nil, addr, fmt.Errorf("SSH connection to %s failed: %w", addr, err)
+	}
+	logger.Debug("[ssh-init] connected to %s\n", addr)
+	return client, addr, nil
+}
+
+func resolveSSHTargetOS(cfg *config.Config, client *ssh.Client) string {
+	if cfg.TargetOS != "" {
+		logger.Debug("[ssh-init] using explicit target OS: %s\n", cfg.TargetOS)
+		return cfg.TargetOS
+	}
+	return platform.DetectRemoteOS(context.Background(), client, logger.Debug)
+}
+
+func runSSHInitRemoteCmd(client *ssh.Client, addr, action, remoteCmd string) error {
+	session, err := client.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer session.Close()
+
+	logger.Debug("[ssh-init] remote command: %s\n", remoteCmd)
+
+	output, err := session.CombinedOutput(remoteCmd)
+	if err != nil {
+		logger.Debug("[ssh-init] remote command failed: %v, output: %s\n", err, string(output))
+		return fmt.Errorf("failed to %s: %w\n%s", action, err, string(output))
+	}
+
+	logger.Debug("[ssh-init] remote command succeeded, output: %s\n", strings.TrimSpace(string(output)))
 	return nil
 }

@@ -131,6 +131,58 @@ func quoteWindowsPath(path string) string {
 	return path
 }
 
+// SQLCmdConnectArgs splits ConnectString into sqlcmd client flags.
+func SQLCmdConnectArgs(connectString string) []string {
+	return strings.Fields(strings.TrimSpace(connectString))
+}
+
+// SQLCmdExecArgv returns argv for exec.Command(sqlcmd, argv...).
+func SQLCmdExecArgv(connectString string, extra ...string) []string {
+	args := append([]string{}, SQLCmdConnectArgs(connectString)...)
+	return append(args, extra...)
+}
+
+// FormatSQLCmdCLIInvocation builds a shell-safe sqlcmd command (Unix/bash).
+func FormatSQLCmdCLIInvocation(cli, connectString string, extra ...string) string {
+	parts := append([]string{cli}, SQLCmdExecArgv(connectString, extra...)...)
+	quoted := make([]string, len(parts))
+	for i, p := range parts {
+		quoted[i] = platform.ShellQuoteUnix(p)
+	}
+	return strings.Join(quoted, " ")
+}
+
+// FormatSQLCmdScriptExec builds sqlcmd -i for the target OS.
+func FormatSQLCmdScriptExec(targetOS, cli, connectString, scriptFile string) string {
+	if targetOS == platform.OSWindows {
+		// Use backslashes: C:/Users/... makes sqlcmd treat "/Users" as -U (OS auth conflict with -E).
+		path := quoteWindowsPath(formatSQLCmdWindowsScriptPath(scriptFile))
+		return formatWindowsCLIWithConnect(cli, connectString, "-i", path)
+	}
+	return FormatSQLCmdCLIInvocation(cli, connectString, "-i", scriptFile)
+}
+
+func formatSQLCmdWindowsScriptPath(path string) string {
+	return strings.ReplaceAll(path, `/`, `\`)
+}
+
+// FormatSQLCmdAdHocRemoteCmd builds sqlcmd -Q for remote SSH execution.
+func FormatSQLCmdAdHocRemoteCmd(targetOS, cli, connectString, sql string) string {
+	if targetOS == platform.OSWindows {
+		parts := append([]string{cli}, SQLCmdExecArgv(connectString, "-Q", sql)...)
+		quoted := make([]string, len(parts))
+		for i, p := range parts {
+			if strings.ContainsAny(p, " \t\"") {
+				quoted[i] = `"` + strings.ReplaceAll(p, `"`, `""`) + `"`
+			} else {
+				quoted[i] = p
+			}
+		}
+		return strings.Join(quoted, " ")
+	}
+	return FormatSQLCmdCLIInvocation(cli, connectString, "-Q", sql)
+}
+
 // BuildRemoteSQLExecCmd builds the remote shell command to execute a SQL script file.
 // tmpFile must be an absolute path on the remote host (SFTP upload target).
 func BuildRemoteSQLExecCmd(cfg *config.Config, targetOS, tmpFile string) string {
@@ -143,6 +195,8 @@ func BuildRemoteSQLExecCmd(cfg *config.Config, targetOS, tmpFile string) string 
 		return FormatMySQLScriptRedirectForOS(targetOS, cli, cfg.ConnectString, tmpFile)
 	case "postgresql":
 		return formatPostgreSQLRemoteExec(targetOS, cli, cfg.ConnectString, tmpFile)
+	case "mssql":
+		return FormatSQLCmdScriptExec(targetOS, cli, cfg.ConnectString, tmpFile)
 	default:
 		return formatOracleStyleRemoteExec(targetOS, cli, cfg.ConnectString, tmpFile)
 	}
@@ -267,6 +321,12 @@ func buildWindowsDirectExec(ctx context.Context, cfg *config.Config, cli, sql, s
 		}
 		return exec.CommandContext(ctx, cli, append(strings.Fields(cfg.ConnectString), "-c", sql)...)
 
+	case "mssql":
+		if scriptFile != "" {
+			return exec.CommandContext(ctx, cli, SQLCmdExecArgv(cfg.ConnectString, "-i", scriptFile)...)
+		}
+		return exec.CommandContext(ctx, cli, SQLCmdExecArgv(cfg.ConnectString, "-Q", sql)...)
+
 	default: // oracle (sqlplus), dameng (disql)
 		args := []string{"-S"}
 		if cfg.ConnectString != "" {
@@ -310,6 +370,18 @@ func buildWindowsSourcedExec(ctx context.Context, cfg *config.Config, cli, sql, 
 		parts := make([]string, len(connArgs)+1)
 		parts[0] = cli
 		copy(parts[1:], connArgs)
+		inner = strings.Join(parts, " ")
+
+	case "mssql":
+		args := SQLCmdExecArgv(cfg.ConnectString)
+		if scriptFile != "" {
+			args = append(args, "-i", scriptFile)
+		} else {
+			args = append(args, "-Q", sql)
+		}
+		parts := make([]string, len(args)+1)
+		parts[0] = cli
+		copy(parts[1:], args)
 		inner = strings.Join(parts, " ")
 
 	default: // oracle, dameng
@@ -356,6 +428,11 @@ func buildLocalDirectSQLExec(ctx context.Context, cfg *config.Config, cli, sql, 
 			return exec.CommandContext(ctx, cli, cfg.ConnectString, "-f", scriptFile)
 		}
 		return exec.CommandContext(ctx, cli, cfg.ConnectString, "-c", sql)
+	case "mssql":
+		if scriptFile != "" {
+			return exec.CommandContext(ctx, cli, SQLCmdExecArgv(cfg.ConnectString, "-i", scriptFile)...)
+		}
+		return exec.CommandContext(ctx, cli, SQLCmdExecArgv(cfg.ConnectString, "-Q", sql)...)
 	default:
 		args := []string{"-S"}
 		if cfg.ConnectString != "" {
@@ -391,6 +468,14 @@ func buildLocalSourcedSQLExec(ctx context.Context, cfg *config.Config, cli, sql,
 		} else {
 			fullCmd = WrapSourceCmd(cfg.SourceCmd,
 				FormatCLIInvocation(cli, cfg.ConnectString, "-c", sql))
+		}
+	case "mssql":
+		if scriptFile != "" {
+			fullCmd = WrapSourceCmd(cfg.SourceCmd,
+				FormatSQLCmdCLIInvocation(cli, cfg.ConnectString, "-i", scriptFile))
+		} else {
+			fullCmd = WrapSourceCmd(cfg.SourceCmd,
+				FormatSQLCmdCLIInvocation(cli, cfg.ConnectString, "-Q", sql))
 		}
 	default:
 		args := []string{"-S"}

@@ -42,8 +42,12 @@ func (e *Executor) ExecuteCommand(ctx context.Context, input string) (string, er
 	}
 
 	// Check if it's a SQL script
-	if strings.HasSuffix(input, ".sql") {
-		return e.executeSQLScript(ctx, input)
+	if scripts.IsSQLScriptInput(input) {
+		return e.executeSQLScript(ctx, scripts.FirstToken(input))
+	}
+
+	if _, runArgs, kind, ok := parseSourceInvocation(input); ok {
+		return e.executeSourceFile(ctx, scripts.FirstToken(input), runArgs, kind)
 	}
 
 	// Check if it's an OS command/script
@@ -158,7 +162,7 @@ func (e *Executor) executeOSCommand(ctx context.Context, input string) (string, 
 		scriptName := fields[0]
 		scriptContent, err := scripts.GetOSScript(scriptName)
 		if err == nil {
-			return e.executeOSScript(ctx, scriptContent, nil)
+			return e.executeOSScript(ctx, scriptName, scriptContent, nil)
 		}
 		// Input looks like a script name (e.g. db_size.sl) but script not found:
 		// do not run as shell command to avoid SSH and confusing "command not found"
@@ -170,7 +174,7 @@ func (e *Executor) executeOSCommand(ctx context.Context, input string) (string, 
 		scriptName := fields[0]
 		scriptContent, err := scripts.GetOSScript(scriptName)
 		if err == nil {
-			return e.executeOSScript(ctx, scriptContent, fields[1:])
+			return e.executeOSScript(ctx, scriptName, scriptContent, fields[1:])
 		}
 		// Looks like a script filename but not in script library
 		if looksLikeOSScriptFilename(scriptName) {
@@ -189,7 +193,7 @@ func (e *Executor) executeOSCommand(ctx context.Context, input string) (string, 
 func looksLikeOSScriptFilename(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
-	case ".sh", ".bash", ".zsh", ".ksh":
+	case ".sh", ".bash", ".zsh", ".ksh", ".c", ".py", ".ps1", ".bat", ".cmd":
 		return true
 	default:
 		return false
@@ -330,31 +334,93 @@ func (e *Executor) executeOSCommandLocal(ctx context.Context, command string) (s
 	return result, nil
 }
 
-// executeOSScript executes an OS script (optional args passed to the script as positional parameters)
-func (e *Executor) executeOSScript(ctx context.Context, scriptContent string, args []string) (string, error) {
-	if len(args) == 0 {
-		if e.cfg.ConnectionMode == "ssh" {
-			return e.executeOSCommandViaSSH(ctx, scriptContent)
+// effectiveTargetOS returns the OS where commands/scripts execute.
+func (e *Executor) effectiveTargetOS() string {
+	if e.cfg.ConnectionMode == "ssh" {
+		if e.cfg.TargetOS != "" {
+			return e.cfg.TargetOS
 		}
-		return e.executeOSCommandLocal(ctx, scriptContent)
+		return platform.OSUnix
+	}
+	return platform.LocalOS()
+}
+
+func osScriptArtifactName(scriptName string) string {
+	ext := filepath.Ext(scriptName)
+	base := strings.TrimSuffix(filepath.Base(scriptName), ext)
+	if base == "" {
+		base = "script"
+	}
+	return fmt.Sprintf("ytop_%s_%d%s", base, os.Getpid(), ext)
+}
+
+// executeOSScript executes an embedded OS script using a runner matched to target OS and file extension.
+func (e *Executor) executeOSScript(ctx context.Context, scriptName, scriptContent string, args []string) (string, error) {
+	targetOS := e.effectiveTargetOS()
+	kind := platform.OSScriptKindFromExt(scriptName)
+	if !platform.OSScriptSupportedOn(kind, targetOS) {
+		return "", platform.OSScriptMismatchError(scriptName, targetOS, kind)
 	}
 
-	delim := randomHeredocMarker("YTOP_OS_EOF")
-	var escapedArgs strings.Builder
-	for _, a := range args {
-		if escapedArgs.Len() > 0 {
-			escapedArgs.WriteByte(' ')
-		}
-		escapedArgs.WriteString(utils.ShellEscape(a))
+	pythonBin := e.cfg.Python
+	if pythonBin == "" {
+		pythonBin = platform.DefaultPythonBin(targetOS)
 	}
 
-	cmd := fmt.Sprintf("bash -s -- %s <<'%s'\n%s\n%s",
-		escapedArgs.String(), delim, scriptContent, delim)
+	artifact := osScriptArtifactName(scriptName)
 
 	if e.cfg.ConnectionMode == "ssh" {
-		return e.executeOSCommandViaSSH(ctx, cmd)
+		return e.executeOSScriptSSH(ctx, scriptContent, artifact, args, kind, pythonBin, targetOS)
+	}
+	return e.executeOSScriptLocal(ctx, scriptContent, artifact, args, kind, pythonBin, targetOS)
+}
+
+func (e *Executor) executeOSScriptLocal(ctx context.Context, scriptContent, artifact string, args []string, kind platform.OSScriptKind, pythonBin, targetOS string) (string, error) {
+	scriptPath := platform.LocalTempPath(artifact)
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0644); err != nil {
+		return "", fmt.Errorf("failed to write OS script: %w", err)
+	}
+	if !e.cfg.DebugMode {
+		defer os.Remove(scriptPath)
+	}
+
+	cmd, err := platform.BuildOSScriptRunCmd(targetOS, scriptPath, args, kind, pythonBin)
+	if err != nil {
+		return "", err
+	}
+	if e.cfg.SourceCmd != "" {
+		cmd = connector.WrapSourceCmd(e.cfg.SourceCmd, cmd)
+	}
+	if e.cfg.DebugMode {
+		logger.Debug("Executing OS script locally: %s\n", cmd)
 	}
 	return e.executeOSCommandLocal(ctx, cmd)
+}
+
+func (e *Executor) executeOSScriptSSH(ctx context.Context, scriptContent, artifact string, args []string, kind platform.OSScriptKind, pythonBin, targetOS string) (string, error) {
+	sshConn, ok := e.conn.(*connector.SSHConnector)
+	if !ok {
+		return "", fmt.Errorf("not an SSH connection")
+	}
+
+	sftpPath, execPath, err := sshConn.UploadScriptSFTP(ctx, []byte(scriptContent), artifact)
+	if err != nil {
+		return "", fmt.Errorf("failed to upload OS script: %w", err)
+	}
+
+	if !e.cfg.DebugMode {
+		defer sshConn.CleanupRemoteScript(sftpPath)
+	}
+
+	cmd, err := platform.BuildOSScriptRunCmd(targetOS, execPath, args, kind, pythonBin)
+	if err != nil {
+		return "", err
+	}
+	cmd = sshConn.WrapCmd(cmd)
+	if e.cfg.DebugMode {
+		logger.Debug("Executing OS script via SSH: %s\n", cmd)
+	}
+	return sshConn.ExecuteCommandRealtime(ctx, cmd)
 }
 
 // ExecuteAdHocSQL executes a single SQL statement directly
@@ -404,6 +470,8 @@ func (e *Executor) executeAdHocSQLViaSSH(ctx context.Context, sql string) (strin
 			cli,
 			e.cfg.ConnectString,
 			utils.ShellEscape(sqlExec))
+	case "mssql":
+		remoteCmd = connector.FormatSQLCmdAdHocRemoteCmd(e.cfg.TargetOS, cli, e.cfg.ConnectString, sqlExec)
 	default:
 		// Windows remote has no bash heredoc; upload script and run via @file / disql.
 		if e.cfg.TargetOS == platform.OSWindows {
@@ -468,7 +536,7 @@ func (e *Executor) findVariables(script string) []string {
 	matches := re.FindAllStringSubmatch(script, -1)
 
 	seen := make(map[string]struct {
-		name   string
+		name     string
 		isDouble bool
 	})
 	var variables []string
@@ -493,7 +561,7 @@ func (e *Executor) findVariables(script string) []string {
 				}
 			} else {
 				seen[varName] = struct {
-					name   string
+					name     string
 					isDouble bool
 				}{varName, isDouble}
 				variables = append(variables, key)
@@ -552,16 +620,16 @@ func (e *Executor) CopyScript(ctx context.Context, scriptName, destPath string) 
 	if strings.HasSuffix(scriptName, ".sql") {
 		scriptContent, err = scripts.GetSQLScript(scriptName)
 	} else {
-		scriptContent, err = scripts.GetOSScript(scriptName)
+		scriptContent, err = scripts.LoadScriptByName(scriptName)
 	}
 
 	if err != nil {
 		return "", fmt.Errorf("failed to load script: %w", err)
 	}
 
-	// Default to /tmp if no destination specified
+	// Default destination uses target OS temp directory
 	if destPath == "" {
-		destPath = "/tmp"
+		destPath = platform.DefaultScriptCopyDir(e.effectiveTargetOS())
 	}
 
 	// Ensure destination path ends with /

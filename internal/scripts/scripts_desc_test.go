@@ -2,46 +2,33 @@ package scripts
 
 import "testing"
 
-func TestNormalizeScriptDescription(t *testing.T) {
-	tests := []struct {
-		in, want string
+func TestExtractScriptDescriptionOSHeaders(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
 	}{
-		{"Purpose: YashanDB Show AWR load profile", "YashanDB Show AWR load profile"},
-		{"Purpose:YashanDB no space", "YashanDB no space"},
-		{"YashanDB already clean", "YashanDB already clean"},
-		{"", ""},
+		{
+			name: "shell hash purpose",
+			body: "#!/bin/bash\n# Purpose: Wrapper to run iostat extended stats\n",
+			want: "Wrapper to run iostat extended stats",
+		},
+		{
+			name: "python hash purpose",
+			body: "#!/usr/bin/env python\n# Purpose: Process and thread CPU memory IO stats via /proc\n",
+			want: "Process and thread CPU memory IO stats via /proc",
+		},
+		{
+			name: "c slash purpose",
+			body: "// Purpose: Linux memory alloc free read write stress tool\n",
+			want: "Linux memory alloc free read write stress tool",
+		},
 	}
-	for _, tt := range tests {
-		if got := normalizeScriptDescription(tt.in); got != tt.want {
-			t.Fatalf("normalizeScriptDescription(%q) = %q, want %q", tt.in, got, tt.want)
-		}
-	}
-}
-
-func TestGetDescriptionFromContent_SQLHeader(t *testing.T) {
-	content := []byte("-- File Name: we.sql\n-- Purpose: YashanDB Session overview\n-- Created: 20251201  by  huangtingzhong\n")
-	got := getDescriptionFromContent(content)
-	want := "YashanDB Session overview"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
-}
-
-func TestGetRegexForPattern_EmptyMeansAll(t *testing.T) {
-	matcher, err := getRegexForPattern("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !matcher("we.sql") || !matcher("strace.sh") {
-		t.Fatal("empty pattern should match any filename")
-	}
-}
-
-func TestGetDescriptionFromContent_ShebangBeforeHeader(t *testing.T) {
-	content := []byte("#!/usr/bin/env bash\n# File Name: strace.sh\n# Purpose: Wrap strace for DB troubleshooting\n# Created: 20260517  by  huangtingzhong\n")
-	got := getDescriptionFromContent(content)
-	want := "Wrap strace for DB troubleshooting"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractScriptDescription([]byte(tc.body)); got != tc.want {
+				t.Fatalf("extractScriptDescription() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

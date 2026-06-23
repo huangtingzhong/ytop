@@ -73,8 +73,12 @@ func (c *SSHConnector) Connect(ctx context.Context) error {
 	logger.DebugKeyVal("TargetOS", c.cfg.TargetOS)
 
 	config.AdaptSourceCmdForWindowsSSH(c.cfg)
-	if c.cfg.DebugMode && c.cfg.SourceCmd != "" {
-		logger.DebugKeyVal("SourceCmd(final)", c.cfg.SourceCmd)
+	c.cfg.ApplyMssqlSSHWindowsConnectDefaults()
+	if c.cfg.DebugMode {
+		if c.cfg.SourceCmd != "" {
+			logger.DebugKeyVal("SourceCmd(final)", c.cfg.SourceCmd)
+		}
+		logger.DebugKeyVal("ConnectString(final)", c.cfg.ConnectString)
 	}
 
 	if c.cfg.DBType == "yashandb" && c.cfg.TargetOS == platform.OSWindows {
@@ -112,10 +116,23 @@ func (c *SSHConnector) Connect(ctx context.Context) error {
 	}
 
 	// Verify DB CLI is available on remote host (new session; SSH Session is one-shot per Run)
+	cliPath, err := c.resolveRemoteCLIPath(ctx)
+	if err != nil {
+		return err
+	}
+
+	c.cfg.RemoteCLIPath = cliPath
+	logger.DebugStep("ssh-connect OK", "CLI="+cliPath)
+	logger.DebugKeyVal("CLIPath", cliPath)
+	return nil
+}
+
+// resolveRemoteCLIPath finds the DB CLI on the remote host (where/which, then MSSQL registry on Windows).
+func (c *SSHConnector) resolveRemoteCLIPath(ctx context.Context) (string, error) {
 	session, err := c.pool.NewSession()
 	if err != nil {
 		logger.DebugStep("ssh-connect FAILED", err.Error())
-		return fmt.Errorf("failed to create SSH session for CLI verification: %w", err)
+		return "", fmt.Errorf("failed to create SSH session for CLI verification: %w", err)
 	}
 	defer session.Close()
 
@@ -130,24 +147,70 @@ func (c *SSHConnector) Connect(ctx context.Context) error {
 
 	output, err := c.runCmd(session, checkCmd)
 	outStr := strings.TrimSpace(string(output))
-	if err != nil {
-		hint := buildCLIHint(c.cfg.DBType, c.cfg.TargetOS, c.cfg.SourceCmd)
-		logger.DebugStep("ssh-cli-check FAILED", err.Error())
+	if err == nil {
+		if cliPath := trimCLICheckOutput(outStr); cliPath != "" {
+			return cliPath, nil
+		}
+	} else {
 		logger.DebugCommandOutput("ssh-cli-check", outStr, err)
-		return fmt.Errorf(
-			"DB CLI '%s' not found on remote host '%s' (targetOS=%s).\n"+
-				"  Check command: %s\n"+
-				"  Remote output: %s\n"+
-				"%s",
-			cli, c.cfg.SSHHost, c.cfg.TargetOS, checkCmd, outStr, hint,
-		)
 	}
 
-	cliPath := trimCLICheckOutput(outStr)
-	c.cfg.RemoteCLIPath = cliPath
-	logger.DebugStep("ssh-connect OK", "CLI="+cliPath)
-	logger.DebugKeyVal("CLIPath", cliPath)
-	return nil
+	if c.cfg.DBType == "mssql" && c.cfg.TargetOS == platform.OSWindows {
+		cliPath, regErr := c.resolveMssqlCLIViaRegistry()
+		if regErr == nil && cliPath != "" {
+			logger.DebugStep("ssh-cli-check", "sqlcmd resolved via registry")
+			return cliPath, nil
+		}
+		if regErr != nil {
+			logger.DebugStep("ssh-cli-check registry FAILED", regErr.Error())
+		}
+	}
+
+	hint := buildCLIHint(c.cfg.DBType, c.cfg.TargetOS, c.cfg.SourceCmd)
+	logger.DebugStep("ssh-cli-check FAILED", "CLI not found")
+	return "", fmt.Errorf(
+		"DB CLI '%s' not found on remote host '%s' (targetOS=%s).\n"+
+			"  Check command: %s\n"+
+			"  Remote output: %s\n"+
+			"%s",
+		cli, c.cfg.SSHHost, c.cfg.TargetOS, checkCmd, outStr, hint,
+	)
+}
+
+func (c *SSHConnector) resolveMssqlCLIViaRegistry() (string, error) {
+	session, err := c.pool.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("registry probe session: %w", err)
+	}
+	defer session.Close()
+
+	probeCmd := c.WrapCmd(platform.BuildWindowsMssqlRegistryProbeCmd())
+	logger.DebugKeyVal("MssqlRegistryProbe", probeCmd)
+
+	output, err := c.runCmd(session, probeCmd)
+	outStr := string(output)
+	if err != nil {
+		return "", fmt.Errorf("registry probe command failed: %w\n%s", err, outStr)
+	}
+	if c.cfg.DebugMode {
+		logger.DebugCommandOutput("mssql-registry-probe", outStr, nil)
+	}
+
+	sqlcmdPath, tcpPort, parseErr := platform.ParseWindowsMssqlRegistryProbeOutput(outStr)
+	if parseErr != nil {
+		if c.cfg.DebugMode {
+			logger.DebugCommandOutput("mssql-registry-probe(parse-failed)", outStr, parseErr)
+		}
+		return "", parseErr
+	}
+	c.cfg.ApplyMssqlRegistryPort(tcpPort)
+	if tcpPort != "" {
+		logger.DebugKeyVal("MssqlRegistryPort", tcpPort)
+		if c.cfg.DebugMode {
+			logger.DebugKeyVal("ConnectString(after-port)", c.cfg.ConnectString)
+		}
+	}
+	return sqlcmdPath, nil
 }
 
 // buildSSHSQLExecCmd builds the command string to execute a SQL temp file on remote host.
@@ -367,4 +430,3 @@ func (c *SSHConnector) ExecuteCommandRealtime(ctx context.Context, command strin
 	}
 	return result, nil
 }
-

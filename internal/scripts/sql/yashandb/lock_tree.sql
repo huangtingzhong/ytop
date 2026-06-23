@@ -1,22 +1,22 @@
 -- File Name: lock_tree.sql
--- Purpose: YashanDB Show row and table lock wait tree
+-- Purpose: YashanDB row/table lock wait tree (compact, no wrap)
 -- Created: 20251208  by  huangtingzhong
 
-col l             for a1
-col b_sid         for a15
-col b_sqlid       for a18
-col h_sqlid       for a18
-col b_event       for a18
-col b_user        for a15
-col h_user        for a15
-col h_sid         for a15
-col b_user        for a15
-col h_event       for a18
-col resourceid    for a15
-col lock_type     for a10
-col h_seconds     for a10
-col b_seconds     for a10
-col table_name    for a30
+col Lvl        for a1
+col WaitSess   for a19
+col WaitUser   for a14
+col WaitStat   for a10
+col BlockSess  for a19
+col BlockUser  for a14
+col BlockStat  for a10
+col LockType   for a10
+col WaitEvent  for a22
+col WaitSQL    for a20
+col BlockSQL   for a20
+col TableName  for a28
+col ResourceID for a14
+col WaitTime   for a5
+col HoldTime   for a5
 
 WITH 
 row_lockwait AS (
@@ -140,25 +140,50 @@ all_lock_chain AS (
     SELECT * FROM ts_blocking
     UNION ALL
     SELECT * FROM tx_blocking
+),
+fmt AS (
+  SELECT a.*,
+         TRUNC(EXTRACT(DAY FROM a.b_exec_time) * 86400 +
+               EXTRACT(HOUR FROM a.b_exec_time) * 3600 +
+               EXTRACT(MINUTE FROM a.b_exec_time) * 60 +
+               EXTRACT(SECOND FROM a.b_exec_time)) AS b_sec,
+         TRUNC(EXTRACT(DAY FROM a.h_exec_time) * 86400 +
+               EXTRACT(HOUR FROM a.h_exec_time) * 3600 +
+               EXTRACT(MINUTE FROM a.h_exec_time) * 60 +
+               EXTRACT(SECOND FROM a.h_exec_time)) AS h_sec
+    FROM all_lock_chain a
 )
-SELECT 
-    LEVEL||'' AS "L",
-    LPAD(' ', 2*(LEVEL-1)) || TO_CHAR(a.inst_id) || '.' || TO_CHAR(a.request_sid) || '.' || TO_CHAR(a.request_serial#) AS b_sid,
-    a.request_username AS b_user,b_sqlid,b_event,trunc(EXTRACT(DAY FROM (b_exec_time)) * 86400 +
-        EXTRACT(HOUR FROM (b_exec_time)) * 3600 +
-        EXTRACT(MINUTE FROM (b_exec_time)) * 60 +
-        EXTRACT(SECOND FROM (b_exec_time)))||'' AS b_seconds,
-        -- b_exec_status,
-    a.lock_type AS lock_type,
-    a.table_name AS table_name,
-    to_char(a.blocking_inst)||'.'||TO_CHAR(a.blocking_sid) || '.' || TO_CHAR(a.blocking_serial#) AS h_sid,
-    a.blocking_username AS h_user,h_sqlid,h_event,trunc(EXTRACT(DAY FROM (h_exec_time)) * 86400 +
-        EXTRACT(HOUR FROM (h_exec_time)) * 3600 +
-        EXTRACT(MINUTE FROM (h_exec_time)) * 60 +
-        EXTRACT(SECOND FROM (h_exec_time)))||'' AS h_seconds,
-        -- h_exec_status,
-    TO_CHAR(a.resource_id) AS  resourceid
-FROM all_lock_chain a
+SELECT TO_CHAR(LEVEL) AS Lvl,
+       SUBSTR(LPAD(' ', 2 * (LEVEL - 1)) ||
+              TO_CHAR(a.inst_id) || '.' || TO_CHAR(a.request_sid) || '.' ||
+              TO_CHAR(a.request_serial#), 1, 19) AS WaitSess,
+       SUBSTR(a.request_username, 1, 14) AS WaitUser,
+       SUBSTR(a.b_exec_status, 1, 10) AS WaitStat,
+       SUBSTR(TO_CHAR(a.blocking_inst) || '.' || TO_CHAR(a.blocking_sid) || '.' ||
+              TO_CHAR(a.blocking_serial#), 1, 19) AS BlockSess,
+       SUBSTR(a.blocking_username, 1, 14) AS BlockUser,
+       SUBSTR(a.h_exec_status, 1, 10) AS BlockStat,
+       SUBSTR(a.lock_type, 1, 10) AS LockType,
+       SUBSTR(a.b_event, 1, 22) AS WaitEvent,
+       SUBSTR(a.b_sqlid, 1, 20) AS WaitSQL,
+       SUBSTR(a.h_sqlid, 1, 20) AS BlockSQL,
+       SUBSTR(a.table_name, 1, 28) AS TableName,
+       SUBSTR(TO_CHAR(a.resource_id), 1, 14) AS ResourceID,
+       SUBSTR(
+         CASE
+           WHEN a.b_sec < 1 THEN TO_CHAR(ROUND(a.b_sec * 1000)) || 'MS'
+           WHEN a.b_sec < 10000 THEN TO_CHAR(ROUND(a.b_sec)) || 'S'
+           WHEN a.b_sec < 36000 THEN TO_CHAR(ROUND(a.b_sec / 60)) || 'M'
+           ELSE TO_CHAR(ROUND(a.b_sec / 3600)) || 'H'
+         END, 1, 5) AS WaitTime,
+       SUBSTR(
+         CASE
+           WHEN a.h_sec < 1 THEN TO_CHAR(ROUND(a.h_sec * 1000)) || 'MS'
+           WHEN a.h_sec < 10000 THEN TO_CHAR(ROUND(a.h_sec)) || 'S'
+           WHEN a.h_sec < 36000 THEN TO_CHAR(ROUND(a.h_sec / 60)) || 'M'
+           ELSE TO_CHAR(ROUND(a.h_sec / 3600)) || 'H'
+         END, 1, 5) AS HoldTime
+FROM fmt a
 START WITH NOT EXISTS (
     SELECT 1 FROM all_lock_chain a2
     WHERE a2.request_sid = a.blocking_sid

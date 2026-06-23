@@ -50,3 +50,43 @@ func TestBuildRemoteSQLExecCmd_oracle(t *testing.T) {
 	}
 }
 
+func TestBuildRemoteSQLExecCmd_mssql_unix(t *testing.T) {
+	cfg := &config.Config{
+		DBType:        "mssql",
+		ConnectString: "-S localhost -U sa -P secret -d master",
+	}
+	got := BuildRemoteSQLExecCmd(cfg, platform.OSUnix, "/tmp/ytop.sql")
+	if !strings.Contains(got, "sqlcmd") || !strings.Contains(got, "-i") || !strings.Contains(got, "/tmp/ytop.sql") {
+		t.Fatalf("BuildRemoteSQLExecCmd mssql unix = %q", got)
+	}
+}
+
+func TestBuildRemoteSQLExecCmd_mssql_windows(t *testing.T) {
+	cfg := &config.Config{
+		DBType:        "mssql",
+		ConnectString: "-S localhost -E",
+		RemoteCLIPath: `C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn\sqlcmd.exe`,
+	}
+	got := BuildRemoteSQLExecCmd(cfg, platform.OSWindows, `C:\Users\Administrator\AppData\Local\Temp\ytop.sql`)
+	if !strings.Contains(got, "sqlcmd.exe") {
+		t.Fatalf("BuildRemoteSQLExecCmd mssql windows = %q, want sqlcmd path", got)
+	}
+	if !strings.Contains(got, "-i") || !strings.Contains(got, `\Temp\ytop.sql`) {
+		t.Fatalf("BuildRemoteSQLExecCmd mssql windows = %q, want -i with backslash path", got)
+	}
+	if strings.Contains(got, "/Users") {
+		t.Fatalf("BuildRemoteSQLExecCmd mssql windows = %q, must not use forward slashes in Users path", got)
+	}
+}
+
+func TestFormatSQLCmdAdHocRemoteCmd_windows(t *testing.T) {
+	got := FormatSQLCmdAdHocRemoteCmd(
+		platform.OSWindows,
+		`C:\Tools\sqlcmd.exe`,
+		"-S localhost -U sa",
+		"SELECT 1",
+	)
+	if !strings.Contains(got, `-Q`) || !strings.Contains(got, "SELECT 1") {
+		t.Fatalf("FormatSQLCmdAdHocRemoteCmd windows = %q", got)
+	}
+}
