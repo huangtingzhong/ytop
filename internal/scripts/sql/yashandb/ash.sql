@@ -19,9 +19,6 @@ col uio     for a8
 col cpu     for a8
 col bcpu    for a8
 
-set lines 250
-set pages 100
-
 SELECT TO_CHAR(date_hh, 'yyyymmdd hh24') || ' '
        || &display_time * date_mi || '-'
        || &display_time * (date_mi + 1) AS time,

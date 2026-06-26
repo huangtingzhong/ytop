@@ -68,17 +68,23 @@ func (e *Executor) executeSQLScript(ctx context.Context, scriptName string) (str
 
 	// Oracle sqlplus natively handles &var substitution with interactive prompts.
 	// All other DB types: ytop handles variable substitution (no terminal or CLI doesn't support &var).
-	skipVarSub := e.cfg.DBType == "oracle"
-	if !skipVarSub {
+	if e.cfg.DBType != "oracle" {
 		variables := e.findVariables(scriptContent)
+		promptInfos := resolveVariablePromptInfos(scriptContent, variables)
 		varMap := make(map[string]string)
 		for _, variable := range variables {
-			value := terminal.PromptInput(fmt.Sprintf("\r\nEnter value for %s: ", variable), 256)
+			info := promptInfos[variable]
+			printVariableHint(info.Hint)
+			value := terminal.PromptInput(formatVariableInputPrompt(variable, info.Default), 256)
+			if value == "" && info.Default != "" {
+				value = info.Default
+			}
 			if e.cfg.DBType == "yashandb" {
 				value = escapeYasqlSubstValue(value)
 			}
 			varMap[variable] = value
 		}
+		scriptContent = stripSQLPlusClientCommands(scriptContent)
 		for variable, value := range varMap {
 			scriptContent = e.replaceVariable(scriptContent, variable, value)
 		}
@@ -528,57 +534,23 @@ func escapeYasqlSubstValue(value string) string {
 	return yasqlDollarVar.ReplaceAllString(value, `#$1`)
 }
 
-// findVariables finds all &var and &&var in script
+// findVariables finds all &var and &&var in script (skips -- / REM comment lines).
 func (e *Executor) findVariables(script string) []string {
-	// Match &var or &&var where var is followed by non-word character or end of string
-	// This ensures &1 doesn't match in &11
-	re := regexp.MustCompile(`(&&?)(\w+)\b`)
-	matches := re.FindAllStringSubmatch(script, -1)
-
-	seen := make(map[string]struct {
-		name     string
-		isDouble bool
-	})
-	var variables []string
-
-	for _, match := range matches {
-		if len(match) > 2 {
-			prefix := match[1]  // & or &&
-			varName := match[2] // variable name
-			isDouble := prefix == "&&"
-
-			key := prefix + varName
-
-			// Check if we've seen this exact variable (with same prefix)
-			if existing, exists := seen[varName]; exists {
-				// If we've seen &var but now see &&var, or vice versa
-				// treat them as different variables
-				if existing.isDouble != isDouble {
-					// Keep both versions
-					if !utils.Contains(variables, key) {
-						variables = append(variables, key)
-					}
-				}
-			} else {
-				seen[varName] = struct {
-					name     string
-					isDouble bool
-				}{varName, isDouble}
-				variables = append(variables, key)
-			}
-		}
-	}
-
-	return variables
+	return collectScriptVariables(script)
 }
 
-// replaceVariable replaces a variable in script with precise matching
+// replaceVariable replaces a variable in script (skips -- / REM comment lines).
 func (e *Executor) replaceVariable(script, variable, value string) string {
-	// Use word boundary to ensure exact match
-	// For example, replacing &1 won't affect &11
 	pattern := regexp.QuoteMeta(variable) + `\b`
 	re := regexp.MustCompile(pattern)
-	return re.ReplaceAllString(script, value)
+	lines := splitScriptLines(script)
+	for i, line := range lines {
+		if isSQLCommentLine(line) {
+			continue
+		}
+		lines[i] = re.ReplaceAllString(line, value)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // splitSQLStatements splits SQL script into individual statements

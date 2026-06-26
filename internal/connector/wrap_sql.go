@@ -4,7 +4,7 @@ import "strings"
 
 // WrapSQLSuppressScriptEcho prepends session commands so Oracle-style CLIs do not print
 // the executed SQL/script before the result grid: sqlplus, disql (oracle / dameng).
-// YashanDB yasql does not support these SET options (YASQL-00008); mysql/psql/yashandb leave SQL unchanged.
+// YashanDB yasql does not support SET ECHO (YASQL-00008); mysql/psql/yashandb leave SQL unchanged.
 func WrapSQLSuppressScriptEcho(dbType string, sql string) string {
 	sql = strings.TrimSpace(sql)
 	if sql == "" {

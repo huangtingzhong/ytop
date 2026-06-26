@@ -3,8 +3,6 @@
 -- Created: 20250307  by  huangtingzhong
 
 -- Params: &&owner (default all), &&tablename (default all)
-SET LINES 200
-SET PAGES 500
 COL owner_name  FOR A64
 COL name        FOR A64
 COL column_name FOR A32

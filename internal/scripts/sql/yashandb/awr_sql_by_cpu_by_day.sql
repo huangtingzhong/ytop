@@ -3,8 +3,6 @@
 -- Created: 20250307  by  huangtingzhong
 
 -- Params: &&days_back = earliest N days (default 2), &&days_show = collect M days (default 2, show last M days)
-SET LINES 200
-SET PAGES 500
 COL snap_day     FOR A12
 COL rn           FOR A4
 COL sql_bget     FOR A18

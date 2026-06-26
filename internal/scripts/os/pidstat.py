@@ -766,108 +766,112 @@ def run_sample_loop(pids, cfg, interval, count):
         prev_sys = copy.copy(curr_sys)
 
 
+PROG_NAME = "pidstat.py"
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(
+        prog=PROG_NAME,
         description=(
-            "进程/线程资源监控（读取 /proc，类似 pidstat）。\n"
-            "默认：--name yasdb，间隔 5 秒，持续采样；"
-            "仅指定 interval 而未指定 count 时同样持续执行。"
+            "Process/thread resource monitoring via /proc (pidstat-like).\n"
+            "Default: --name yasdb, 5s interval, continuous sampling; "
+            "interval only (no count) also runs continuously."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例（采样周期写法同 iostat：interval [count]）:
-  pidstat.py                          # yasdb，每 5 秒采样，一直运行
-  pidstat.py 3 3                      # 每 3 秒采样，共 3 次
-  pidstat.py 10                       # 每 10 秒采样，一直运行
+Examples (timing like iostat: interval [count]):
+  pidstat.py                          # yasdb, every 5s, run until stopped
+  pidstat.py 3 3                      # every 3s, 3 samples
+  pidstat.py 10                       # every 10s, run until stopped
   pidstat.py --name yasdb 1 5
   pidstat.py --pid 2441 3
   pidstat.py --list-matches
   pidstat.py --all-matches 3 2
   pidstat.py --sort "cpu desc" --limit 20 1 3
 
-进程用 --pid / --name 指定（默认 yasdb）；interval/count 为末尾位置参数，不是 PID。
-兼容：-i / -c 仍可用，与位置参数含义相同。
+Select process with --pid / --name (default yasdb); interval/count are trailing positional args, not PID.
+Compatibility: -i / -c still accepted with the same meaning as positional args.
 """,
     )
-    proc = parser.add_argument_group("进程选择")
+    proc = parser.add_argument_group("Process selection")
     proc.add_argument(
         "-p", "--pid", type=int, default=None, metavar="PID",
-        help="指定进程 PID（优先于 --name，不再按名称搜索）",
+        help="Monitor this PID (overrides --name; no name search)",
     )
     proc.add_argument(
         "-n", "--name", default=DEFAULT_PROCESS, metavar="NAME",
-        help="按进程名匹配（匹配 /proc 中 Name 或可执行文件 basename；默认: %(default)s）",
+        help="Match process by /proc Name or executable basename (default: %(default)s)",
     )
     proc.add_argument(
         "--all-matches", action="store_true",
-        help="名称匹配到多个进程时，监控全部（默认只监控 RSS 最大的一个）",
+        help="When name matches multiple processes, monitor all (default: largest RSS only)",
     )
     proc.add_argument(
         "--list-matches", action="store_true",
-        help="列出名称匹配到的进程（PID/RSS/COMMAND）后退出，不采样",
+        help="List matching processes (PID/RSS/COMMAND) and exit without sampling",
     )
 
-    timing = parser.add_argument_group("采样周期（位置参数，写法同 iostat interval [count]）")
+    timing = parser.add_argument_group("Sampling interval (positional, like iostat interval [count])")
     timing.add_argument(
         "interval", nargs="?", type=int, default=None, metavar="interval",
-        help="采样间隔秒数（省略则默认 5；只写 interval 则一直运行）",
+        help="Sample interval in seconds (default 5; interval only runs forever)",
     )
     timing.add_argument(
         "count", nargs="?", type=int, default=None, metavar="count",
-        help="采样次数（省略则一直运行）",
+        help="Number of samples (omit to run forever)",
     )
-    # 保留 -i/-c 兼容，不在 -h 主列表中强调
+    # Keep -i/-c for compatibility; hidden from main help listing
     parser.add_argument("-i", "--interval", type=int, default=None, dest="interval_flag",
                         help=argparse.SUPPRESS)
     parser.add_argument("-c", "--count", type=int, default=None, dest="count_flag",
                         help=argparse.SUPPRESS)
 
-    stats = parser.add_argument_group("统计项（默认等价于 -t -u -r -d）")
+    stats = parser.add_argument_group("Metrics (default equivalent to -t -u -r -d)")
     stats.add_argument(
         "-t", "--thread", dest="thread_mode", action="store_true",
-        help="线程级统计（显示 TGID/TID；默认开启）",
+        help="Per-thread stats (show TGID/TID; on by default)",
     )
     stats.add_argument(
         "-u", "--cpu", dest="show_cpu", action="store_true",
-        help="CPU：%%USR/%%SYS/%%CPU/%%WAIT 等（默认开启）",
+        help="CPU: %%USR/%%SYS/%%CPU/%%WAIT etc. (on by default)",
     )
     stats.add_argument(
         "-r", "--mem", dest="show_mem", action="store_true",
-        help="内存与缺页：VSZ/RSS/%%MEM/MINFLT/MAJFLT（默认开启）",
+        help="Memory and faults: VSZ/RSS/%%MEM/MINFLT/MAJFLT (on by default)",
     )
     stats.add_argument(
         "-d", "--io", dest="show_io", action="store_true",
-        help="磁盘 IO：KB_RD/KB_WR/RIOPS/WIOPS（默认开启）",
+        help="Disk I/O: KB_RD/KB_WR/RIOPS/WIOPS (on by default)",
     )
     stats.add_argument(
         "-w", "--switch", dest="show_switch", action="store_true",
-        help="采集上下文切换（voluntary/nonvoluntary，默认关闭）",
+        help="Context switches (voluntary/nonvoluntary; off by default)",
     )
     stats.add_argument(
         "-v", "--proc", dest="show_proc", action="store_true",
-        help="保留选项，当前未使用",
+        help="Reserved; currently unused",
     )
     stats.add_argument(
         "-s", "--stack", dest="show_stack", action="store_true",
-        help="保留选项，当前未使用",
+        help="Reserved; currently unused",
     )
 
-    filt = parser.add_argument_group("过滤与展示")
+    filt = parser.add_argument_group("Filter and display")
     filt.add_argument(
         "--tid", metavar="IDS",
-        help="只显示指定线程 ID，逗号分隔，如 2443,2451",
+        help="Show only these thread IDs, comma-separated (e.g. 2443,2451)",
     )
     filt.add_argument(
         "--tname", metavar="REGEX",
-        help="只显示线程名匹配正则的线程，逗号分隔，如 DBWR,TIMER",
+        help="Show threads whose name matches regex, comma-separated (e.g. DBWR,TIMER)",
     )
     filt.add_argument(
         "--sort", metavar="SPEC",
-        help='线程排序，如 "cpu desc,mem asc"（默认按 cpu 降序）',
+        help='Sort threads, e.g. "cpu desc,mem asc" (default: cpu desc)',
     )
     filt.add_argument(
         "--limit", "--lines", type=int, default=50, dest="display_limit", metavar="N",
-        help="每次采样最多显示行数（默认: %(default)s）",
+        help="Max rows per sample (default: %(default)s)",
     )
     parser.set_defaults(
         thread_mode=True, show_cpu=True, show_mem=True, show_io=True,

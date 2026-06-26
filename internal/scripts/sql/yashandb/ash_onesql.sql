@@ -13,9 +13,6 @@ col sqlid         for a13
 col oevent        for a25
 col wait_class    for a15
 
-set lines 250
-set pages 100
-
 SELECT TO_CHAR(sample_time, 'yyyy-mm-dd hh24:mi:ss') AS time,
        TO_CHAR(inst_id) AS inst,
        inst_id || '-' || session_id || '-' || session_serial# AS sess_id,
