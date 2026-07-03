@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -32,6 +33,79 @@ func ResolveCLI(dbType, yasqlPath string) (string, error) {
 		"CLI '%s' not found in PATH\n  LookPath error: %v\n  PATH=%s",
 		name, firstErr, pathEnv,
 	)
+}
+
+// ResolveLocalCLI finds the DB CLI on the local machine.
+// When sourceCmd is set and the CLI is not on the current PATH, runs which/where after
+// applying sourceCmd (aligned with SSH resolveRemoteCLIPath + WrapCmd).
+func ResolveLocalCLI(ctx context.Context, dbType, yasqlPath, sourceCmd string) (string, error) {
+	localOS := LocalOS()
+	cliName := defaultCLIName(dbType, yasqlPath)
+
+	if path, err := resolveCLIIfAbsolute(cliName); err != nil {
+		return "", err
+	} else if path != "" {
+		return path, nil
+	}
+
+	if path, err := exec.LookPath(cliName); err == nil {
+		return path, nil
+	}
+
+	if strings.TrimSpace(sourceCmd) != "" {
+		path, err := resolveCLIAfterSource(ctx, localOS, cliName, sourceCmd)
+		if err == nil {
+			return path, nil
+		}
+		pathEnv := os.Getenv("PATH")
+		return "", fmt.Errorf("%s\n  PATH=%s", err.Error(), pathEnv)
+	}
+
+	return ResolveCLI(dbType, yasqlPath)
+}
+
+func resolveCLIIfAbsolute(name string) (string, error) {
+	if name == "" || !filepath.IsAbs(name) {
+		return "", nil
+	}
+	info, err := os.Stat(name)
+	if err != nil {
+		return "", fmt.Errorf("CLI path not found or not executable: %s: %w", name, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("CLI path is a directory: %s", name)
+	}
+	if LocalOS() == OSUnix && info.Mode()&0111 == 0 {
+		return "", fmt.Errorf("CLI path is not executable: %s", name)
+	}
+	return name, nil
+}
+
+func resolveCLIAfterSource(ctx context.Context, localOS, cliName, sourceCmd string) (string, error) {
+	inner := CheckRemoteCLICmd(localOS, cliName)
+	prog, args := WrapLocalSourceCmd(localOS, sourceCmd, inner)
+	cmd := exec.CommandContext(ctx, prog, args...)
+	output, err := cmd.CombinedOutput()
+	outStr := strings.TrimSpace(string(output))
+	if err != nil {
+		return "", fmt.Errorf(
+			"CLI '%s' not found after sourcing env.\n  Command: %s %v\n  Output: %s\n  Error: %v",
+			cliName, prog, args, outStr, err,
+		)
+	}
+	if path := TrimCLICheckOutput(outStr); path != "" {
+		return path, nil
+	}
+	return "", fmt.Errorf("CLI '%s' not found after sourcing env (empty which/where output): %s", cliName, outStr)
+}
+
+// TrimCLICheckOutput returns the first line of which/where output.
+func TrimCLICheckOutput(output string) string {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimRight(lines[0], "\r"))
 }
 
 // DefaultCLINameForDB returns the default CLI binary name for a DB type.

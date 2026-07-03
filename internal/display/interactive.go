@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/yihan/ytop/internal/connector"
+	"github.com/yihan/ytop/internal/logger"
 	"github.com/yihan/ytop/internal/models"
 	"github.com/yihan/ytop/internal/scripts"
 )
@@ -30,6 +31,13 @@ func NewInteractiveDisplay(d *Display, conn connector.Connector) *InteractiveDis
 func (d *InteractiveDisplay) RenderInteractive(snapshot *models.Snapshot) {
 	d.iteration++
 	d.sessionList = snapshot.SessionDetails
+
+	if d.cfg.DebugMode {
+		selected := d.selectedSessionLabel()
+		logger.Debug("[tui] RenderInteractive iteration #%d: sysStats=%d events=%d sessionMetrics=%d sessionDetails=%d selected=%s\n",
+			d.iteration, len(snapshot.SysStats), len(snapshot.SystemEvents),
+			len(snapshot.SessionMetrics), len(snapshot.SessionDetails), selected)
+	}
 
 	// Clear screen and move cursor to top-left
 	fmt.Print("\033[2J\033[H")
@@ -161,6 +169,17 @@ func (d *InteractiveDisplay) GetSelectedSQLID() string {
 		return sqlID
 	}
 	return ""
+}
+
+func (d *InteractiveDisplay) selectedSessionLabel() string {
+	if len(d.sessionList) == 0 {
+		return "(none)"
+	}
+	s := d.sessionList[0]
+	if s.SidTid != "" {
+		return s.SidTid
+	}
+	return s.SqlID
 }
 
 // ExecuteSQLPlan executes the SQL plan script for the selected SQL ID

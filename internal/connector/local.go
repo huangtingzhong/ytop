@@ -45,10 +45,9 @@ func (c *LocalConnector) Connect(ctx context.Context) error {
 		return nil
 	}
 
-	// Resolve CLI using exec.LookPath (cross-platform; no bash/which needed).
-	cliPath, err := platform.ResolveCLI(c.cfg.DBType, c.cfg.YasqlPath)
+	// Resolve CLI: current PATH first, then after -s (aligned with SSH Connect).
+	cliPath, err := platform.ResolveLocalCLI(ctx, c.cfg.DBType, c.cfg.YasqlPath, c.cfg.SourceCmd)
 	if err != nil {
-		// Build detailed error with OS-specific hints.
 		hint := buildCLIHint(c.cfg.DBType, localOS, c.cfg.SourceCmd)
 		logger.DebugStep("local-connect FAILED", err.Error())
 		return fmt.Errorf(
@@ -59,20 +58,13 @@ func (c *LocalConnector) Connect(ctx context.Context) error {
 		)
 	}
 
+	c.cfg.RemoteCLIPath = cliPath
 	logger.Debug("[local-connect] CLI resolved: %s\n", cliPath)
 
-	// On Windows with SourceCmd, verify the source script actually exists.
-	if localOS == platform.OSWindows && c.cfg.SourceCmd != "" {
-		if err := verifySourceCmdWindows(c.cfg.SourceCmd); err != nil {
+	if c.cfg.SourceCmd != "" {
+		if err := verifyLocalSourceCmd(ctx, localOS, c.cfg.SourceCmd); err != nil {
 			logger.DebugStep("local-connect WARN", "source-cmd: "+err.Error())
-			// Non-fatal — warn only; the bat file may be found at execution time.
 			logger.Debug("[local-connect] WARN: %v\n", err)
-		}
-	} else if localOS == platform.OSUnix && c.cfg.SourceCmd != "" {
-		// Unix: verify the env file exists using bash -c "test -f <path>".
-		testCmd := exec.CommandContext(ctx, "bash", "-c", fmt.Sprintf("test -f %s", c.cfg.SourceCmd))
-		if err := testCmd.Run(); err != nil {
-			logger.DebugStep("local-connect WARN", "source-cmd not found: "+c.cfg.SourceCmd)
 		}
 	}
 
@@ -181,23 +173,24 @@ func buildCLIHint(dbType, localOS, sourceCmd string) string {
 	return sb.String()
 }
 
-// verifySourceCmdWindows checks whether a Windows bat/cmd env file exists.
-func verifySourceCmdWindows(sourceCmd string) error {
-	// Extract the file path (first token before any arguments).
-	tokens := strings.Fields(sourceCmd)
-	if len(tokens) == 0 {
-		return nil
+func verifyLocalSourceCmd(ctx context.Context, localOS, sourceCmd string) error {
+	checkCmd := platform.SourceEnvFileCheckCmd(localOS, sourceCmd)
+	var testCmd *exec.Cmd
+	if localOS == platform.OSWindows {
+		testCmd = exec.CommandContext(ctx, "cmd", "/C", checkCmd)
+	} else {
+		testCmd = exec.CommandContext(ctx, "bash", "-c", checkCmd)
 	}
-	batFile := strings.Trim(tokens[0], `"'`)
-	info, err := exec.LookPath(batFile)
-	if err != nil {
-		// Try direct file existence check.
-		checkCmd := exec.Command("cmd", "/C", fmt.Sprintf("if exist \"%s\" (echo found)", batFile))
-		out, _ := checkCmd.CombinedOutput()
-		if !strings.Contains(string(out), "found") {
-			_ = info
-			return fmt.Errorf("source file not found: %s", batFile)
-		}
+	if err := testCmd.Run(); err != nil {
+		return fmt.Errorf("source file not found: %s", sourceEnvFileDisplay(sourceCmd))
 	}
 	return nil
+}
+
+func sourceEnvFileDisplay(sourceCmd string) string {
+	s := strings.TrimSpace(sourceCmd)
+	if strings.HasPrefix(s, "source ") {
+		return strings.Trim(s[len("source "):], `"'`)
+	}
+	return s
 }

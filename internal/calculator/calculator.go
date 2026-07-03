@@ -70,7 +70,9 @@ func (c *Calculator) CalculateSysStatDeltas(metrics []models.SysStatMetric, time
 	return result
 }
 
-// CalculateSystemEventDeltas calculates deltas for system events
+// CalculateSystemEventDeltas computes interval deltas for v$system_event and returns TOP N.
+// Percentage is each event's share of total interval wait time across ALL events with
+// activity in the window (not re-normalized within TOP N).
 func (c *Calculator) CalculateSystemEventDeltas(events []models.SystemEvent) []models.SystemEvent {
 	if len(c.prevSystemEvents) == 0 {
 		for _, e := range events {
@@ -83,8 +85,8 @@ func (c *Calculator) CalculateSystemEventDeltas(events []models.SystemEvent) []m
 		return []models.SystemEvent{}
 	}
 
-	result := make([]models.SystemEvent, 0, len(events))
-	var totalTime float64
+	deltas := make([]models.SystemEvent, 0, len(events))
+	var totalWaitAll float64
 
 	for _, e := range events {
 		key := fmt.Sprintf("%d-%s", e.InstID, e.EventName)
@@ -93,41 +95,44 @@ func (c *Calculator) CalculateSystemEventDeltas(events []models.SystemEvent) []m
 			deltaTime := e.TimeWaited - prev.TimeWaited
 
 			if deltaWaits > 0 && deltaTime > 0 {
-				result = append(result, models.SystemEvent{
+				deltas = append(deltas, models.SystemEvent{
 					InstID:      e.InstID,
 					EventName:   e.EventName,
 					TotalWaits:  deltaWaits,
 					TimeWaited:  deltaTime,
 					AvgWaitTime: deltaTime / float64(deltaWaits),
 				})
-				totalTime += deltaTime
+				totalWaitAll += deltaTime
 			}
 		}
 		c.prevSystemEvents[key] = e
 	}
 
-	for i := range result {
-		if totalTime > 0 {
-			result[i].Percentage = (result[i].TimeWaited / totalTime) * 100
+	for i := range deltas {
+		if totalWaitAll > 0 {
+			deltas[i].Percentage = (deltas[i].TimeWaited / totalWaitAll) * 100
 		}
 	}
 
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].TimeWaited > result[j].TimeWaited
+	sort.Slice(deltas, func(i, j int) bool {
+		return deltas[i].TimeWaited > deltas[j].TimeWaited
 	})
 
-	if len(result) > c.cfg.EventTopN {
-		result = result[:c.cfg.EventTopN]
+	topN := deltas
+	if len(topN) > c.cfg.EventTopN {
+		topN = topN[:c.cfg.EventTopN]
 	}
 
 	if c.cfg.DebugMode {
-		logger.Debug("[calculator] SystemEvents: %d active events (top %d), totalTime=%.4f\n", len(result), c.cfg.EventTopN, totalTime)
-		for i, e := range result {
-			logger.Debug("[calculator]   #%d %s: waits=%d time=%.4f avg=%.6f pct=%.1f%%\n", i+1, e.EventName, e.TotalWaits, e.TimeWaited, e.AvgWaitTime, e.Percentage)
+		logger.Debug("[calculator] SystemEvents: %d events with wait in interval, totalWait=%.4fs, showing top %d\n",
+			len(deltas), totalWaitAll, len(topN))
+		for i, e := range topN {
+			logger.Debug("[calculator]   #%d %s: waits=%d time=%.4f avg=%.6f pct=%.2f%% (of all interval wait)\n",
+				i+1, e.EventName, e.TotalWaits, e.TimeWaited, e.AvgWaitTime, e.Percentage)
 		}
 	}
 
-	return result
+	return topN
 }
 
 // RankSessionMetrics ranks sessions by specified metric and calculates per-second deltas

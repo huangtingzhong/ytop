@@ -1,5 +1,6 @@
--- File Name: parameter.sql
--- Purpose: YashanDB Show instance parameters and defaults
+-- File Name: parameter_23.5.sql
+-- Purpose: YashanDB instance parameters for 23.5+
+-- Supported: 23.5
 -- Created: 20251208  by  huangtingzhong
 
 col i              for a1

@@ -63,6 +63,10 @@ func (e *Executor) executeSQLScript(ctx context.Context, scriptName string) (str
 	}
 
 	if e.cfg.DebugMode {
+		if scripts.LastResolvedScript != "" && scripts.LastResolvedScript != scriptName {
+			logger.Debug("Resolved script %q -> %q (DB version %s)\n",
+				scriptName, scripts.LastResolvedScript, scripts.CurrentDBVersion)
+		}
 		logger.Debug("Loaded script content:\n%s\n", scriptContent)
 	}
 
@@ -71,23 +75,49 @@ func (e *Executor) executeSQLScript(ctx context.Context, scriptName string) (str
 	if e.cfg.DBType != "oracle" {
 		variables := e.findVariables(scriptContent)
 		promptInfos := resolveVariablePromptInfos(scriptContent, variables)
+		if e.cfg.DebugMode {
+			debugLogScriptVariables(variables, promptInfos)
+		}
 		varMap := make(map[string]string)
 		for _, variable := range variables {
 			info := promptInfos[variable]
 			printVariableHint(info.Hint)
-			value := terminal.PromptInput(formatVariableInputPrompt(variable, info.Default), 256)
+			rawValue := terminal.PromptInput(formatVariableInputPrompt(variable, info.Default), 256)
+			value := rawValue
+			source := "input"
 			if value == "" && info.Default != "" {
 				value = info.Default
+				source = "default"
 			}
 			if e.cfg.DBType == "yashandb" {
-				value = escapeYasqlSubstValue(value)
+				escaped := escapeYasqlSubstValue(value)
+				if e.cfg.DebugMode && escaped != value {
+					logger.Debug("Variable %s: yasql escape %q -> %q\n", variable, value, escaped)
+				}
+				value = escaped
 			}
 			varMap[variable] = value
+			if e.cfg.DebugMode {
+				debugLogVariableAssignment(variable, rawValue, value, source)
+			}
 		}
+		beforeStrip := scriptContent
 		scriptContent = stripSQLPlusClientCommands(scriptContent)
-		for variable, value := range varMap {
-			scriptContent = e.replaceVariable(scriptContent, variable, value)
+		if e.cfg.DebugMode && scriptContent != beforeStrip {
+			logger.Debug("Stripped SQL*Plus client commands (ACCEPT/PROMPT/etc.)\n")
 		}
+		for _, variable := range variables {
+			scriptContent = e.replaceVariable(scriptContent, variable, varMap[variable])
+			if e.cfg.DebugMode {
+				logger.Debug("Replaced %s with %q\n", variable, varMap[variable])
+			}
+		}
+		if e.cfg.DebugMode && len(variables) > 0 {
+			logger.DebugSection("script-after-substitution")
+			logger.Debug("%s\n", scriptContent)
+		}
+	} else if e.cfg.DebugMode {
+		logger.Debug("Oracle mode: variable substitution delegated to sqlplus\n")
 	}
 
 	// SSH mode: always upload and run on the remote host (respects TargetOS for Windows cmd vs Unix bash).
@@ -114,9 +144,6 @@ func (e *Executor) executeSQLViaSSHUpload(ctx context.Context, scriptContent, sc
 
 	basename := fmt.Sprintf("ytop_%s_%d.sql", filepath.Base(scriptName), os.Getpid())
 	output, err := sshConn.ExecuteRemoteSQLScript(ctx, []byte(scriptForExec), basename)
-	if e.cfg.DebugMode {
-		logger.DebugCommandOutput("executor-ssh-script", output, err)
-	}
 	if err != nil {
 		return output, fmt.Errorf("failed to execute script via SSH: %w", err)
 	}
@@ -537,6 +564,30 @@ func escapeYasqlSubstValue(value string) string {
 // findVariables finds all &var and &&var in script (skips -- / REM comment lines).
 func (e *Executor) findVariables(script string) []string {
 	return collectScriptVariables(script)
+}
+
+func debugLogScriptVariables(variables []string, promptInfos map[string]variablePromptInfo) {
+	logger.DebugSection("script-variables")
+	if len(variables) == 0 {
+		logger.Debug("No substitution variables found\n")
+		return
+	}
+	logger.Debug("Found %d variable(s): %v\n", len(variables), variables)
+	for _, variable := range variables {
+		info := promptInfos[variable]
+		logger.Debug("  %s: hint=%q default=%q\n", variable, info.Hint, info.Default)
+	}
+}
+
+func debugLogVariableAssignment(variable, rawValue, finalValue, source string) {
+	switch {
+	case source == "default":
+		logger.Debug("Variable %s = %q (from default, input was empty)\n", variable, finalValue)
+	case rawValue != finalValue:
+		logger.Debug("Variable %s: input=%q resolved=%q (from %s)\n", variable, rawValue, finalValue, source)
+	default:
+		logger.Debug("Variable %s = %q (from %s)\n", variable, finalValue, source)
+	}
 }
 
 // replaceVariable replaces a variable in script (skips -- / REM comment lines).

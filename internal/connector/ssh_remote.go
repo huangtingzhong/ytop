@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/yihan/ytop/internal/logger"
 	"github.com/yihan/ytop/internal/platform"
@@ -139,13 +138,4 @@ func RemoteScriptBasename(prefix string) string {
 // remoteScriptBasename returns a unique script filename for SFTP upload.
 func remoteScriptBasename(prefix string) string {
 	return fmt.Sprintf("ytop_%s_%d_%d.sql", prefix, os.Getpid(), os.Getppid())
-}
-
-// trimCLICheckOutput returns the first line of which/where output.
-func trimCLICheckOutput(output string) string {
-	lines := strings.Split(strings.TrimSpace(output), "\n")
-	if len(lines) == 0 {
-		return ""
-	}
-	return strings.TrimSpace(strings.TrimRight(lines[0], "\r"))
 }

@@ -83,7 +83,7 @@ func Debugf(format string, args ...interface{}) {
 	Debug(format, args...)
 }
 
-// DebugStep logs a major named step with optional detail to ytop_debug.log and stderr (-D).
+// DebugStep logs a major named step with optional detail to ytop_debug.log (-D).
 func DebugStep(step, detail string) {
 	var line string
 	if detail != "" {
@@ -92,24 +92,15 @@ func DebugStep(step, detail string) {
 		line = fmt.Sprintf("=== [STEP] %s ===", step)
 	}
 	Debug("%s\n", line)
-	if debugEnabled {
-		fmt.Fprintf(os.Stderr, "[DEBUG] %s\n", line)
-	}
 }
 
-// DebugSection prints a lightweight section separator to log and stderr (-D).
+// DebugSection prints a lightweight section separator to ytop_debug.log (-D).
 func DebugSection(name string) {
 	line := fmt.Sprintf("--- [%s] ---", name)
 	Debug("%s\n", line)
-	if debugEnabled {
-		fmt.Fprintf(os.Stderr, "[DEBUG] %s\n", line)
-	}
 }
 
-// DebugKeyVal logs a single key=value pair indented under the current step.
+// DebugKeyVal logs a single key=value pair indented under the current step to ytop_debug.log (-D).
 func DebugKeyVal(key, val string) {
 	Debug("  %s=%s\n", key, val)
-	if debugEnabled {
-		fmt.Fprintf(os.Stderr, "[DEBUG]   %s=%s\n", key, val)
-	}
 }

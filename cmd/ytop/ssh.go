@@ -26,7 +26,6 @@ func runSSH() {
 
 	globalFlags := config.ParseGlobalFlags(fs)
 
-	// SSH subcommand specific flags
 	var deleteMode bool
 	fs.BoolVar(&deleteMode, "delete", false, "Delete passwordless login from remote host")
 
@@ -38,9 +37,11 @@ func runSSH() {
 		os.Exit(1)
 	}
 
-	// Build config from global flags
-	cfg := config.DefaultConfig()
-	globalFlags.ApplyToConfig(cfg)
+	cfg, err := config.LoadSubcommandConfig(globalFlags, fs, "ssh")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Initialize logger
 	if err := logger.Init(cfg.DebugMode); err != nil {
@@ -48,6 +49,8 @@ func runSSH() {
 		os.Exit(1)
 	}
 	defer logger.Close()
+
+	config.DebugLogSummary(cfg)
 
 	logger.Debug("[ssh] mode=%s host=%s user=%s port=%d delete=%v\n",
 		cfg.ConnectionMode, cfg.SSHHost, cfg.SSHUser, cfg.SSHPort, deleteMode)

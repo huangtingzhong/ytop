@@ -1,5 +1,6 @@
 -- File Name: we_23.5.sql
--- Purpose: YashanDB Session overview for YashanDB 23.5
+-- Purpose: YashanDB Session overview for YashanDB 23.5+
+-- Supported: 23.5
 -- Created: 20260516  by  huangtingzhong
 
 col SID_TID           for a20

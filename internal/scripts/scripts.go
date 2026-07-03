@@ -62,6 +62,7 @@ func getScriptDir() (string, error) {
 
 // GetSQLScript loads a SQL script from embedded files or filesystem.
 // Explicit OS paths (e.g. ./we.sql, d:\we.sql) are read from the filesystem first; otherwise embedded/scripts dir.
+// When CurrentDBVersion is set, logical names such as we.sql resolve to the best matching variant.
 func GetSQLScript(name string) (string, error) {
 	if isExplicitPath(name) {
 		// Explicit path: read from OS filesystem
@@ -69,38 +70,30 @@ func GetSQLScript(name string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("failed to read SQL script from filesystem %s: %w", name, err)
 		}
+		LastResolvedScript = name
 		return string(content), nil
 	}
 
-	// First try to read from filesystem
-	scriptsDir, err := getScriptDir()
-	if err == nil && scriptsDir != "" {
-		scriptPath := filepath.Join(scriptsDir, "sql", CurrentDBType, name)
-		content, err := os.ReadFile(scriptPath)
-		if err == nil {
-			return string(content), nil
+	resolved := name
+	LastResolvedScript = name
+	if strings.TrimSpace(CurrentDBVersion) != "" && !hasVersionSuffix(name) {
+		if picked, err := ResolveSQLScriptName(name, CurrentDBVersion); err == nil {
+			resolved = picked
+		} else if !sqlScriptExists(name) {
+			return "", err
 		}
 	}
+	LastResolvedScript = resolved
 
-	// Try default embedded FS
-	{
-		path := "sql/" + CurrentDBType + "/" + name
-		content, err := fs.ReadFile(defaultEmbeddedFS, path)
-		if err == nil {
-			return string(content), nil
+	content, err := readSQLScriptBytes(resolved)
+	if err != nil {
+		if resolved != name {
+			return "", fmt.Errorf("failed to read SQL script %s (resolved from %s for DB version %s): %w",
+				resolved, name, CurrentDBVersion, err)
 		}
+		return "", fmt.Errorf("failed to read SQL script %s", name)
 	}
-
-	// Try external embedded filesystem (legacy)
-	if ExternalEmbeddedFS != nil {
-		scriptPath := filepath.Join("scripts", "sql", CurrentDBType, name)
-		content, err := fs.ReadFile(ExternalEmbeddedFS, scriptPath)
-		if err == nil {
-			return string(content), nil
-		}
-	}
-
-	return "", fmt.Errorf("failed to read SQL script %s", name)
+	return string(content), nil
 }
 
 // GetOSScript loads an OS script from embedded files or filesystem.
@@ -201,6 +194,7 @@ type ScriptInfo struct {
 	Type        string // "sql" or "os"
 	Filename    string
 	Description string // Purpose line (normalized)
+	Versions    string // Applicable DB versions (from header metadata)
 }
 
 // SearchScripts searches for scripts matching pattern (filesystem first, then embedded FS)
@@ -324,17 +318,30 @@ func searchInEmbeddedFS(embeddedFS fs.FS, basePath string, matcher func(string) 
 
 // buildScriptInfo parses Purpose from the script header for -S listing.
 func buildScriptInfo(scriptType, filename string, content []byte) ScriptInfo {
+	fields := parseScriptHeaderFields(content)
 	return ScriptInfo{
 		Type:        scriptType,
 		Filename:    filename,
-		Description: extractScriptDescription(content),
+		Description: fields.Purpose,
+		Versions:    formatScriptVersionLabel(fields, filename),
 	}
 }
 
+func formatScriptVersionLabel(fields scriptHeaderFields, filename string) string {
+	if fields.Supported != "" {
+		return fields.Supported
+	}
+	if _, suffix := parseScriptFilename(filename); suffix != "" {
+		return suffix
+	}
+	return "all"
+}
+
 type scriptHeaderFields struct {
-	FileName string
-	Purpose  string
-	Created  string
+	FileName  string
+	Purpose   string
+	Created   string
+	Supported string
 }
 
 func extractScriptDescription(content []byte) string {
@@ -362,6 +369,8 @@ func parseScriptHeaderFields(content []byte) scriptHeaderFields {
 			fields.Purpose = normalizeScriptDescription(line)
 		case strings.HasPrefix(line, "Created:"):
 			fields.Created = strings.TrimSpace(strings.TrimPrefix(line, "Created:"))
+		case strings.HasPrefix(line, "Supported:"):
+			fields.Supported = strings.TrimSpace(strings.TrimPrefix(line, "Supported:"))
 		}
 	}
 	return fields

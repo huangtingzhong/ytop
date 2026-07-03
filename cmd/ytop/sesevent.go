@@ -14,7 +14,6 @@ import (
 )
 
 func runSesevent() {
-	// Check for help flag anywhere in arguments
 	for _, arg := range os.Args[2:] {
 		if arg == "--help" || arg == "-h" || arg == "help" || arg == "-help" {
 			config.PrintSeseventUsage()
@@ -22,25 +21,18 @@ func runSesevent() {
 		}
 	}
 
-	// Parse flags
 	fs := flag.NewFlagSet("sesevent", flag.ContinueOnError)
-
-	// Disable default output to prevent duplicate messages
 	fs.SetOutput(io.Discard)
 
-	// Parse global flags
 	globalFlags := config.ParseGlobalFlags(fs)
 
-	// Query-specific filters
 	var sids, eventNames string
-
 	fs.StringVar(&sids, "sid", "", "Session ID filter (comma-separated, e.g., 40,50,90)")
 	fs.StringVar(&sids, "S", "", "Session ID filter (short)")
 	fs.StringVar(&eventNames, "event", "", "Event name filter (comma-separated, supports % wildcard)")
 	fs.StringVar(&eventNames, "e", "", "Event name filter (short)")
 
 	if err := fs.Parse(os.Args[2:]); err != nil {
-		// Print error message for non-help errors
 		if err != flag.ErrHelp {
 			fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
 		}
@@ -48,45 +40,37 @@ func runSesevent() {
 		os.Exit(1)
 	}
 
-	// Build config
-	cfg := config.DefaultConfig()
-	if globalFlags.ConfigFile != "" {
-		// Load from file if specified
-		loadedCfg, err := config.LoadConfig()
-		if err == nil {
-			cfg = loadedCfg
-		}
+	cfg, err := config.LoadSubcommandConfig(globalFlags, fs, "event")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Apply global flags to config
-	globalFlags.ApplyToConfig(cfg)
+	interval, count, topN := config.SubcommandTiming(cfg, globalFlags, subcommandVisited(fs))
 
-	// Initialize logger
 	if err := logger.Init(cfg.DebugMode); err != nil {
 		fmt.Fprintf(os.Stderr, "Error initializing logger: %v\n", err)
 		os.Exit(1)
 	}
 	defer logger.Close()
 
+	config.DebugLogSummary(cfg)
+
 	if err := config.FinalizeSourceCmd(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Validate
 	if err := cfg.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Create connector
 	conn, err := connector.NewConnector(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating connector: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Connect
 	ctx := context.Background()
 	if err := conn.Connect(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Error connecting to database: %v\n", err)
@@ -94,10 +78,9 @@ func runSesevent() {
 	}
 	defer conn.Close()
 
-	// Prepare query config
-	instIDs := fmt.Sprintf("%d", globalFlags.InstanceID)
-	if globalFlags.InstanceID == 0 {
-		instIDs = "" // Empty means all instances
+	instIDs := fmt.Sprintf("%d", cfg.InstanceID)
+	if cfg.InstanceID == 0 {
+		instIDs = ""
 	}
 
 	qc := &subcommand.QueryConfig{
@@ -107,11 +90,9 @@ func runSesevent() {
 		ExcludeFilter: "a.wait_class NOT IN ('Idle')",
 	}
 
-	// Display function for sesevent
 	displayFunc := func(deltas []subcommand.Record, topN int, instIDs, sids, names string, sample, totalSamples int) {
 		subcommand.DisplayResults(deltas, topN, instIDs, sids, names, sample, totalSamples, "Session Events", true)
 	}
 
-	// Run subcommand
-	subcommand.RunSubcommand(ctx, conn, qc, globalFlags.Interval, globalFlags.Count, globalFlags.TopN, instIDs, sids, eventNames, displayFunc)
+	subcommand.RunSubcommand(ctx, conn, qc, interval, count, topN, instIDs, sids, eventNames, displayFunc)
 }

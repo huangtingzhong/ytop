@@ -1,6 +1,8 @@
 package platform
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -148,6 +150,46 @@ func TestResolveCLI_knownTool(t *testing.T) {
 // exec_lookPath is a thin helper so the test file doesn't import os/exec directly.
 func exec_lookPath(name string) (string, error) {
 	return ResolveCLI("_unknown_dbtype_", name) // yasqlPath = "go" → finds "go"
+}
+
+// TestResolveLocalCLI_withSource verifies CLI resolution after sourcing a custom PATH.
+func TestResolveLocalCLI_withSource(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix source script test")
+	}
+	tmpDir := t.TempDir()
+	fakeCLI := filepath.Join(tmpDir, "ytop_fake_yasql")
+	if err := os.WriteFile(fakeCLI, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	envFile := filepath.Join(tmpDir, "env.sh")
+	content := fmt.Sprintf("export PATH=%q:$PATH\n", tmpDir)
+	if err := os.WriteFile(envFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sourceCmd := "source " + ShellQuoteUnix(envFile)
+	ctx := context.Background()
+	path, err := ResolveLocalCLI(ctx, "yashandb", "ytop_fake_yasql", sourceCmd)
+	if err != nil {
+		t.Fatalf("ResolveLocalCLI with source: %v", err)
+	}
+	if path != fakeCLI {
+		t.Fatalf("ResolveLocalCLI = %q, want %q", path, fakeCLI)
+	}
+}
+
+func TestTrimCLICheckOutput(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"/usr/bin/mysql\n", "/usr/bin/mysql"},
+		{"/usr/bin/mysql\r\n/usr/bin/mysql\r\n", "/usr/bin/mysql"},
+	}
+	for _, c := range cases {
+		got := TrimCLICheckOutput(c.in)
+		if got != c.want {
+			t.Errorf("TrimCLICheckOutput(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
 }
 
 // TestWrapLocalSourceCmd_unix verifies Unix path returns bash -c.

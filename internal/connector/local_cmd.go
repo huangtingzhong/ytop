@@ -275,7 +275,7 @@ func BuildLocalSQLExecCmd(ctx context.Context, cfg *config.Config, sql, scriptFi
 		return cmd
 	}
 
-	cli := cfg.DefaultCLI()
+	cli := cfg.ResolveCLIForExec()
 
 	if platform.LocalOS() == platform.OSWindows {
 		return buildLocalWindowsExec(ctx, cfg, cli, sql, scriptFile)

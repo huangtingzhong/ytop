@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/yihan/ytop/internal/logger"
 	"gopkg.in/ini.v1"
 )
 
@@ -65,6 +66,9 @@ type Config struct {
 	// Database type
 	DBType string // "yashandb", "oracle", "dameng", "mysql", "postgresql", "mssql"
 
+	// DBVersion is the target database version for script resolution (empty = auto-detect via CLI -v).
+	DBVersion string
+
 	// Custom login command (overrides default CLI login)
 	LoginCmd string
 
@@ -79,8 +83,8 @@ type Config struct {
 	// Populated during SSHConnector.Connect (echo %TEMP% on Windows, /tmp on Unix).
 	RemoteTempDir string
 
-	// RemoteCLIPath is the absolute path to the DB CLI on the SSH target host.
-	// Populated during SSHConnector.Connect (which/where output); empty in local mode.
+	// RemoteCLIPath is the absolute path to the DB CLI after Connect (local or SSH target).
+	// Populated by LocalConnector/SSHConnector Connect (which/where, optionally after -s).
 	RemoteCLIPath string
 
 	// C / Python source execution (-f memtest.c / probe.py)
@@ -88,6 +92,12 @@ type Config struct {
 	CFLAGS  string // C compiler flags
 	LDFLAGS string // C linker flags (e.g. -lm)
 	Python  string // Python interpreter (default python3)
+
+	// Set when interval/count come from INI (direct mode should not reset them).
+	iniIntervalSet         bool
+	iniCountSet            bool
+	iniConnectionModeSet   bool
+	iniSessionTopSet       bool
 }
 
 // DefaultConfig returns a config with default values
@@ -132,7 +142,7 @@ func DefaultConfig() *Config {
 	}
 }
 
-// ResolveCLIForExec returns the CLI executable to invoke: RemoteCLIPath when set (SSH), else DefaultCLI().
+// ResolveCLIForExec returns the CLI executable to invoke: RemoteCLIPath when set after Connect, else DefaultCLI().
 func (c *Config) ResolveCLIForExec() string {
 	if c.RemoteCLIPath != "" {
 		return c.RemoteCLIPath
@@ -264,6 +274,7 @@ func normalizeFindScriptFlagArgs(args []string) []string {
 // LoadConfig loads configuration from file and command line
 func LoadConfig() (*Config, error) {
 	cfg := DefaultConfig()
+	resetLoadTrace("main")
 
 	// Customize flag error handling to show our custom usage
 	flag.Usage = func() {
@@ -271,7 +282,9 @@ func LoadConfig() (*Config, error) {
 	}
 
 	// Define command line flags
-	configFile := flag.String("config", "", "Path to config file")
+	var explicitConfigPath string
+	flag.StringVar(&explicitConfigPath, "config", "", "Path to config file")
+	flag.StringVar(&explicitConfigPath, "c", "", "Path to config file (short)")
 	connectionMode := flag.String("mode", "", "Connection mode: local or ssh")
 	yasqlPath := flag.String("yasql", "", "Path to yasql executable")
 	connectString := flag.String("connect", "", "Connection string")
@@ -308,6 +321,8 @@ func LoadConfig() (*Config, error) {
 	metricModeLong := flag.Bool("metric", false, "Enable metric mode with delta/per-second calculation (use with -f)")
 	dbType := flag.String("d", "", "Database type: y/yas/yashandb, o/ora/oracle, d/dm/dameng, m/my/mysql, p/pg/postgres, s/ms/mssql")
 	dbTypeLong := flag.String("db-type", "", "Database type (long form)")
+	dbVersionShort := flag.String("V", "", "Database version for script resolution (short; empty = auto-detect via DB CLI -v)")
+	dbVersion := flag.String("db-version", "", "Database version for script resolution (empty = auto-detect via DB CLI -v)")
 	loginCmd := flag.String("login-cmd", "", "Custom login command (e.g. 'sqlplus / as sysdba')")
 	targetOS := flag.String("target-os", "", "Remote OS type for SSH mode: windows or unix (default: auto-detect)")
 	cc := flag.String("cc", "", "C compiler for -f *.c (default: gcc)")
@@ -319,157 +334,157 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
-	// Load from config file if specified
-	if *configFile != "" {
-		if err := loadFromFile(cfg, *configFile); err != nil {
-			return nil, fmt.Errorf("failed to load config file: %w", err)
-		}
+	visited := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
+	recordCLIOverrides(visited)
+
+	// Load INI only when -c/--config is explicitly passed
+	if err := LoadINIInto(cfg, resolveExplicitConfigPath(visited, explicitConfigPath)); err != nil {
+		return nil, fmt.Errorf("failed to load config file: %w", err)
 	}
 
-	// Override with command line flags
-	if *connectionMode != "" {
+	// Override with explicitly passed command line flags only
+	if VisitedAny(visited, "mode") && *connectionMode != "" {
 		cfg.ConnectionMode = *connectionMode
 	}
-	if *yasqlPath != "" {
+	if VisitedAny(visited, "yasql") && *yasqlPath != "" {
 		cfg.YasqlPath = *yasqlPath
 	}
-	if *connectString != "" {
+	if VisitedAny(visited, "connect") && *connectString != "" {
 		cfg.ConnectString = *connectString
 	}
-	if *connectStringShort != "" {
+	if VisitedAny(visited, "C") && *connectStringShort != "" {
 		cfg.ConnectString = *connectStringShort
 	}
-	if *sshHost != "" {
+	if VisitedAny(visited, "ssh-host") && *sshHost != "" {
 		cfg.SSHHost = *sshHost
 	}
-	if *sshHostShort != "" {
+	if VisitedAny(visited, "t") && *sshHostShort != "" {
 		cfg.SSHHost = *sshHostShort
 	}
-	if *port != 0 { // Changed from > 0 to != 0 to handle both positive and default values
+	if VisitedAny(visited, "port") && *port != 0 {
 		cfg.SSHPort = *port
 	}
-	if *portShort != 0 { // Handle short parameter -P
+	if VisitedAny(visited, "P") && *portShort != 0 {
 		cfg.SSHPort = *portShort
 	}
-	if *sshUser != "" {
+	if VisitedAny(visited, "ssh-user") && *sshUser != "" {
 		cfg.SSHUser = *sshUser
 	}
-	if *sshUserShort != "" {
+	if VisitedAny(visited, "u") && *sshUserShort != "" {
 		cfg.SSHUser = *sshUserShort
 	}
-	if *sshPassword != "" {
+	if VisitedAny(visited, "ssh-password") && *sshPassword != "" {
 		cfg.SSHPassword = *sshPassword
 	}
-	if *sshPasswordShort != "" {
+	if VisitedAny(visited, "p") && *sshPasswordShort != "" {
 		cfg.SSHPassword = *sshPasswordShort
 	}
-	if *sshKeyFile != "" {
+	if VisitedAny(visited, "ssh-key") && *sshKeyFile != "" {
 		cfg.SSHKeyFile = *sshKeyFile
 	}
-	if *sshKeyFileShort != "" {
+	if VisitedAny(visited, "k") && *sshKeyFileShort != "" {
 		cfg.SSHKeyFile = *sshKeyFileShort
 	}
-	if *sourceCmd != "" {
+	if VisitedAny(visited, "source") && *sourceCmd != "" {
 		cfg.SourceCmd = *sourceCmd
 	}
-	if *sourceCmdShort != "" {
+	if VisitedAny(visited, "s") && *sourceCmdShort != "" {
 		cfg.SourceCmd = *sourceCmdShort
 	}
-	if *outputFile != "" {
+	if VisitedAny(visited, "o") && *outputFile != "" {
 		cfg.OutputFile = *outputFile
 	}
-	if *sessionTopN > 0 {
+	if VisitedAny(visited, "session-top") && *sessionTopN > 0 {
 		cfg.SessionTopN = *sessionTopN
 	}
-	if *sessionSortBy != "" {
+	if VisitedAny(visited, "session-sort") && *sessionSortBy != "" {
 		cfg.SessionSortBy = *sessionSortBy
 	}
-	if *sessionDetailTopN > 0 {
+	if VisitedAny(visited, "session-detail-top") && *sessionDetailTopN > 0 {
 		cfg.SessionDetailTopN = *sessionDetailTopN
 	}
-	if *noColor {
+	if VisitedAny(visited, "no-color") && *noColor {
 		cfg.ColorEnabled = false
 	}
-	if *noTimestamp {
+	if VisitedAny(visited, "no-timestamp") && *noTimestamp {
 		cfg.ShowTimestamp = false
 	}
-	if *debug || *debugShort {
+	if VisitedAny(visited, "debug", "D") && (*debug || *debugShort) {
 		cfg.DebugMode = true
 	}
-	if *instanceID >= 0 {
+	if VisitedAny(visited, "inst-id") {
 		cfg.InstanceID = *instanceID
 	}
-	if *executeScript != "" {
+	if VisitedAny(visited, "f") && *executeScript != "" {
 		cfg.ExecuteScript = *executeScript
 	}
-	if *executeSQL != "" {
+	if VisitedAny(visited, "q") && *executeSQL != "" {
 		cfg.ExecuteSQL = *executeSQL
 	}
-	if *readScript != "" {
+	if VisitedAny(visited, "r") && *readScript != "" {
 		cfg.ReadScript = *readScript
 	}
-	if *copyScript != "" {
+	if VisitedAny(visited, "copy") && *copyScript != "" {
 		cfg.CopyScript = *copyScript
 	}
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "S" {
-			cfg.FindScript = *findScript
-			cfg.FindScriptSet = true
-		}
-	})
-	if *metricMode || *metricModeLong {
+	if VisitedAny(visited, "S") {
+		cfg.FindScript = *findScript
+		cfg.FindScriptSet = true
+	}
+	if VisitedAny(visited, "m", "metric") && (*metricMode || *metricModeLong) {
 		cfg.MetricMode = true
 	}
-	if *dbTypeLong != "" {
+	if VisitedAny(visited, "db-type") && *dbTypeLong != "" {
 		parsed, err := parseDBType(*dbTypeLong)
 		if err != nil {
 			return nil, err
 		}
 		cfg.DBType = parsed
 	}
-	if *dbType != "" {
+	if VisitedAny(visited, "d") && *dbType != "" {
 		parsed, err := parseDBType(*dbType)
 		if err != nil {
 			return nil, err
 		}
 		cfg.DBType = parsed
 	}
-	if *loginCmd != "" {
+	if VisitedAny(visited, "V") && *dbVersionShort != "" {
+		cfg.DBVersion = strings.TrimSpace(*dbVersionShort)
+	}
+	if VisitedAny(visited, "db-version") && *dbVersion != "" {
+		cfg.DBVersion = strings.TrimSpace(*dbVersion)
+	}
+	if VisitedAny(visited, "login-cmd") && *loginCmd != "" {
 		cfg.LoginCmd = *loginCmd
 	}
-	if *targetOS != "" {
-		switch strings.ToLower(*targetOS) {
-		case "windows", "win":
-			cfg.TargetOS = "windows"
-		case "unix", "linux":
-			cfg.TargetOS = "unix"
-		default:
-			return nil, fmt.Errorf("invalid --target-os %q: must be 'windows' or 'unix'", *targetOS)
+	if VisitedAny(visited, "target-os") && *targetOS != "" {
+		osName, err := parseTargetOS(*targetOS)
+		if err != nil {
+			return nil, err
 		}
+		cfg.TargetOS = osName
 	}
-	if *cc != "" {
+	if VisitedAny(visited, "cc") && *cc != "" {
 		cfg.CC = *cc
 	}
-	if *cflags != "" {
+	if VisitedAny(visited, "cflags") && *cflags != "" {
 		cfg.CFLAGS = *cflags
 	}
-	if *ldflags != "" {
+	if VisitedAny(visited, "ldflags") && *ldflags != "" {
 		cfg.LDFLAGS = *ldflags
 	}
-	if *python != "" {
+	if VisitedAny(visited, "python") && *python != "" {
 		cfg.Python = *python
 	}
 
 	cfg.ApplyDBTypeConnectDefaults()
 
-	// Auto-detect connection mode based on SSH host (needed before normalizing -s paths)
-	// If user explicitly set mode, use that; otherwise auto-detect
-	if *connectionMode == "" {
-		if cfg.SSHHost != "" {
-			cfg.ConnectionMode = "ssh"
-		} else {
-			cfg.ConnectionMode = "local"
-		}
+	// Auto-detect connection mode when not explicitly set on CLI or in INI
+	if !VisitedAny(visited, "mode") && !cfg.iniConnectionModeSet && cfg.ConnectionMode == "local" && cfg.SSHHost != "" {
+		cfg.ConnectionMode = "ssh"
 	}
 
 	if err := FinalizeSourceCmd(cfg); err != nil {
@@ -511,13 +526,17 @@ func LoadConfig() (*Config, error) {
 	// count defaults to 0 (infinite loop), consistent with monitor mode.
 	// This applies to all direct modes including metric mode (-f xxx -m).
 	if isDirectMode {
-		if !intervalSpecified {
+		if !intervalSpecified && !cfg.iniIntervalSet {
 			cfg.Interval = 0
-			if !countSpecified {
+			if !countSpecified && !cfg.iniCountSet {
 				cfg.Count = 1
 			}
+			recordMergeNote("direct_mode: default interval=0 count=1 (no ini/positional)")
+		} else if !intervalSpecified && cfg.iniIntervalSet {
+			recordMergeNote(fmt.Sprintf("direct_mode: interval=%d from ini", cfg.Interval))
 		}
 	}
+	recordPositional(args, intervalSpecified, countSpecified)
 
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
@@ -527,74 +546,375 @@ func LoadConfig() (*Config, error) {
 	return cfg, nil
 }
 
-// loadFromFile loads configuration from INI file
+// LoadINIInto merges settings from an INI file into cfg when explicitPath is non-empty.
+func LoadINIInto(cfg *Config, explicitPath string) error {
+	path := strings.TrimSpace(explicitPath)
+	if path == "" {
+		recordNoINI()
+		return nil
+	}
+	return loadFromFile(cfg, path)
+}
+
+// resolveExplicitConfigPath returns the config file path when -c/--config was passed.
+func resolveExplicitConfigPath(visited map[string]bool, configPath string) string {
+	if visited == nil {
+		return ""
+	}
+	if visited["config"] || visited["c"] {
+		return configPath
+	}
+	return ""
+}
+
+// iniLoadOptions controls INI parsing. SpaceBeforeInlineComment allows # and ; in
+// values when not preceded by whitespace (e.g. passwords p@ss#word), while
+// "value  # comment" and "value  ; comment" still strip trailing inline comments.
+var iniLoadOptions = ini.LoadOptions{
+	SpaceBeforeInlineComment: true,
+}
+
+// loadFromFile loads all supported keys from an INI file into cfg.
 func loadFromFile(cfg *Config, path string) error {
-	iniFile, err := ini.Load(path)
+	iniFile, err := ini.LoadSources(iniLoadOptions, path)
 	if err != nil {
 		return err
 	}
 
 	section := iniFile.Section("")
 
-	if section.HasKey("connection_mode") {
-		cfg.ConnectionMode = section.Key("connection_mode").String()
+	setString := func(key string, set func(string)) {
+		if section.HasKey(key) {
+			set(section.Key(key).String())
+		}
 	}
-	if section.HasKey("yasql_path") {
-		cfg.YasqlPath = section.Key("yasql_path").String()
+	setInt := func(key string, set func(int)) {
+		if section.HasKey(key) {
+			set(section.Key(key).MustInt(0))
+		}
 	}
-	if section.HasKey("connect_string") {
-		cfg.ConnectString = section.Key("connect_string").String()
+	setBool := func(key string, set func(bool)) {
+		if !section.HasKey(key) {
+			return
+		}
+		v, err := parseINIBool(section.Key(key).String())
+		if err != nil {
+			return
+		}
+		set(v)
 	}
-	if section.HasKey("ssh_host") {
-		cfg.SSHHost = section.Key("ssh_host").String()
-	}
-	if section.HasKey("ssh_port") {
-		cfg.SSHPort = section.Key("ssh_port").MustInt(22)
-	}
-	if section.HasKey("ssh_user") {
-		cfg.SSHUser = section.Key("ssh_user").String()
-	}
-	if section.HasKey("ssh_password") {
-		cfg.SSHPassword = section.Key("ssh_password").String()
-	}
-	if section.HasKey("ssh_key_file") {
-		cfg.SSHKeyFile = section.Key("ssh_key_file").String()
-	}
-	if section.HasKey("source_cmd") {
-		cfg.SourceCmd = section.Key("source_cmd").String()
-	}
+
+	setString("connection_mode", func(v string) {
+		cfg.ConnectionMode = strings.TrimSpace(v)
+		cfg.iniConnectionModeSet = true
+	})
+	setString("yasql_path", func(v string) { cfg.YasqlPath = v })
+	setString("connect_string", func(v string) { cfg.ConnectString = v })
+
+	setString("ssh_host", func(v string) { cfg.SSHHost = v })
+	setInt("ssh_port", func(v int) { cfg.SSHPort = v })
+	setString("ssh_user", func(v string) { cfg.SSHUser = v })
+	setString("ssh_password", func(v string) { cfg.SSHPassword = v })
+	setString("ssh_key_file", func(v string) { cfg.SSHKeyFile = v })
+	setString("source_cmd", func(v string) { cfg.SourceCmd = v })
+
 	if section.HasKey("interval") {
-		cfg.Interval = section.Key("interval").MustInt(1)
+		cfg.Interval = section.Key("interval").MustInt(cfg.Interval)
+		cfg.iniIntervalSet = true
 	}
 	if section.HasKey("count") {
-		cfg.Count = section.Key("count").MustInt(0)
+		cfg.Count = section.Key("count").MustInt(cfg.Count)
+		cfg.iniCountSet = true
 	}
-	if section.HasKey("output_file") {
-		cfg.OutputFile = section.Key("output_file").String()
+
+	setString("output_file", func(v string) { cfg.OutputFile = v })
+	setInt("session_top_n", func(v int) {
+		cfg.SessionTopN = v
+		cfg.iniSessionTopSet = true
+	})
+	setString("session_sort_by", func(v string) { cfg.SessionSortBy = v })
+	setInt("session_detail_top_n", func(v int) { cfg.SessionDetailTopN = v })
+
+	setBool("show_timestamp", func(v bool) { cfg.ShowTimestamp = v })
+	setBool("color_enabled", func(v bool) { cfg.ColorEnabled = v })
+	if section.HasKey("no_color") {
+		if v, err := parseINIBool(section.Key("no_color").String()); err == nil && v {
+			cfg.ColorEnabled = false
+		}
 	}
-	if section.HasKey("session_top_n") {
-		cfg.SessionTopN = section.Key("session_top_n").MustInt(10)
+
+	if section.HasKey("instance_id") {
+		cfg.InstanceID = section.Key("instance_id").MustInt(0)
+	} else if section.HasKey("inst_id") {
+		cfg.InstanceID = section.Key("inst_id").MustInt(0)
 	}
-	if section.HasKey("session_sort_by") {
-		cfg.SessionSortBy = section.Key("session_sort_by").String()
-	}
-	if section.HasKey("session_detail_top_n") {
-		cfg.SessionDetailTopN = section.Key("session_detail_top_n").MustInt(10)
-	}
+
 	if section.HasKey("sysstat_metrics") {
 		metricsStr := section.Key("sysstat_metrics").String()
 		if metricsStr != "" {
-			cfg.SysStatMetrics = strings.Split(metricsStr, ",")
-			for i := range cfg.SysStatMetrics {
-				cfg.SysStatMetrics[i] = strings.TrimSpace(cfg.SysStatMetrics[i])
+			parts := strings.Split(metricsStr, ",")
+			cfg.SysStatMetrics = make([]string, 0, len(parts))
+			for _, m := range parts {
+				if t := strings.TrimSpace(m); t != "" {
+					cfg.SysStatMetrics = append(cfg.SysStatMetrics, t)
+				}
 			}
 		}
 	}
-	if section.HasKey("event_top_n") {
-		cfg.EventTopN = section.Key("event_top_n").MustInt(5)
+	setInt("event_top_n", func(v int) { cfg.EventTopN = v })
+
+	setInt("query_timeout", func(v int) {
+		if v > 0 {
+			cfg.QueryTimeout = v
+		}
+	})
+	setInt("ssh_timeout", func(v int) {
+		if v > 0 {
+			cfg.SSHTimeout = v
+		}
+	})
+	setBool("reuse_ssh", func(v bool) { cfg.ReuseSSH = v })
+	setBool("debug", func(v bool) { cfg.DebugMode = v })
+	setBool("debug_mode", func(v bool) { cfg.DebugMode = v })
+
+	setString("execute_script", func(v string) { cfg.ExecuteScript = strings.TrimSpace(v) })
+	setString("execute_sql", func(v string) { cfg.ExecuteSQL = strings.TrimSpace(v) })
+	setString("read_script", func(v string) { cfg.ReadScript = strings.TrimSpace(v) })
+	setString("copy_script", func(v string) { cfg.CopyScript = strings.TrimSpace(v) })
+	if section.HasKey("find_script") {
+		cfg.FindScript = section.Key("find_script").String()
+		cfg.FindScriptSet = true
 	}
 
+	setBool("metric_mode", func(v bool) { cfg.MetricMode = v })
+	setBool("metric", func(v bool) { cfg.MetricMode = v })
+
+	if section.HasKey("db_type") {
+		parsed, err := parseDBType(section.Key("db_type").String())
+		if err != nil {
+			return fmt.Errorf("config %q: %w", path, err)
+		}
+		cfg.DBType = parsed
+	}
+	setString("db_version", func(v string) { cfg.DBVersion = strings.TrimSpace(v) })
+	setString("login_cmd", func(v string) { cfg.LoginCmd = v })
+
+	if section.HasKey("target_os") {
+		osName, err := parseTargetOS(section.Key("target_os").String())
+		if err != nil {
+			return fmt.Errorf("config %q: %w", path, err)
+		}
+		cfg.TargetOS = osName
+	}
+
+	setString("cc", func(v string) {
+		if strings.TrimSpace(v) != "" {
+			cfg.CC = v
+		}
+	})
+	setString("cflags", func(v string) { cfg.CFLAGS = v })
+	setString("ldflags", func(v string) { cfg.LDFLAGS = v })
+	setString("python", func(v string) {
+		if strings.TrimSpace(v) != "" {
+			cfg.Python = v
+		}
+	})
+
+	cfg.ApplyDBTypeConnectDefaults()
+
+	keys := make([]string, 0, len(section.Keys()))
+	for _, k := range section.Keys() {
+		keys = append(keys, k.Name())
+	}
+	recordINILoaded(path, keys)
 	return nil
+}
+
+func parseINIBool(s string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid boolean %q", s)
+	}
+}
+
+func parseTargetOS(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "windows", "win":
+		return "windows", nil
+	case "unix", "linux", "":
+		return "unix", nil
+	default:
+		return "", fmt.Errorf("invalid target_os %q: must be 'windows' or 'unix'", s)
+	}
+}
+
+func VisitedAny(visited map[string]bool, names ...string) bool {
+	if visited == nil {
+		return true
+	}
+	for _, n := range names {
+		if visited[n] {
+			return true
+		}
+	}
+	return false
+}
+
+// loadTrace captures config load steps for DebugLogSummary (after logger.Init).
+type loadTrace struct {
+	entry        string
+	iniPath      string
+	iniKeys      []string
+	cliOverrides []string
+	positional   []string
+	mergeNotes   []string
+}
+
+var lastLoadTrace loadTrace
+
+func resetLoadTrace(entry string) {
+	lastLoadTrace = loadTrace{entry: entry}
+}
+
+func recordINILoaded(path string, keys []string) {
+	lastLoadTrace.iniPath = path
+	lastLoadTrace.iniKeys = append([]string(nil), keys...)
+}
+
+func recordNoINI() {
+	lastLoadTrace.iniPath = ""
+	lastLoadTrace.iniKeys = nil
+}
+
+func recordCLIOverrides(visited map[string]bool) {
+	if visited == nil {
+		return
+	}
+	names := make([]string, 0, len(visited))
+	for name := range visited {
+		names = append(names, name)
+	}
+	lastLoadTrace.cliOverrides = names
+}
+
+func recordPositional(args []string, intervalSet, countSet bool) {
+	lastLoadTrace.positional = append([]string(nil), args...)
+	if intervalSet {
+		lastLoadTrace.mergeNotes = append(lastLoadTrace.mergeNotes, "positional: interval overridden")
+	}
+	if countSet {
+		lastLoadTrace.mergeNotes = append(lastLoadTrace.mergeNotes, "positional: count overridden")
+	}
+}
+
+func recordMergeNote(note string) {
+	if strings.TrimSpace(note) != "" {
+		lastLoadTrace.mergeNotes = append(lastLoadTrace.mergeNotes, note)
+	}
+}
+
+// DebugLogSummary writes INI/CLI merge details to ytop_debug.log.
+// Call once after logger.Init when cfg.DebugMode is true.
+func DebugLogSummary(cfg *Config) {
+	if cfg == nil || !cfg.DebugMode {
+		return
+	}
+
+	logger.DebugSection("config-load")
+	logger.DebugKeyVal("entry", lastLoadTrace.entry)
+	if lastLoadTrace.iniPath != "" {
+		logger.DebugKeyVal("ini_file", lastLoadTrace.iniPath)
+		logger.Debug("  ini_keys (%d): %s\n", len(lastLoadTrace.iniKeys), strings.Join(lastLoadTrace.iniKeys, ", "))
+	} else {
+		logger.DebugKeyVal("ini_file", "(none)")
+	}
+
+	if len(lastLoadTrace.cliOverrides) > 0 {
+		logger.Debug("  cli_flags (%d): %s\n", len(lastLoadTrace.cliOverrides), strings.Join(lastLoadTrace.cliOverrides, ", "))
+	} else {
+		logger.Debug("  cli_flags: (none explicit; defaults/ini kept)\n")
+	}
+
+	if len(lastLoadTrace.positional) > 0 {
+		logger.Debug("  positional_args: %s\n", strings.Join(lastLoadTrace.positional, " "))
+	}
+	for _, note := range lastLoadTrace.mergeNotes {
+		logger.Debug("  merge: %s\n", note)
+	}
+
+	logger.DebugSection("config-final")
+	logConfigField("ConnectionMode", cfg.ConnectionMode)
+	logConfigField("DBType", cfg.DBType)
+	logConfigField("DBVersion", cfg.DBVersion)
+	logConfigField("YasqlPath", cfg.YasqlPath)
+	logConfigField("ConnectString", cfg.ConnectString)
+	logConfigField("LoginCmd", cfg.LoginCmd)
+	logConfigField("SSHHost", cfg.SSHHost)
+	logger.Debug("  SSHPort=%d SSHUser=%s\n", cfg.SSHPort, cfg.SSHUser)
+	if cfg.SSHPassword != "" {
+		logger.Debug("  SSHPassword=(set)\n")
+	}
+	if cfg.SSHKeyFile != "" {
+		logConfigField("SSHKeyFile", cfg.SSHKeyFile)
+	}
+	logConfigField("SourceCmd", cfg.SourceCmd)
+	logConfigField("TargetOS", cfg.TargetOS)
+	logger.Debug("  Interval=%d Count=%d InstanceID=%d\n", cfg.Interval, cfg.Count, cfg.InstanceID)
+	logger.Debug("  SessionTopN=%d SessionSortBy=%q SessionDetailTopN=%d EventTopN=%d\n",
+		cfg.SessionTopN, cfg.SessionSortBy, cfg.SessionDetailTopN, cfg.EventTopN)
+	logger.Debug("  DebugMode=%v MetricMode=%v ColorEnabled=%v ShowTimestamp=%v\n",
+		cfg.DebugMode, cfg.MetricMode, cfg.ColorEnabled, cfg.ShowTimestamp)
+	if cfg.ExecuteScript != "" {
+		logConfigField("ExecuteScript", cfg.ExecuteScript)
+	}
+	if cfg.ExecuteSQL != "" {
+		logConfigField("ExecuteSQL", cfg.ExecuteSQL)
+	}
+	if cfg.ReadScript != "" {
+		logConfigField("ReadScript", cfg.ReadScript)
+	}
+	if cfg.CopyScript != "" {
+		logConfigField("CopyScript", cfg.CopyScript)
+	}
+	if cfg.FindScriptSet {
+		logConfigField("FindScript", cfg.FindScript)
+	}
+	if cfg.OutputFile != "" {
+		logConfigField("OutputFile", cfg.OutputFile)
+	}
+	if cfg.CC != "" && cfg.CC != "gcc" {
+		logConfigField("CC", cfg.CC)
+	}
+	if cfg.CFLAGS != "" {
+		logConfigField("CFLAGS", cfg.CFLAGS)
+	}
+	if cfg.LDFLAGS != "" {
+		logConfigField("LDFLAGS", cfg.LDFLAGS)
+	}
+	if cfg.Python != "" && cfg.Python != "python3" {
+		logConfigField("Python", cfg.Python)
+	}
+	logger.Debug("  ini_sources: interval=%v count=%v connection_mode=%v session_top=%v\n",
+		cfg.iniIntervalSet, cfg.iniCountSet, cfg.iniConnectionModeSet, cfg.iniSessionTopSet)
+}
+
+func logConfigField(key, val string) {
+	if val == "" {
+		return
+	}
+	logger.DebugKeyVal(key, val)
+}
+
+// DebugLogSummaryf is a convenience wrapper with a custom entry label.
+func DebugLogSummaryf(cfg *Config, entry string) {
+	if entry != "" {
+		lastLoadTrace.entry = entry
+	}
+	DebugLogSummary(cfg)
 }
 
 // stripDebugFlagsFromArgs removes -D/--debug from positional arguments.
@@ -735,10 +1055,11 @@ func PrintUsage() {
 	fmt.Println("  -p, --password <pass>     SSH password")
 	fmt.Println("  -k, --key <file>          SSH private key file")
 	fmt.Println("  -s, --source <path>       Env file to source before DB CLI")
-	fmt.Println("  --config <file>           Path to config file")
+	fmt.Println("  -c, --config <file>       Path to config file (required to load ini)")
 	fmt.Println()
 	fmt.Println("Database:")
 	fmt.Println("  -d, --db-type <type>      DB type: yas(han)(default), o(ra), d(m), m(y), p(g), s(ms)")
+	fmt.Println("  -V, --db-version <ver>    DB version for script resolution (default: auto via CLI -v)")
 	fmt.Println("  --login-cmd <cmd>         Custom DB login command")
 	fmt.Println()
 	fmt.Println("Output:")
@@ -768,10 +1089,11 @@ func PrintMonitorUsage() {
 	fmt.Println("  -p, --password <pass>     SSH password")
 	fmt.Println("  -k, --key <file>          SSH private key file")
 	fmt.Println("  -s, --source <path>       Env file to source before DB CLI")
-	fmt.Println("  --config <file>           Path to config file")
+	fmt.Println("  -c, --config <file>       Path to config file (required to load ini)")
 	fmt.Println()
 	fmt.Println("Database:")
 	fmt.Println("  -d, --db-type <type>      DB type: yas(han)(default), o(ra), d(m), m(y), p(g), s(ms)")
+	fmt.Println("  -V, --db-version <ver>    DB version for script resolution (default: auto via CLI -v)")
 	fmt.Println("  --login-cmd <cmd>         Custom DB login command")
 	fmt.Println()
 	fmt.Println("Output:")
@@ -797,7 +1119,7 @@ func PrintMonitorUsage() {
 	fmt.Println("  ytop 1 20                                   # 1s interval, 20 iterations")
 	fmt.Println("  ytop -C \"/ as sysdba\"                       # Local connection")
 	fmt.Println("  ytop -t 10.10.10.130 -u yashan -p oracle -s ~/.bashrc")
-	fmt.Println("  ytop --config config.ini                    # Use config file")
+	fmt.Println("  ytop -c config.ini                          # Use config file")
 	fmt.Println("  ytop --session-top 20 --session-sort \"CPU TIME\"")
 }
 
@@ -828,10 +1150,11 @@ func PrintScriptUsage() {
 	fmt.Println("  -p, --password <pass>     SSH password")
 	fmt.Println("  -k, --key <file>          SSH private key file")
 	fmt.Println("  -s, --source <path>       Env file to source before DB CLI")
-	fmt.Println("  --config <file>           Path to config file")
+	fmt.Println("  -c, --config <file>       Path to config file (required to load ini)")
 	fmt.Println()
 	fmt.Println("Database:")
 	fmt.Println("  -d, --db-type <type>      DB type: yas(han)(default), o(ra), d(m), m(y), p(g), s(ms)")
+	fmt.Println("  -V, --db-version <ver>    DB version for script resolution (default: auto via CLI -v)")
 	fmt.Println("  --login-cmd <cmd>         Custom DB login command")
 	fmt.Println("  --cc <compiler>           C compiler for -f *.c (default: gcc)")
 	fmt.Println("  --cflags <flags>          C compile flags for -f *.c")
@@ -883,9 +1206,11 @@ func PrintSesstatUsage() {
 	fmt.Println("  -p, --password <pass>     SSH password")
 	fmt.Println("  -k, --key <file>          SSH private key file")
 	fmt.Println("  -s, --source <path>       Env file to source before DB CLI")
+	fmt.Println("  -c, --config <file>       Path to config file")
 	fmt.Println()
 	fmt.Println("Output:")
 	fmt.Println("  --session-top <num>       TOP N results (default: 5)")
+	fmt.Println("  --count <num>             Number of samples (default: 2)")
 	fmt.Println("  -I, --inst <id>           Instance ID (0=all, default: 0)")
 	fmt.Println("  -D, --debug               Enable debug mode")
 	fmt.Println()
@@ -896,6 +1221,7 @@ func PrintSesstatUsage() {
 	fmt.Println("  With --sid:    TOP N stats for specified sessions")
 	fmt.Println()
 	fmt.Println("Examples:")
+	fmt.Println("  ytop stat -c config.ini -t 10.10.10.130")
 	fmt.Println("  ytop stat -t 10.10.10.130 -u yashan -p oracle -s ~/.bashrc")
 	fmt.Println("  ytop stat -S 40,50 -n \"CPU%,parse%\"")
 	fmt.Println("  ytop stat -I 1 --session-top 10")
@@ -919,9 +1245,11 @@ func PrintSeseventUsage() {
 	fmt.Println("  -p, --password <pass>     SSH password")
 	fmt.Println("  -k, --key <file>          SSH private key file")
 	fmt.Println("  -s, --source <path>       Env file to source before DB CLI")
+	fmt.Println("  -c, --config <file>       Path to config file")
 	fmt.Println()
 	fmt.Println("Output:")
 	fmt.Println("  --session-top <num>       TOP N results (default: 5)")
+	fmt.Println("  --count <num>             Number of samples (default: 2)")
 	fmt.Println("  -I, --inst <id>           Instance ID (0=all, default: 0)")
 	fmt.Println("  -D, --debug               Enable debug mode")
 	fmt.Println()
@@ -954,6 +1282,7 @@ func PrintSSHUsage() {
 	fmt.Println("  -p, --password <pass>     SSH password (required for setup only)")
 	fmt.Println()
 	fmt.Println("Options:")
+	fmt.Println("  -c, --config <file>       Path to config file")
 	fmt.Println("  -P, --port <port>         SSH port (default: 22)")
 	fmt.Println("  -k, --key <file>          Local private key file (default: ~/.ssh/id_rsa)")
 	fmt.Println("  --delete                  Remove public key from remote host")

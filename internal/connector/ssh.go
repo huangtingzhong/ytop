@@ -30,10 +30,10 @@ func (c *SSHConnector) WrapCmd(cmd string) string {
 
 // runCmd executes a command on the remote host via SSH session.
 func (c *SSHConnector) runCmd(session *ssh.Session, cmd string) ([]byte, error) {
-	logger.Debug("[ssh] runCmd: executing %d bytes\n", len(cmd))
+	logger.Debug("SSH command: %s\n", cmd)
 	output, err := session.CombinedOutput(cmd)
-	logger.Debug("[ssh] runCmd: got %d bytes, err=%v\n", len(output), err)
 	cleaned := stripSttyWarnings(string(output))
+	logger.DebugCommandOutput("ssh", cleaned, err)
 	return []byte(cleaned), err
 }
 
@@ -99,9 +99,6 @@ func (c *SSHConnector) Connect(ctx context.Context) error {
 			return fmt.Errorf("failed to create SSH session for source file check: %w", err)
 		}
 		checkCmd := platform.SourceEnvFileCheckCmd(c.cfg.TargetOS, c.cfg.SSHSourceExistenceCheck)
-		if c.cfg.DebugMode {
-			logger.Debug("Verifying remote -s file: %s\n", checkCmd)
-		}
 		out, err := c.runCmd(sTest, checkCmd)
 		sTest.Close()
 		if err != nil {
@@ -148,11 +145,9 @@ func (c *SSHConnector) resolveRemoteCLIPath(ctx context.Context) (string, error)
 	output, err := c.runCmd(session, checkCmd)
 	outStr := strings.TrimSpace(string(output))
 	if err == nil {
-		if cliPath := trimCLICheckOutput(outStr); cliPath != "" {
+		if cliPath := platform.TrimCLICheckOutput(outStr); cliPath != "" {
 			return cliPath, nil
 		}
-	} else {
-		logger.DebugCommandOutput("ssh-cli-check", outStr, err)
 	}
 
 	if c.cfg.DBType == "mssql" && c.cfg.TargetOS == platform.OSWindows {
@@ -192,15 +187,9 @@ func (c *SSHConnector) resolveMssqlCLIViaRegistry() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("registry probe command failed: %w\n%s", err, outStr)
 	}
-	if c.cfg.DebugMode {
-		logger.DebugCommandOutput("mssql-registry-probe", outStr, nil)
-	}
 
 	sqlcmdPath, tcpPort, parseErr := platform.ParseWindowsMssqlRegistryProbeOutput(outStr)
 	if parseErr != nil {
-		if c.cfg.DebugMode {
-			logger.DebugCommandOutput("mssql-registry-probe(parse-failed)", outStr, parseErr)
-		}
 		return "", parseErr
 	}
 	c.cfg.ApplyMssqlRegistryPort(tcpPort)
@@ -288,16 +277,8 @@ func (c *SSHConnector) ExecuteCommand(ctx context.Context, command string) (stri
 	}
 	defer session.Close()
 
-	if c.cfg.DebugMode {
-		logger.Debug("SSH command: %s\n", command)
-	}
-
-	// Execute command
 	output, err := c.runCmd(session, command)
 	outputStr := string(output)
-	if c.cfg.DebugMode {
-		logger.DebugCommandOutput("ssh", outputStr, err)
-	}
 	if err != nil {
 		return outputStr, fmt.Errorf("SSH command execution failed: %w", err)
 	}

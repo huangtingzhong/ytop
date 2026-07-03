@@ -282,7 +282,8 @@ ORDER BY s.INST_ID, s.SID, n.NAME
 	return metrics, nil
 }
 
-// CollectSessionDetails collects detailed session information
+// CollectSessionDetails collects active session details (same session filter as we.sql).
+// Note: CollectSessionMetrics does not filter INACTIVE status; this query does.
 func (c *Collector) CollectSessionDetails(ctx context.Context) ([]models.SessionDetail, error) {
 	instFilter := ""
 	if c.cfg.InstanceID > 0 {
@@ -334,7 +335,7 @@ FETCH FIRST %d ROWS ONLY
 		logger.Debug("[collector] CollectSessionDetails SQL:\n%s\n", sql)
 	}
 
-	rows, err := c.conn.ExecuteQuery(ctx, sql)
+	_, rows, err := c.conn.ExecuteQueryWithHeader(ctx, sql)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query session details: %w", err)
 	}
@@ -346,41 +347,63 @@ FETCH FIRST %d ROWS ONLY
 	var details []models.SessionDetail
 	for _, row := range rows {
 		if len(row) < 8 {
+			if c.cfg.DebugMode {
+				logger.Debug("[collector] skipping row: expected 8 columns, got %d: %v\n", len(row), row)
+			}
 			continue
 		}
 
-		// Skip header row
-		if row[0] == "SID_TID" {
+		sidTid := strings.TrimSpace(row[0])
+		if sidTid == "" || sidTid == "SID_TID" {
 			continue
 		}
 
-		// SQL returns: sid_tid, event, username, program, sql_id, exec_ms, client, inst_id
-		execMs, err := strconv.ParseFloat(row[5], 64)
-		if err != nil {
-			logger.Debug("[collector] skipping row: invalid exec_ms %q: %v\n", row[5], err)
-			continue
-		}
-		execTime := formatExecTime(execMs)
-
-		instID, err := strconv.Atoi(row[7])
-		if err != nil {
-			logger.Debug("[collector] skipping row: invalid inst_id %q: %v\n", row[7], err)
-			continue
-		}
+		execMs := parseSessionDetailFloat(row[5])
+		instID := parseSessionDetailInt(row[7])
 
 		details = append(details, models.SessionDetail{
 			InstID:   instID,
-			SidTid:   row[0],
+			SidTid:   sidTid,
 			Event:    row[1],
 			Username: row[2],
 			Program:  row[3],
 			SqlID:    row[4],
-			ExecTime: execTime,
+			ExecTime: formatExecTime(execMs),
 			Client:   row[6],
 		})
 	}
 
+	if c.cfg.DebugMode && len(rows) > 0 && len(details) == 0 {
+		logger.Debug("[collector] CollectSessionDetails: %d raw rows parsed to 0 details\n", len(rows))
+	}
+
 	return details, nil
+}
+
+func parseSessionDetailFloat(s string) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+func parseSessionDetailInt(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	if v, err := strconv.Atoi(s); err == nil {
+		return v
+	}
+	if v, err := strconv.ParseFloat(s, 64); err == nil {
+		return int(v)
+	}
+	return 0
 }
 
 // formatExecTime formats elapsed time from milliseconds using MS/S/M/H/D (aligned with we.sql).

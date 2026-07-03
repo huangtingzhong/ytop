@@ -117,8 +117,11 @@ func runMonitor() {
 	}
 	defer logger.Close()
 
-	// Set script DB type
+	config.DebugLogSummary(cfg)
+
+	// Set script DB type and resolve DB version when possible without connecting.
 	scripts.CurrentDBType = cfg.DBType
+	connector.InitDBVersionFromConfig(context.Background(), cfg)
 
 	// Check if only finding scripts or reading script content (no database connection needed)
 	if cfg.FindScriptSet {
@@ -158,6 +161,9 @@ func runMonitor() {
 		os.Exit(1)
 	}
 	defer conn.Close()
+
+	// Auto-detect DB version via CLI -v when --db-version is not set.
+	connector.InitDBVersion(ctx, cfg, conn)
 
 	// Check if in metric mode (--metric with -f)
 	if cfg.MetricMode && cfg.ExecuteScript != "" {
@@ -296,12 +302,13 @@ func handleCopyScript(ctx context.Context, cfg *config.Config, exec *executor.Ex
 
 const (
 	scriptListTypeWidth = 10
-	scriptListFileWidth = 50
-	scriptListDescWidth = 80
+	scriptListFileWidth = 40
+	scriptListVerWidth  = 16
+	scriptListDescWidth = 64
 )
 
 func scriptListRuleWidth() int {
-	return scriptListTypeWidth + 1 + scriptListFileWidth + 1 + scriptListDescWidth
+	return scriptListTypeWidth + 1 + scriptListFileWidth + 1 + scriptListVerWidth + 1 + scriptListDescWidth
 }
 
 func truncateScriptListText(s string, max int) string {
@@ -318,15 +325,17 @@ func printScriptListTable(results []scripts.ScriptInfo, eol string) {
 	if eol == "" {
 		eol = "\n"
 	}
-	fmt.Printf("%-*s %-*s %-*s%s",
+	fmt.Printf("%-*s %-*s %-*s %-*s%s",
 		scriptListTypeWidth, "TYPE",
 		scriptListFileWidth, "FILENAME",
+		scriptListVerWidth, "VERSIONS",
 		scriptListDescWidth, "DESCRIPTION", eol)
 	fmt.Print(strings.Repeat("-", scriptListRuleWidth()) + eol)
 	for _, result := range results {
-		fmt.Printf("%-*s %-*s %-*s%s",
+		fmt.Printf("%-*s %-*s %-*s %-*s%s",
 			scriptListTypeWidth, result.Type,
 			scriptListFileWidth, truncateScriptListText(result.Filename, scriptListFileWidth),
+			scriptListVerWidth, truncateScriptListText(result.Versions, scriptListVerWidth),
 			scriptListDescWidth, truncateScriptListText(result.Description, scriptListDescWidth),
 			eol)
 	}
@@ -374,6 +383,7 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 
 	// Check if stdin is a terminal
 	isTerminal := term.IsTerminal(int(os.Stdin.Fd()))
+	logger.DebugStep("tui-start", fmt.Sprintf("interval=%ds count=%d terminal=%v", cfg.Interval, cfg.Count, isTerminal))
 
 	if isTerminal {
 		// Setup terminal for raw input
@@ -421,6 +431,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 	snapshot, err := collectSnapshot(ctx, coll, calc)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error in iteration: %v\n", err)
+		if cfg.DebugMode {
+			logger.Debug("[tui] initial snapshot failed: %v\n", err)
+		}
 	} else {
 		if isTerminal {
 			interactiveDisp.RenderInteractive(snapshot)
@@ -443,6 +456,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 			snapshot, err := collectSnapshot(ctx, coll, calc)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error in iteration: %v\n", err)
+				if cfg.DebugMode {
+					logger.Debug("[tui] ticker snapshot failed: %v\n", err)
+				}
 			} else {
 				if isTerminal {
 					interactiveDisp.RenderInteractive(snapshot)
@@ -459,6 +475,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 			}
 
 		case <-sigChan:
+			if cfg.DebugMode {
+				logger.DebugTUIAction("exit", "signal")
+			}
 			// Restore terminal before exit
 			restoreTerminal()
 			stopGoroutines()
@@ -467,14 +486,23 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 		case key := <-keyChan:
 			// Handle keyboard input in interactive mode
 			if isTerminal {
+				if cfg.DebugMode {
+					logger.DebugTUIKey(key)
+				}
 				switch key {
 				case 'q', 'Q', 27: // q, Q, or ESC key
+					if cfg.DebugMode {
+						logger.DebugTUIAction("quit", "")
+					}
 					// Restore terminal before exit
 					restoreTerminal()
 					stopGoroutines()
 					fmt.Println("\r\nExiting...")
 					return
 				case 'a', 'A':
+					if cfg.DebugMode {
+						logger.DebugSection("tui-adhoc-sql")
+					}
 					// Execute ad-hoc SQL
 					// Clear screen
 					fmt.Print("\033[2J\033[H")
@@ -485,9 +513,15 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					// Prompt for SQL statement (terminal stays in raw mode)
 					fmt.Print("\nEnter SQL statement (ESC to cancel): ")
 					sqlStmt := terminal.PromptInput("", 1024)
+					if cfg.DebugMode {
+						logger.DebugTUIInput("adhoc-sql", sqlStmt)
+					}
 
 					if sqlStmt != "" {
 						output, err := exec.ExecuteAdHocSQL(ctx, sqlStmt)
+						if cfg.DebugMode {
+							logger.DebugTUIResult("adhoc-sql", err, len(output))
+						}
 						if err != nil {
 							fmt.Fprintf(os.Stderr, "\r\nError executing SQL: %v\r\n", err)
 						}
@@ -518,9 +552,17 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					}
 
 					// Refresh display
-					snapshot, _ := collectSnapshot(ctx, coll, calc)
-					interactiveDisp.RenderInteractive(snapshot)
+					if snapshot, snapErr := collectSnapshot(ctx, coll, calc); snapErr != nil {
+						if cfg.DebugMode {
+							logger.Debug("[tui] post-adhoc-sql refresh failed: %v\n", snapErr)
+						}
+					} else {
+						interactiveDisp.RenderInteractive(snapshot)
+					}
 				case 's', 'S':
+					if cfg.DebugMode {
+						logger.DebugSection("tui-exec-command")
+					}
 					// Execute command/script
 					// Clear screen
 					fmt.Print("\033[2J\033[H")
@@ -531,6 +573,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					// Prompt for command (terminal stays in raw mode)
 					fmt.Print("\nEnter SQL script (.sql) or OS command (ESC to cancel): ")
 					command := terminal.PromptInput("", 256)
+					if cfg.DebugMode {
+						logger.DebugTUIInput("exec-command", command)
+					}
 
 					if command != "" {
 						fmt.Println() // Add blank line before output
@@ -594,6 +639,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 							escStopChan <- true // Stop ESC monitoring goroutine
 						case <-escChan:
 							cmdCancel() // Cancel the command
+							if cfg.DebugMode {
+								logger.DebugTUIAction("exec-command", "cancelled-by-user")
+							}
 							fmt.Println("\n\n[Command cancelled by user - Press ESC]")
 							time.Sleep(500 * time.Millisecond) // Wait for command to clean up
 							output = ""
@@ -603,6 +651,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 
 						if cmdErr != nil {
 							fmt.Fprintf(os.Stderr, "\r\n\r\nError executing command: %v\r\n\r\n", cmdErr)
+						}
+						if cfg.DebugMode {
+							logger.DebugTUIResult("exec-command", cmdErr, len(output))
 						}
 
 						// Display output if available (SQL scripts only;
@@ -642,9 +693,17 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					}
 
 					// Refresh display
-					snapshot, _ := collectSnapshot(ctx, coll, calc)
-					interactiveDisp.RenderInteractive(snapshot)
+					if snapshot, snapErr := collectSnapshot(ctx, coll, calc); snapErr != nil {
+						if cfg.DebugMode {
+							logger.Debug("[tui] post-exec-command refresh failed: %v\n", snapErr)
+						}
+					} else {
+						interactiveDisp.RenderInteractive(snapshot)
+					}
 				case 'f', 'F':
+					if cfg.DebugMode {
+						logger.DebugSection("tui-find-script")
+					}
 					// Find/search scripts
 					// Clear screen
 					fmt.Print("\033[2J\033[H")
@@ -655,6 +714,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					// Prompt for search pattern
 					fmt.Print("\nEnter search pattern (regex, .* for all, ESC to cancel): ")
 					pattern := terminal.PromptInput("", 256)
+					if cfg.DebugMode {
+						logger.DebugTUIInput("find-script", pattern)
+					}
 
 					if pattern != "" {
 						fmt.Print("\r\n\r\n")
@@ -668,6 +730,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 						} else {
 							printScriptListTable(results, "\r\n")
 							fmt.Printf("\r\n%d script(s) found\r\n", len(results))
+						}
+						if cfg.DebugMode {
+							logger.DebugTUIResult("find-script", err, len(results))
 						}
 
 						// Resume keyboard reading before waiting for key press
@@ -689,9 +754,17 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					}
 
 					// Refresh display
-					snapshot, _ := collectSnapshot(ctx, coll, calc)
-					interactiveDisp.RenderInteractive(snapshot)
+					if snapshot, snapErr := collectSnapshot(ctx, coll, calc); snapErr != nil {
+						if cfg.DebugMode {
+							logger.Debug("[tui] post-find-script refresh failed: %v\n", snapErr)
+						}
+					} else {
+						interactiveDisp.RenderInteractive(snapshot)
+					}
 				case 'r', 'R':
+					if cfg.DebugMode {
+						logger.DebugSection("tui-read-script")
+					}
 					// Read/view script content
 					// Clear screen
 					fmt.Print("\033[2J\033[H")
@@ -702,6 +775,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					// Prompt for script filename
 					fmt.Print("\nEnter script filename (.sql in sql/, others in os/, ESC to cancel): ")
 					filename := terminal.PromptInput("", 256)
+					if cfg.DebugMode {
+						logger.DebugTUIInput("read-script", filename)
+					}
 
 					if filename != "" {
 						fmt.Print("\r\n\r\n")
@@ -718,6 +794,15 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 							fmt.Print(displayContent)
 							fmt.Print("\r\n")
 						}
+						if cfg.DebugMode {
+							if err != nil {
+								logger.DebugTUIResult("read-script", err, 0)
+							} else if isBinary {
+								logger.DebugTUIAction("read-script", "binary file")
+							} else {
+								logger.DebugTUIResult("read-script", nil, len(content))
+							}
+						}
 
 						// Resume keyboard reading before waiting for key press
 						pauseReadChan <- false
@@ -738,9 +823,17 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					}
 
 					// Refresh display
-					snapshot, _ := collectSnapshot(ctx, coll, calc)
-					interactiveDisp.RenderInteractive(snapshot)
+					if snapshot, snapErr := collectSnapshot(ctx, coll, calc); snapErr != nil {
+						if cfg.DebugMode {
+							logger.Debug("[tui] post-read-script refresh failed: %v\n", snapErr)
+						}
+					} else {
+						interactiveDisp.RenderInteractive(snapshot)
+					}
 				case 'c', 'C':
+					if cfg.DebugMode {
+						logger.DebugSection("tui-copy-script")
+					}
 					// Copy script to server/local
 					// Clear screen
 					fmt.Print("\033[2J\033[H")
@@ -751,6 +844,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					// Prompt for script filename and destination
 					fmt.Print("\nEnter script filename and destination (e.g., we.sql /tmp, or just we.sql for /tmp, ESC to cancel): ")
 					input := terminal.PromptInput("", 512)
+					if cfg.DebugMode {
+						logger.DebugTUIInput("copy-script", input)
+					}
 
 					if input != "" {
 						fmt.Print("\r\n\r\n")
@@ -761,11 +857,17 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 							fmt.Print("Invalid format. Usage: <scriptname> [destpath]\r\n")
 							fmt.Print("Example: we.sql /tmp\r\n")
 							fmt.Print("Example: we.sql (defaults to /tmp)\r\n")
+							if cfg.DebugMode {
+								logger.DebugTUIAction("copy-script", "invalid-format")
+							}
 						} else {
 							scriptName := parts[0]
 							destPath := ""
 							if len(parts) == 2 {
 								destPath = parts[1]
+							}
+							if cfg.DebugMode {
+								logger.Debug("[tui] copy-script script=%q dest=%q\n", scriptName, destPath)
 							}
 							// If no destPath specified, CopyScript will default to /tmp
 
@@ -779,6 +881,13 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 										cfg.SSHHost, destFile)
 								} else {
 									fmt.Printf("Script copied successfully to %s\r\n", destFile)
+								}
+							}
+							if cfg.DebugMode {
+								if err != nil {
+									logger.DebugTUIResult("copy-script", err, 0)
+								} else {
+									logger.Debug("[tui] copy-script result=ok dest_file=%q\n", destFile)
 								}
 							}
 						}
@@ -802,9 +911,17 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					}
 
 					// Refresh display
-					snapshot, _ := collectSnapshot(ctx, coll, calc)
-					interactiveDisp.RenderInteractive(snapshot)
+					if snapshot, snapErr := collectSnapshot(ctx, coll, calc); snapErr != nil {
+						if cfg.DebugMode {
+							logger.Debug("[tui] post-copy-script refresh failed: %v\n", snapErr)
+						}
+					} else {
+						interactiveDisp.RenderInteractive(snapshot)
+					}
 				case 'h', 'H':
+					if cfg.DebugMode {
+						logger.DebugTUIAction("help", "")
+					}
 					// Show help with terminal restore
 					terminal.WithTerminalRestore(globalOldState, func() error {
 						// Clear screen and show help
@@ -817,8 +934,17 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					<-keyChan // Consume the next key press
 
 					// Refresh display immediately
-					snapshot, _ := collectSnapshot(ctx, coll, calc)
-					interactiveDisp.RenderInteractive(snapshot)
+					if snapshot, snapErr := collectSnapshot(ctx, coll, calc); snapErr != nil {
+						if cfg.DebugMode {
+							logger.Debug("[tui] post-help refresh failed: %v\n", snapErr)
+						}
+					} else {
+						interactiveDisp.RenderInteractive(snapshot)
+					}
+				default:
+					if cfg.DebugMode {
+						logger.DebugTUIAction("unhandled", logger.TUIKeyName(key))
+					}
 				}
 			}
 		}
@@ -948,25 +1074,30 @@ func processKeyboard(inputChan <-chan byte, keyChan chan<- byte, pauseChan <-cha
 func collectSnapshot(ctx context.Context, coll *collector.Collector, calc *calculator.Calculator) (*models.Snapshot, error) {
 	collectStart := time.Now()
 	timestamp := time.Now()
+	logger.DebugSection("tui-collect-snapshot")
 
 	// Collect data
 	sysStats, err := coll.CollectSysStats(ctx)
 	if err != nil {
+		logger.Debug("[tui] collectSnapshot failed at sysstat after %.3fs: %v\n", time.Since(collectStart).Seconds(), err)
 		return nil, fmt.Errorf("failed to collect sysstat: %w", err)
 	}
 
 	systemEvents, err := coll.CollectSystemEvents(ctx)
 	if err != nil {
+		logger.Debug("[tui] collectSnapshot failed at system_events after %.3fs: %v\n", time.Since(collectStart).Seconds(), err)
 		return nil, fmt.Errorf("failed to collect system events: %w", err)
 	}
 
 	sessionMetrics, err := coll.CollectSessionMetrics(ctx)
 	if err != nil {
+		logger.Debug("[tui] collectSnapshot failed at session_metrics after %.3fs: %v\n", time.Since(collectStart).Seconds(), err)
 		return nil, fmt.Errorf("failed to collect session metrics: %w", err)
 	}
 
 	sessionDetails, err := coll.CollectSessionDetails(ctx)
 	if err != nil {
+		logger.Debug("[tui] collectSnapshot failed at session_details after %.3fs: %v\n", time.Since(collectStart).Seconds(), err)
 		return nil, fmt.Errorf("failed to collect session details: %w", err)
 	}
 
@@ -977,9 +1108,15 @@ func collectSnapshot(ctx context.Context, coll *collector.Collector, calc *calcu
 	systemEvents = calc.CalculateSystemEventDeltas(systemEvents)
 	sessionMetrics = calc.RankSessionMetrics(sessionMetrics, timestamp)
 
+	totalDuration := time.Since(collectStart)
+	logger.Debug("[tui] collectSnapshot ok collect=%.3fs total=%.3fs sysStats=%d events=%d sessionMetrics=%d sessionDetails=%d\n",
+		collectDuration.Seconds(), totalDuration.Seconds(),
+		len(sysStats), len(systemEvents), len(sessionMetrics), len(sessionDetails))
 	if collectDuration > 500*time.Millisecond {
 		fmt.Fprintf(os.Stderr, "[WARN] Snapshot collection took %.2fs (collect=%.2fs)\n",
-			time.Since(collectStart).Seconds(), collectDuration.Seconds())
+			totalDuration.Seconds(), collectDuration.Seconds())
+		logger.Debug("[tui] collectSnapshot slow: collect=%.3fs total=%.3fs\n",
+			collectDuration.Seconds(), totalDuration.Seconds())
 	}
 
 	// Create snapshot

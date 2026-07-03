@@ -104,39 +104,47 @@ func parseYasqlOutput(output string) ([][]string, error) {
 	return rows, nil
 }
 
-// parseFixedWidthLine parses a line based on separator positions
+// parseFixedWidthLine parses a line based on separator positions.
+// Empty columns are preserved so downstream row indices stay aligned with headers.
 func parseFixedWidthLine(line, separator string) []string {
-	var fields []string
-	var start int
-	inField := false
-
-	// Find column boundaries from separator line
-	for i, ch := range separator {
-		if ch == '-' && !inField {
-			start = i
-			inField = true
-		} else if ch == ' ' && inField {
-			// End of field
-			if start < len(line) {
-				end := min(i, len(line))
-				field := strings.TrimSpace(line[start:end])
-				if field != "" {
-					fields = append(fields, field)
-				}
-			}
-			inField = false
+	ranges := fixedWidthColumnRanges(separator)
+	fields := make([]string, 0, len(ranges))
+	for _, r := range ranges {
+		start, end := r[0], r[1]
+		if start >= len(line) {
+			fields = append(fields, "")
+			continue
 		}
-	}
-
-	// Handle last field
-	if inField && start < len(line) {
-		field := strings.TrimSpace(line[start:])
-		if field != "" {
-			fields = append(fields, field)
+		if end > len(line) {
+			end = len(line)
 		}
+		fields = append(fields, strings.TrimSpace(line[start:end]))
 	}
-
 	return fields
+}
+
+// fixedWidthColumnRanges returns [start,end) spans for each dash group in a yasql separator line.
+func fixedWidthColumnRanges(separator string) [][2]int {
+	var ranges [][2]int
+	inDash := false
+	start := 0
+	for i, ch := range separator {
+		if ch == '-' {
+			if !inDash {
+				start = i
+				inDash = true
+			}
+			continue
+		}
+		if inDash {
+			ranges = append(ranges, [2]int{start, i})
+			inDash = false
+		}
+	}
+	if inDash {
+		ranges = append(ranges, [2]int{start, len(separator)})
+	}
+	return ranges
 }
 
 // ParseYasqlOutputWithHeader parses yasql output and returns header + data rows
