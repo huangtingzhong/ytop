@@ -105,76 +105,76 @@ func (d *Display) renderHeader(out *strings.Builder, timestamp time.Time) {
 	}
 }
 
-// renderSysStats renders v$sysstat metrics in a single row format with aligned columns
-// Supports multi-instance display
+// renderSysStats renders v$sysstat metrics in a single row (rates + IO latency ms).
 func (d *Display) renderSysStats(out *strings.Builder, metrics []models.SysStatMetric) {
-	out.WriteString(d.colorize("v$SYSSTAT Metrics (Per Second)\n", "yellow"))
+	if len(metrics) == 0 {
+		out.WriteString(d.colorize("v$SYSSTAT Metrics (Per Second)\n", "yellow"))
+		out.WriteString(strings.Repeat("-", 120))
+		out.WriteString("\nNo metrics available\n\n")
+		return
+	}
+
+	if !d.sysStatsReady(metrics) {
+		out.WriteString(d.colorize("v$SYSSTAT Metrics (Per Second)\n", "yellow"))
+		out.WriteString(strings.Repeat("-", 120))
+		out.WriteString("\nCollecting baseline data...\n\n")
+		return
+	}
+
+	d.renderSysStatPanel(out, "v$SYSSTAT Metrics (Per Second)", config.SysStatDisplayNames(), metrics)
+}
+
+func (d *Display) sysStatsReady(metrics []models.SysStatMetric) bool {
+	display := make(map[string]bool, len(config.SysStatDisplayNames()))
+	for _, n := range config.SysStatDisplayNames() {
+		display[n] = true
+	}
+	for _, m := range metrics {
+		if config.IsSysStatSourceOnly(m.Name) {
+			continue
+		}
+		if !display[m.Name] {
+			continue
+		}
+		if m.IsIntervalAvg && m.IntervalValue > 0.001 {
+			return true
+		}
+		if m.DeltaPerSec > 0.01 {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *Display) renderSysStatPanel(out *strings.Builder, title string, order []string, metrics []models.SysStatMetric) {
+	out.WriteString(d.colorize(title+"\n", "yellow"))
 	out.WriteString(strings.Repeat("-", 120))
 	out.WriteString("\n")
 
-	if len(metrics) == 0 {
-		out.WriteString("No metrics available\n\n")
-		return
-	}
+	colWidth := 6
+	nameMap := sysStatShortNames()
 
-	colWidth := 6 // Width for each column
-
-	// Metric name mapping for better readability (max 6 chars)
-	nameMap := map[string]string{
-		"BLOCK CHANGES":      "BLKCHG",
-		"BUFFER CR GETS":     "CRGETS",
-		"BUFFER GETS":        "GETS",
-		"COMMITS":            "COMMIT",
-		"CPU TIME":           "CPUTIM",
-		"DB TIME":            "DBTIM",
-		"DISK READS":         "PHYRD",
-		"DISK WRITES":        "PHYWR",
-		"EXECUTE COUNT":      "EXEC",
-		"INSERT COUNT":       "INSERT",
-		"LOGONS TOTAL":       "LOGONS",
-		"PARSE COUNT (HARD)": "HRDPRS",
-		"QUERY COUNT":        "QUERY",
-		"REDO SIZE":          "REDO",
-	}
-
-	// Check if we have any delta values
-	hasNonZero := false
-	for _, m := range metrics {
-		if m.DeltaPerSec > 0.01 {
-			hasNonZero = true
-			break
-		}
-	}
-
-	// First iteration (no delta), don't display
-	if !hasNonZero {
-		out.WriteString("Collecting baseline data...\n\n")
-		return
-	}
-
-	// Group metrics by instance
-	instMetrics := make(map[int][]models.SysStatMetric)
-	for _, m := range metrics {
-		instMetrics[m.InstID] = append(instMetrics[m.InstID], m)
-	}
-
-	// Get sorted instance IDs
+	instMetrics := make(map[int]map[string]models.SysStatMetric)
 	var instIDs []int
-	for instID := range instMetrics {
-		instIDs = append(instIDs, instID)
+	seenInst := make(map[int]bool)
+	for _, m := range metrics {
+		if _, ok := instMetrics[m.InstID]; !ok {
+			instMetrics[m.InstID] = make(map[string]models.SysStatMetric)
+		}
+		instMetrics[m.InstID][m.Name] = m
+		if !seenInst[m.InstID] {
+			seenInst[m.InstID] = true
+			instIDs = append(instIDs, m.InstID)
+		}
 	}
 	sort.Ints(instIDs)
 
-	// Header row - I + metric names (right-aligned)
 	out.WriteString(d.colorize(fmt.Sprintf("%2s", "I"), "bold"))
 	out.WriteString(" ")
-
-	// Use first instance's metrics to get metric names in order
-	firstInstMetrics := instMetrics[instIDs[0]]
-	for i, m := range firstInstMetrics {
-		shortName := nameMap[m.Name]
+	for i, name := range order {
+		shortName := nameMap[name]
 		if shortName == "" {
-			shortName = d.truncate(m.Name, colWidth)
+			shortName = d.truncate(name, colWidth)
 		}
 		if i > 0 {
 			out.WriteString(" ")
@@ -183,30 +183,61 @@ func (d *Display) renderSysStats(out *strings.Builder, metrics []models.SysStatM
 	}
 	out.WriteString("\n")
 
-	// Data rows - one per instance
 	for _, instID := range instIDs {
 		out.WriteString(fmt.Sprintf("%2d", instID))
 		out.WriteString(" ")
-
-		for i, m := range instMetrics[instID] {
+		row := instMetrics[instID]
+		for i, name := range order {
 			if i > 0 {
 				out.WriteString(" ")
 			}
-
+			m, ok := row[name]
+			if !ok {
+				out.WriteString(fmt.Sprintf("%*s", colWidth, "0"))
+				continue
+			}
 			var valueStr string
-			if m.DeltaPerSec > 0.01 {
-				// Show delta per second (without /s)
+			if m.IsIntervalAvg {
+				if m.IntervalValue > 0.001 {
+					valueStr = d.formatNumber(m.IntervalValue)
+				} else {
+					valueStr = "0"
+				}
+			} else if m.DeltaPerSec > 0.01 {
 				valueStr = d.formatNumber(m.DeltaPerSec)
 			} else {
-				// Zero or very small delta
 				valueStr = "0"
 			}
 			out.WriteString(fmt.Sprintf("%*s", colWidth, valueStr))
 		}
 		out.WriteString("\n")
 	}
-
 	out.WriteString("\n")
+}
+
+func sysStatShortNames() map[string]string {
+	return map[string]string{
+		"BLOCK CHANGES":              "BLKCHG",
+		"BUFFER CR GETS":             "CRGETS",
+		"BUFFER GETS":                "GETS",
+		"COMMITS":                    "COMMIT",
+		"CPU TIME":                   "CPUTIM",
+		"DB TIME":                    "DBTIM",
+		"DISK READS":                 "PHYRD",
+		"DISK WRITES":                "PHYWR",
+		"EXECUTE COUNT":              "EXEC",
+		"INSERT COUNT":               "INSERT",
+		"LOGONS TOTAL":               "LOGONS",
+		"PARSE COUNT (HARD)":         "HRDPRS",
+		"QUERY COUNT":                "QUERY",
+		"REDO SIZE":                  "REDO",
+		config.MetricCheckpointsCompleted: "CHKPT",
+		config.MetricUserIOWaitTime:       "IOWAIT",
+		config.MetricVMOpen:             "VMOPN",
+		config.MetricVMSwapOut:            "VMSWP",
+		config.DerivedAvgReadMS:           "RDMS",
+		config.DerivedAvgWriteMS:          "WRMS",
+	}
 }
 
 // renderSystemEvents renders v$system_event TOP N
@@ -283,41 +314,8 @@ func (d *Display) renderSessionMetrics(out *strings.Builder, metrics []models.Se
 	sqlIDWidth := 15
 	programWidth := 20
 
-	// Metric names in order (matching v$SYSSTAT)
-	metricNames := []string{
-		"BLOCK CHANGES",
-		"BUFFER CR GETS",
-		"BUFFER GETS",
-		"COMMITS",
-		"CPU TIME",
-		"DB TIME",
-		"DISK READS",
-		"DISK WRITES",
-		"EXECUTE COUNT",
-		"INSERT COUNT",
-		"LOGONS TOTAL",
-		"PARSE COUNT (HARD)",
-		"QUERY COUNT",
-		"REDO SIZE",
-	}
-
-	// Short names mapping (same as v$SYSSTAT, max 6 chars)
-	nameMap := map[string]string{
-		"BLOCK CHANGES":      "BLKCHG",
-		"BUFFER CR GETS":     "CRGETS",
-		"BUFFER GETS":        "GETS",
-		"COMMITS":            "COMMIT",
-		"CPU TIME":           "CPUTIM",
-		"DB TIME":            "DBTIM",
-		"DISK READS":         "PHYRD",
-		"DISK WRITES":        "PHYWR",
-		"EXECUTE COUNT":      "EXEC",
-		"INSERT COUNT":       "INSERT",
-		"LOGONS TOTAL":       "LOGONS",
-		"PARSE COUNT (HARD)": "HRDPRS",
-		"QUERY COUNT":        "QUERY",
-		"REDO SIZE":          "REDO",
-	}
+	metricNames := config.SessionStatDisplayNames()
+	nameMap := sysStatShortNames()
 
 	// Header row: I, SID.Serial.TID, Username, SQL_ID, Program, Metrics
 	out.WriteString(d.colorize(fmt.Sprintf("%*s", instWidth, "I"), "bold"))
@@ -387,7 +385,7 @@ func (d *Display) renderSessionDetails(out *strings.Builder, details []models.Se
 	// Header
 	out.WriteString(d.colorize(fmt.Sprintf("%*s", instWidth, "I"), "bold"))
 	out.WriteString(" ")
-	out.WriteString(d.colorize(fmt.Sprintf("%-*s", sidWidth, "SID.Serial"), "bold"))
+	out.WriteString(d.colorize(fmt.Sprintf("%-*s", sidWidth, "SID_TID"), "bold"))
 	out.WriteString(" ")
 	out.WriteString(d.colorize(fmt.Sprintf("%-*s", eventWidth, "Event"), "bold"))
 	out.WriteString(" ")

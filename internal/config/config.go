@@ -43,8 +43,9 @@ type Config struct {
 	InstanceID        int // 0 = all instances, 1,2,... = specific instance
 
 	// Metric settings
-	SysStatMetrics []string
-	EventTopN      int
+	SysStatMetrics     []string // GV$SYSSTAT names to query (includes source-only TIME metrics)
+	SessionStatMetrics []string // GV$SESSTAT names for session TOP N
+	EventTopN          int
 
 	// Advanced settings
 	QueryTimeout int
@@ -100,6 +101,106 @@ type Config struct {
 	iniSessionTopSet       bool
 }
 
+// Sysstat metric name constants (GV$SYSSTAT.NAME in YashanDB).
+const (
+	MetricDiskReadTime        = "DISK READ TIME"
+	MetricDiskWriteTime       = "DISK WRITE TIME"
+	MetricDiskReads           = "DISK READS"
+	MetricDiskWrites          = "DISK WRITES"
+	MetricCheckpointsCompleted = "CHECKPOINTS COMPLETED"
+	MetricUserIOWaitTime      = "USER IO WAIT TIME"
+	MetricVMOpen              = "VM OPEN"
+	MetricVMSwapOut           = "VM SWAP OUT"
+	DerivedAvgReadMS          = "AVG READ MS"
+	DerivedAvgWriteMS         = "AVG WRITE MS"
+)
+
+// defaultCoreStatMetrics are the original 14 instance/session statistics.
+func defaultCoreStatMetrics() []string {
+	return []string{
+		"DB TIME",
+		"CPU TIME",
+		"COMMITS",
+		"REDO SIZE",
+		"QUERY COUNT",
+		"BLOCK CHANGES",
+		"LOGONS TOTAL",
+		"INSERT COUNT",
+		"PARSE COUNT (HARD)",
+		"DISK READS",
+		"DISK WRITES",
+		"BUFFER GETS",
+		"EXECUTE COUNT",
+		"BUFFER CR GETS",
+	}
+}
+
+// defaultSessionStatMetrics lists GV$SESSTAT names for session TOP N (includes TIME for derived IO avg).
+func defaultSessionStatMetrics() []string {
+	return defaultSysStatQueryMetrics()
+}
+
+// SessionStatDisplayNames is the session TOP metric column order (aligned with instance sysstat row).
+func SessionStatDisplayNames() []string {
+	return SysStatDisplayNames()
+}
+
+// defaultSysStatQueryMetrics lists all GV$SYSSTAT names collected in monitor mode.
+func defaultSysStatQueryMetrics() []string {
+	base := defaultCoreStatMetrics()
+	extra := []string{
+		MetricCheckpointsCompleted,
+		MetricUserIOWaitTime,
+		MetricDiskReadTime,
+		MetricDiskWriteTime,
+		MetricVMOpen,
+		MetricVMSwapOut,
+	}
+	out := make([]string, 0, len(base)+len(extra))
+	out = append(out, base...)
+	out = append(out, extra...)
+	return out
+}
+
+// SysStatDisplayNames is the single monitor TUI row (rates + IO latency ms).
+func SysStatDisplayNames() []string {
+	return []string{
+		"DB TIME",
+		"CPU TIME",
+		"COMMITS",
+		"REDO SIZE",
+		"QUERY COUNT",
+		"BLOCK CHANGES",
+		"LOGONS TOTAL",
+		"INSERT COUNT",
+		"PARSE COUNT (HARD)",
+		MetricDiskReads,
+		DerivedAvgReadMS,
+		MetricDiskWrites,
+		DerivedAvgWriteMS,
+		"BUFFER GETS",
+		"EXECUTE COUNT",
+		"BUFFER CR GETS",
+		MetricCheckpointsCompleted,
+		MetricUserIOWaitTime,
+		MetricVMOpen,
+		MetricVMSwapOut,
+	}
+}
+
+// IsSysStatSourceOnly reports metrics queried but not shown directly in the TUI.
+func IsSysStatSourceOnly(name string) bool {
+	return name == MetricDiskReadTime || name == MetricDiskWriteTime
+}
+
+// SessionStatMetricsList returns session-level stat names for GV$SESSTAT.
+func (c *Config) SessionStatMetricsList() []string {
+	if len(c.SessionStatMetrics) > 0 {
+		return c.SessionStatMetrics
+	}
+	return defaultSessionStatMetrics()
+}
+
 // DefaultConfig returns a config with default values
 func DefaultConfig() *Config {
 	return &Config{
@@ -115,22 +216,8 @@ func DefaultConfig() *Config {
 		ShowTimestamp:     true,
 		ColorEnabled:      true,
 		InstanceID:        0, // 0 = all instances
-		SysStatMetrics: []string{
-			"DB TIME",
-			"CPU TIME",
-			"COMMITS",
-			"REDO SIZE",
-			"QUERY COUNT",
-			"BLOCK CHANGES",
-			"LOGONS TOTAL",
-			"INSERT COUNT",
-			"PARSE COUNT (HARD)",
-			"DISK READS",
-			"DISK WRITES",
-			"BUFFER GETS",
-			"EXECUTE COUNT",
-			"BUFFER CR GETS",
-		},
+		SysStatMetrics:      defaultSysStatQueryMetrics(),
+		SessionStatMetrics:  defaultSessionStatMetrics(),
 		EventTopN:    5,
 		QueryTimeout: 30,
 		SSHTimeout:   10,
@@ -657,6 +744,18 @@ func loadFromFile(cfg *Config, path string) error {
 			for _, m := range parts {
 				if t := strings.TrimSpace(m); t != "" {
 					cfg.SysStatMetrics = append(cfg.SysStatMetrics, t)
+				}
+			}
+		}
+	}
+	if section.HasKey("session_stat_metrics") {
+		metricsStr := section.Key("session_stat_metrics").String()
+		if metricsStr != "" {
+			parts := strings.Split(metricsStr, ",")
+			cfg.SessionStatMetrics = make([]string, 0, len(parts))
+			for _, m := range parts {
+				if t := strings.TrimSpace(m); t != "" {
+					cfg.SessionStatMetrics = append(cfg.SessionStatMetrics, t)
 				}
 			}
 		}

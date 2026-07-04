@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -254,9 +255,21 @@ func (c *SSHConnector) executeSQLTwoStep(ctx context.Context, sql string) (strin
 // Close closes the SSH connection
 func (c *SSHConnector) Close() error {
 	if c.pool != nil {
-		return c.pool.Close()
+		err := c.pool.Close()
+		c.connected = false
+		return err
 	}
+	c.connected = false
 	return nil
+}
+
+// Reconnect closes the current SSH session and runs Connect again (monitor retry).
+func (c *SSHConnector) Reconnect(ctx context.Context) error {
+	if c.pool != nil {
+		_ = c.pool.Close()
+	}
+	c.connected = false
+	return c.Connect(ctx)
 }
 
 // IsConnected returns connection status
@@ -410,4 +423,45 @@ func (c *SSHConnector) ExecuteCommandRealtime(ctx context.Context, command strin
 		logger.DebugCommandOutput("ssh-realtime", result, nil)
 	}
 	return result, nil
+}
+
+// ErrSSHRetriesExhausted is returned when monitor mode retried SSH operations
+// the maximum number of times without success.
+var ErrSSHRetriesExhausted = errors.New("ssh retries exhausted")
+
+// MonitorSSHMaxRetries is the number of reconnect attempts in monitor TUI mode.
+const MonitorSSHMaxRetries = 3
+
+// IsRecoverableSSHError reports whether err likely indicates a broken SSH/SFTP session
+// (as opposed to a SQL or configuration error).
+func IsRecoverableSSHError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	patterns := []string{
+		"not connected",
+		"ssh connection failed",
+		"failed to create ssh session",
+		"ssh client not available",
+		"ssh command execution failed",
+		"sftp upload failed",
+		"sftp upload verify failed",
+		"connection reset",
+		"broken pipe",
+		"use of closed network connection",
+		"i/o timeout",
+		"no route to host",
+		"connection refused",
+		"network is unreachable",
+		"ssh: handshake failed",
+		"connection timed out",
+		"eof",
+	}
+	for _, p := range patterns {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
 }

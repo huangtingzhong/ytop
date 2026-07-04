@@ -29,7 +29,7 @@ func NewCalculator(cfg *config.Config) *Calculator {
 	}
 }
 
-// CalculateSysStatDeltas calculates per-second deltas for sysstat metrics
+// CalculateSysStatDeltas calculates per-second deltas for sysstat metrics and derived IO averages.
 func (c *Calculator) CalculateSysStatDeltas(metrics []models.SysStatMetric, timestamp time.Time) []models.SysStatMetric {
 	if c.prevTimestamp.IsZero() {
 		for _, m := range metrics {
@@ -52,18 +52,58 @@ func (c *Calculator) CalculateSysStatDeltas(metrics []models.SysStatMetric, time
 		logger.Debug("[calculator] SysStats delta: timeDiff=%.2fs, metrics=%d\n", timeDiff, len(metrics))
 	}
 
-	result := make([]models.SysStatMetric, len(metrics))
-	for i, m := range metrics {
-		result[i] = m
+	intervalByInst := make(map[int]map[string]float64)
+	result := make([]models.SysStatMetric, 0, len(metrics)+4)
+
+	for _, m := range metrics {
 		key := fmt.Sprintf("%d-%s", m.InstID, m.Name)
+		out := m
 		if prevValue, exists := c.prevSysStats[key]; exists {
 			delta := m.CurrentValue - prevValue
-			result[i].DeltaPerSec = delta / timeDiff
+			out.DeltaPerSec = delta / timeDiff
+			if intervalByInst[m.InstID] == nil {
+				intervalByInst[m.InstID] = make(map[string]float64)
+			}
+			intervalByInst[m.InstID][m.Name] = delta
 			if c.cfg.DebugMode {
-				logger.Debug("[calculator]   %s: prev=%.2f cur=%.2f delta/s=%.4f\n", m.Name, prevValue, m.CurrentValue, result[i].DeltaPerSec)
+				logger.Debug("[calculator]   %s: prev=%.2f cur=%.2f delta/s=%.4f\n", m.Name, prevValue, m.CurrentValue, out.DeltaPerSec)
 			}
 		}
 		c.prevSysStats[key] = m.CurrentValue
+		result = append(result, out)
+	}
+
+	for instID, deltas := range intervalByInst {
+		if dr := deltas[config.MetricDiskReads]; dr > 0 {
+			if dt, ok := deltas[config.MetricDiskReadTime]; ok {
+				avg := dt / dr
+				result = append(result, models.SysStatMetric{
+					InstID:        instID,
+					Name:          config.DerivedAvgReadMS,
+					IsIntervalAvg: true,
+					IntervalValue: avg,
+				})
+				if c.cfg.DebugMode {
+					logger.Debug("[calculator]   inst=%d %s: delta_time=%.2f delta_reads=%.2f avg=%.4f ms\n",
+						instID, config.DerivedAvgReadMS, dt, dr, avg)
+				}
+			}
+		}
+		if dw := deltas[config.MetricDiskWrites]; dw > 0 {
+			if dt, ok := deltas[config.MetricDiskWriteTime]; ok {
+				avg := dt / dw
+				result = append(result, models.SysStatMetric{
+					InstID:        instID,
+					Name:          config.DerivedAvgWriteMS,
+					IsIntervalAvg: true,
+					IntervalValue: avg,
+				})
+				if c.cfg.DebugMode {
+					logger.Debug("[calculator]   inst=%d %s: delta_time=%.2f delta_writes=%.2f avg=%.4f ms\n",
+						instID, config.DerivedAvgWriteMS, dt, dw, avg)
+				}
+			}
+		}
 	}
 
 	c.prevTimestamp = timestamp
@@ -169,6 +209,9 @@ func (c *Calculator) RankSessionMetrics(metrics []models.SessionMetric, timestam
 						deltaMetrics[metricName] = 0
 					}
 				}
+				for k, v := range sessionDerivedIOAvg(prev.Metrics, m.Metrics) {
+					deltaMetrics[k] = v
+				}
 
 				// Create new session metric with delta per second values
 				result = append(result, models.SessionMetric{
@@ -185,7 +228,7 @@ func (c *Calculator) RankSessionMetrics(metrics []models.SessionMetric, timestam
 			} else {
 				// New session, show zero values
 				zeroMetrics := make(map[string]float64)
-				for metricName := range m.Metrics {
+				for _, metricName := range config.SessionStatDisplayNames() {
 					zeroMetrics[metricName] = 0
 				}
 				result = append(result, models.SessionMetric{
@@ -237,4 +280,20 @@ func (c *Calculator) RankSessionMetrics(metrics []models.SessionMetric, timestam
 	}
 
 	return result
+}
+
+// sessionDerivedIOAvg computes per-session interval average read/write latency (ms).
+func sessionDerivedIOAvg(prev, cur map[string]float64) map[string]float64 {
+	out := make(map[string]float64)
+	if dr := cur[config.MetricDiskReads] - prev[config.MetricDiskReads]; dr > 0 {
+		if _, ok := prev[config.MetricDiskReadTime]; ok {
+			out[config.DerivedAvgReadMS] = (cur[config.MetricDiskReadTime] - prev[config.MetricDiskReadTime]) / dr
+		}
+	}
+	if dw := cur[config.MetricDiskWrites] - prev[config.MetricDiskWrites]; dw > 0 {
+		if _, ok := prev[config.MetricDiskWriteTime]; ok {
+			out[config.DerivedAvgWriteMS] = (cur[config.MetricDiskWriteTime] - prev[config.MetricDiskWriteTime]) / dw
+		}
+	}
+	return out
 }

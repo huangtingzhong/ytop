@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -428,7 +429,10 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 	maxIterations := cfg.Count
 
 	// Run first iteration immediately
-	snapshot, err := collectSnapshot(ctx, coll, calc)
+	snapshot, err := collectMonitorSnapshot(ctx, cfg, conn, coll, calc)
+	if handleMonitorSSHFatal(err) {
+		return
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error in iteration: %v\n", err)
 		if cfg.DebugMode {
@@ -453,7 +457,10 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 	for {
 		select {
 		case <-ticker.C:
-			snapshot, err := collectSnapshot(ctx, coll, calc)
+			snapshot, err := collectMonitorSnapshot(ctx, cfg, conn, coll, calc)
+			if handleMonitorSSHFatal(err) {
+				return
+			}
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error in iteration: %v\n", err)
 				if cfg.DebugMode {
@@ -552,7 +559,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					}
 
 					// Refresh display
-					if snapshot, snapErr := collectSnapshot(ctx, coll, calc); snapErr != nil {
+					if snapshot, snapErr := collectMonitorSnapshot(ctx, cfg, conn, coll, calc); handleMonitorSSHFatal(snapErr) {
+						return
+					} else if snapErr != nil {
 						if cfg.DebugMode {
 							logger.Debug("[tui] post-adhoc-sql refresh failed: %v\n", snapErr)
 						}
@@ -693,7 +702,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					}
 
 					// Refresh display
-					if snapshot, snapErr := collectSnapshot(ctx, coll, calc); snapErr != nil {
+					if snapshot, snapErr := collectMonitorSnapshot(ctx, cfg, conn, coll, calc); handleMonitorSSHFatal(snapErr) {
+						return
+					} else if snapErr != nil {
 						if cfg.DebugMode {
 							logger.Debug("[tui] post-exec-command refresh failed: %v\n", snapErr)
 						}
@@ -754,7 +765,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					}
 
 					// Refresh display
-					if snapshot, snapErr := collectSnapshot(ctx, coll, calc); snapErr != nil {
+					if snapshot, snapErr := collectMonitorSnapshot(ctx, cfg, conn, coll, calc); handleMonitorSSHFatal(snapErr) {
+						return
+					} else if snapErr != nil {
 						if cfg.DebugMode {
 							logger.Debug("[tui] post-find-script refresh failed: %v\n", snapErr)
 						}
@@ -823,7 +836,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					}
 
 					// Refresh display
-					if snapshot, snapErr := collectSnapshot(ctx, coll, calc); snapErr != nil {
+					if snapshot, snapErr := collectMonitorSnapshot(ctx, cfg, conn, coll, calc); handleMonitorSSHFatal(snapErr) {
+						return
+					} else if snapErr != nil {
 						if cfg.DebugMode {
 							logger.Debug("[tui] post-read-script refresh failed: %v\n", snapErr)
 						}
@@ -911,7 +926,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					}
 
 					// Refresh display
-					if snapshot, snapErr := collectSnapshot(ctx, coll, calc); snapErr != nil {
+					if snapshot, snapErr := collectMonitorSnapshot(ctx, cfg, conn, coll, calc); handleMonitorSSHFatal(snapErr) {
+						return
+					} else if snapErr != nil {
 						if cfg.DebugMode {
 							logger.Debug("[tui] post-copy-script refresh failed: %v\n", snapErr)
 						}
@@ -934,7 +951,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					<-keyChan // Consume the next key press
 
 					// Refresh display immediately
-					if snapshot, snapErr := collectSnapshot(ctx, coll, calc); snapErr != nil {
+					if snapshot, snapErr := collectMonitorSnapshot(ctx, cfg, conn, coll, calc); handleMonitorSSHFatal(snapErr) {
+						return
+					} else if snapErr != nil {
 						if cfg.DebugMode {
 							logger.Debug("[tui] post-help refresh failed: %v\n", snapErr)
 						}
@@ -1068,6 +1087,58 @@ func processKeyboard(inputChan <-chan byte, keyChan chan<- byte, pauseChan <-cha
 			return
 		}
 	}
+}
+
+// collectMonitorSnapshot collects a snapshot; in SSH mode it reconnects and retries
+// up to MonitorSSHMaxRetries times on recoverable connection errors.
+func collectMonitorSnapshot(ctx context.Context, cfg *config.Config, conn connector.Connector, coll *collector.Collector, calc *calculator.Calculator) (*models.Snapshot, error) {
+	snapshot, err := collectSnapshot(ctx, coll, calc)
+	if err == nil || cfg.ConnectionMode != "ssh" || !connector.IsRecoverableSSHError(err) {
+		return snapshot, err
+	}
+
+	sshConn, ok := conn.(*connector.SSHConnector)
+	if !ok {
+		return nil, err
+	}
+
+	lastErr := err
+	for attempt := 1; attempt <= connector.MonitorSSHMaxRetries; attempt++ {
+		fmt.Fprintf(os.Stderr, "[WARN] SSH connection lost, retry %d/%d: %v\n",
+			attempt, connector.MonitorSSHMaxRetries, lastErr)
+		if cfg.DebugMode {
+			logger.Debug("[tui] ssh retry %d/%d: %v\n", attempt, connector.MonitorSSHMaxRetries, lastErr)
+		}
+
+		if reconnErr := sshConn.Reconnect(ctx); reconnErr != nil {
+			lastErr = reconnErr
+		} else if snapshot, err = collectSnapshot(ctx, coll, calc); err == nil {
+			fmt.Fprintf(os.Stderr, "[INFO] SSH reconnected (attempt %d/%d)\n",
+				attempt, connector.MonitorSSHMaxRetries)
+			return snapshot, nil
+		} else if !connector.IsRecoverableSSHError(err) {
+			return nil, err
+		} else {
+			lastErr = err
+		}
+
+		if attempt < connector.MonitorSSHMaxRetries {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+	}
+
+	return nil, fmt.Errorf("%w: %v", connector.ErrSSHRetriesExhausted, lastErr)
+}
+
+func handleMonitorSSHFatal(err error) bool {
+	if err == nil || !errors.Is(err, connector.ErrSSHRetriesExhausted) {
+		return false
+	}
+	restoreTerminal()
+	stopGoroutines()
+	fmt.Fprintf(os.Stderr, "SSH connection lost after %d retries, exiting.\n", connector.MonitorSSHMaxRetries)
+	os.Exit(1)
+	return true
 }
 
 // collectSnapshot collects a data snapshot

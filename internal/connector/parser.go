@@ -55,6 +55,7 @@ func parseYasqlOutput(output string) ([][]string, error) {
 
 	var separatorLine string
 	var dataStarted bool
+	var pastResultFooter bool
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -64,8 +65,12 @@ func parseYasqlOutput(output string) ([][]string, error) {
 			continue
 		}
 
-		// Skip "X rows fetched" lines
+		// Skip "X rows fetched" lines; ignore everything after (disconnect banner).
 		if strings.Contains(line, "rows fetched") || strings.Contains(line, "row fetched") {
+			pastResultFooter = true
+			continue
+		}
+		if pastResultFooter {
 			continue
 		}
 
@@ -161,6 +166,7 @@ func ParseYasqlOutputWithHeader(output string) (header []string, rows [][]string
 	var separatorLine string
 	var headerFound bool
 	var dataStarted bool
+	var pastResultFooter bool
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -170,8 +176,12 @@ func ParseYasqlOutputWithHeader(output string) (header []string, rows [][]string
 			continue
 		}
 
-		// Skip "X rows fetched" lines
+		// Skip "X rows fetched" lines; ignore everything after (disconnect banner).
 		if strings.Contains(line, "rows fetched") || strings.Contains(line, "row fetched") {
+			pastResultFooter = true
+			continue
+		}
+		if pastResultFooter {
 			continue
 		}
 

@@ -4,10 +4,12 @@ import "time"
 
 // SysStatMetric represents a single v$sysstat metric
 type SysStatMetric struct {
-	InstID       int
-	Name         string
-	CurrentValue float64
-	DeltaPerSec  float64
+	InstID         int
+	Name           string
+	CurrentValue   float64
+	DeltaPerSec    float64 // per-second rate for cumulative counters
+	IntervalValue  float64 // interval average (e.g. ms per disk read)
+	IsIntervalAvg  bool    // when true, display IntervalValue instead of DeltaPerSec
 }
 
 // SystemEvent represents a v$system_event entry

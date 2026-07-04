@@ -165,9 +165,9 @@ ORDER BY INST_ID, EVENT
 
 // CollectSessionMetrics collects session-level metrics
 func (c *Collector) CollectSessionMetrics(ctx context.Context) ([]models.SessionMetric, error) {
-	// Build metric list
-	metricList := make([]string, len(c.cfg.SysStatMetrics))
-	for i, m := range c.cfg.SysStatMetrics {
+	sessionMetrics := c.cfg.SessionStatMetricsList()
+	metricList := make([]string, len(sessionMetrics))
+	for i, m := range sessionMetrics {
 		metricList[i] = fmt.Sprintf("'%s'", m)
 	}
 
@@ -290,12 +290,11 @@ func (c *Collector) CollectSessionDetails(ctx context.Context) ([]models.Session
 		instFilter = fmt.Sprintf(" AND a.INST_ID = %d", c.cfg.InstanceID)
 	}
 
-	sql := fmt.Sprintf(`
+	sqlBody := fmt.Sprintf(`
 SELECT
     x.sid_tid,
     x.event,
     x.username,
-    x.program,
     x.sql_id,
     GREATEST(0,
         EXTRACT(DAY FROM x.exec_delta) * 86400000 +
@@ -303,6 +302,7 @@ SELECT
         EXTRACT(MINUTE FROM x.exec_delta) * 60000 +
         EXTRACT(SECOND FROM x.exec_delta) * 1000
     ) AS exec_ms,
+    x.program,
     x.client,
     x.inst_id
 FROM (
@@ -331,46 +331,32 @@ ORDER BY exec_ms DESC
 FETCH FIRST %d ROWS ONLY
 `, instFilter, c.cfg.SessionDetailTopN)
 
+	sql := sessionDetailColPrefix(c.cfg.DBType) + sqlBody
+
 	if c.cfg.DebugMode {
 		logger.Debug("[collector] CollectSessionDetails SQL:\n%s\n", sql)
 	}
 
-	_, rows, err := c.conn.ExecuteQueryWithHeader(ctx, sql)
+	header, rows, err := c.conn.ExecuteQueryWithHeader(ctx, sql)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query session details: %w", err)
 	}
 
 	if c.cfg.DebugMode {
+		logger.Debug("[collector] CollectSessionDetails header: %v\n", header)
 		logger.Debug("[collector] CollectSessionDetails returned %d rows\n", len(rows))
 	}
 
 	var details []models.SessionDetail
 	for _, row := range rows {
-		if len(row) < 8 {
+		detail, ok := parseSessionDetailRow(header, row)
+		if !ok {
 			if c.cfg.DebugMode {
-				logger.Debug("[collector] skipping row: expected 8 columns, got %d: %v\n", len(row), row)
+				logger.Debug("[collector] skipping session detail row: %v\n", row)
 			}
 			continue
 		}
-
-		sidTid := strings.TrimSpace(row[0])
-		if sidTid == "" || sidTid == "SID_TID" {
-			continue
-		}
-
-		execMs := parseSessionDetailFloat(row[5])
-		instID := parseSessionDetailInt(row[7])
-
-		details = append(details, models.SessionDetail{
-			InstID:   instID,
-			SidTid:   sidTid,
-			Event:    row[1],
-			Username: row[2],
-			Program:  row[3],
-			SqlID:    row[4],
-			ExecTime: formatExecTime(execMs),
-			Client:   row[6],
-		})
+		details = append(details, detail)
 	}
 
 	if c.cfg.DebugMode && len(rows) > 0 && len(details) == 0 {
@@ -378,6 +364,138 @@ FETCH FIRST %d ROWS ONLY
 	}
 
 	return details, nil
+}
+
+// sessionDetailColPrefix sets fixed column widths for yasql table output (aligned with we.sql).
+func sessionDetailColPrefix(dbType string) string {
+	switch dbType {
+	case "yashandb", "oracle", "dameng":
+		return `col SID_TID for a20
+col EVENT for a20
+col USERNAME for a15
+col SQL_ID for a20
+col EXEC_MS for a10
+col PROGRAM for a30
+col CLIENT for a20
+col INST_ID for a7
+`
+	default:
+		return ""
+	}
+}
+
+func sessionDetailColumnIndex(header []string) map[string]int {
+	idx := make(map[string]int, len(header))
+	for i, h := range header {
+		key := normalizeSessionDetailHeader(h)
+		if key != "" {
+			idx[key] = i
+		}
+	}
+	return idx
+}
+
+func normalizeSessionDetailHeader(h string) string {
+	h = strings.ToUpper(strings.TrimSpace(h))
+	h = strings.ReplaceAll(h, " ", "_")
+	switch h {
+	case "EXEC_TIME":
+		return "EXEC_MS"
+	case "SID", "SID_SERIAL", "SID.SERIAL":
+		return "SID_TID"
+	}
+	return h
+}
+
+func parseSessionDetailRow(header, row []string) (models.SessionDetail, bool) {
+	if len(row) == 0 {
+		return models.SessionDetail{}, false
+	}
+
+	get := func(keys ...string) string {
+		idx := sessionDetailColumnIndex(header)
+		for _, k := range keys {
+			if i, ok := idx[normalizeSessionDetailHeader(k)]; ok && i < len(row) {
+				return strings.TrimSpace(row[i])
+			}
+		}
+		return ""
+	}
+
+	var (
+		sidTid   string
+		event    string
+		username string
+		sqlID    string
+		program  string
+		client   string
+		execMs   float64
+		instID   int
+	)
+
+	if len(header) > 0 {
+		sidTid = get("SID_TID")
+		event = get("EVENT")
+		username = get("USERNAME")
+		sqlID = get("SQL_ID")
+		program = get("PROGRAM")
+		client = get("CLIENT")
+		instID = parseSessionDetailInt(get("INST_ID"))
+		execMs = parseSessionDetailExecMs(get("EXEC_MS", "EXEC_TIME"))
+	} else if len(row) >= 8 {
+		// Fallback: column order aligned with we.sql / CollectSessionDetails SELECT.
+		sidTid = strings.TrimSpace(row[0])
+		event = row[1]
+		username = row[2]
+		sqlID = row[3]
+		execMs = parseSessionDetailExecMs(row[4])
+		program = row[5]
+		client = row[6]
+		instID = parseSessionDetailInt(row[7])
+	} else {
+		return models.SessionDetail{}, false
+	}
+
+	if sidTid == "" || strings.EqualFold(sidTid, "SID_TID") {
+		return models.SessionDetail{}, false
+	}
+
+	return models.SessionDetail{
+		InstID:   instID,
+		SidTid:   sidTid,
+		Event:    event,
+		Username: username,
+		SqlID:    sqlID,
+		Program:  program,
+		ExecTime: formatExecTime(execMs),
+		Client:   client,
+	}, true
+}
+
+func parseSessionDetailExecMs(s string) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	upper := strings.ToUpper(s)
+	for _, suffix := range []string{"MS", "S", "M", "H", "D"} {
+		if strings.HasSuffix(upper, suffix) && len(s) > len(suffix) {
+			v := parseSessionDetailFloat(s[:len(s)-len(suffix)])
+			switch suffix {
+			case "MS":
+				return v
+			case "S":
+				return v * 1000
+			case "M":
+				return v * 60000
+			case "H":
+				return v * 3600000
+			case "D":
+				return v * 86400000
+			}
+		}
+	}
+	return parseSessionDetailFloat(s)
 }
 
 func parseSessionDetailFloat(s string) float64 {
