@@ -95,24 +95,24 @@ type Config struct {
 	Python  string // Python interpreter (default python3)
 
 	// Set when interval/count come from INI (direct mode should not reset them).
-	iniIntervalSet         bool
-	iniCountSet            bool
-	iniConnectionModeSet   bool
-	iniSessionTopSet       bool
+	iniIntervalSet       bool
+	iniCountSet          bool
+	iniConnectionModeSet bool
+	iniSessionTopSet     bool
 }
 
 // Sysstat metric name constants (GV$SYSSTAT.NAME in YashanDB).
 const (
-	MetricDiskReadTime        = "DISK READ TIME"
-	MetricDiskWriteTime       = "DISK WRITE TIME"
-	MetricDiskReads           = "DISK READS"
-	MetricDiskWrites          = "DISK WRITES"
+	MetricDiskReadTime         = "DISK READ TIME"
+	MetricDiskWriteTime        = "DISK WRITE TIME"
+	MetricDiskReads            = "DISK READS"
+	MetricDiskWrites           = "DISK WRITES"
 	MetricCheckpointsCompleted = "CHECKPOINTS COMPLETED"
-	MetricUserIOWaitTime      = "USER IO WAIT TIME"
-	MetricVMOpen              = "VM OPEN"
-	MetricVMSwapOut           = "VM SWAP OUT"
-	DerivedAvgReadMS          = "AVG READ MS"
-	DerivedAvgWriteMS         = "AVG WRITE MS"
+	MetricUserIOWaitTime       = "USER IO WAIT TIME"
+	MetricVMOpen               = "VM OPEN"
+	MetricVMSwapOut            = "VM SWAP OUT"
+	DerivedAvgReadMS           = "AVG READ MS"
+	DerivedAvgWriteMS          = "AVG WRITE MS"
 )
 
 // defaultCoreStatMetrics are the original 14 instance/session statistics.
@@ -204,28 +204,28 @@ func (c *Config) SessionStatMetricsList() []string {
 // DefaultConfig returns a config with default values
 func DefaultConfig() *Config {
 	return &Config{
-		ConnectionMode:    "local", // Default to local mode
-		YasqlPath:         "yasql",
-		ConnectString:     defaultOracleConnectString,
-		SSHPort:           22,
-		Interval:          5,
-		Count:             0,
-		SessionTopN:       10,
-		SessionSortBy:     "DB TIME",
-		SessionDetailTopN: 10,
-		ShowTimestamp:     true,
-		ColorEnabled:      true,
-		InstanceID:        0, // 0 = all instances
-		SysStatMetrics:      defaultSysStatQueryMetrics(),
-		SessionStatMetrics:  defaultSessionStatMetrics(),
-		EventTopN:    5,
-		QueryTimeout: 30,
-		SSHTimeout:   10,
-		ReuseSSH:     true,
-		DebugMode:    false,
-		DBType:       "yashandb",
-		CC:           "gcc",
-		Python:       "python3",
+		ConnectionMode:     "local", // Default to local mode
+		YasqlPath:          "yasql",
+		ConnectString:      defaultOracleConnectString,
+		SSHPort:            22,
+		Interval:           5,
+		Count:              0,
+		SessionTopN:        10,
+		SessionSortBy:      "DB TIME",
+		SessionDetailTopN:  10,
+		ShowTimestamp:      true,
+		ColorEnabled:       true,
+		InstanceID:         0, // 0 = all instances
+		SysStatMetrics:     defaultSysStatQueryMetrics(),
+		SessionStatMetrics: defaultSessionStatMetrics(),
+		EventTopN:          5,
+		QueryTimeout:       30,
+		SSHTimeout:         10,
+		ReuseSSH:           true,
+		DebugMode:          false,
+		DBType:             "yashandb",
+		CC:                 "gcc",
+		Python:             "python3",
 	}
 }
 

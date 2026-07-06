@@ -1,6 +1,11 @@
 package connector
 
-import "context"
+import (
+	"context"
+	"fmt"
+
+	"github.com/yihan/ytop/internal/config"
+)
 
 // Connector defines the interface for database connections
 type Connector interface {
@@ -18,4 +23,16 @@ type Connector interface {
 
 	// IsConnected returns true if the connection is active
 	IsConnected() bool
+}
+
+// NewConnector creates a connector based on configuration
+func NewConnector(cfg *config.Config) (Connector, error) {
+	switch cfg.ConnectionMode {
+	case "local":
+		return NewLocalConnector(cfg), nil
+	case "ssh":
+		return NewSSHConnector(cfg), nil
+	default:
+		return nil, fmt.Errorf("unsupported connection mode: %s", cfg.ConnectionMode)
+	}
 }

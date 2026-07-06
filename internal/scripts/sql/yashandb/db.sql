@@ -11,5 +11,17 @@ col flashback_on           for a12
 col status                 for a15
 col log_mode               for a10
 col open_mode              for a10
+col current_scn            for a20
 
-select host_name,DATABASE_NAME,log_mode,open_mode,status,flashback_on,DATABASE_ROLE,PROTECTION_MODE,PROTECTION_LEVEL,SWITCHOVER_STATUS from v$database;
+select host_name,
+       DATABASE_NAME,
+       log_mode,
+       open_mode,
+       TO_CHAR(current_scn) AS current_scn,
+       status,
+       flashback_on,
+       DATABASE_ROLE,
+       PROTECTION_MODE,
+       PROTECTION_LEVEL,
+       SWITCHOVER_STATUS
+  from v$database;

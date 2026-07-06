@@ -5,9 +5,187 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
+
+// Package scripts 内版本号解析与比较，供脚本版本匹配使用。
+
+var versionTokenRe = regexp.MustCompile(`(\d+(?:\.\d+)*)`)
+
+// ParseVersion parses dotted numeric version strings such as "23.5.1".
+func ParseVersion(s string) ([]int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, fmt.Errorf("empty version")
+	}
+	parts := strings.Split(s, ".")
+	out := make([]int, 0, len(parts))
+	for _, p := range parts {
+		if p == "" {
+			return nil, fmt.Errorf("invalid version %q", s)
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid version %q", s)
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// CompareVersions compares two dotted versions. Returns -1/0/1.
+func CompareVersions(a, b string) (int, error) {
+	av, err := ParseVersion(a)
+	if err != nil {
+		return 0, err
+	}
+	bv, err := ParseVersion(b)
+	if err != nil {
+		return 0, err
+	}
+	max := len(av)
+	if len(bv) > max {
+		max = len(bv)
+	}
+	for i := 0; i < max; i++ {
+		var ai, bi int
+		if i < len(av) {
+			ai = av[i]
+		}
+		if i < len(bv) {
+			bi = bv[i]
+		}
+		if ai < bi {
+			return -1, nil
+		}
+		if ai > bi {
+			return 1, nil
+		}
+	}
+	return 0, nil
+}
+
+// VersionMatchesPrefix reports whether dbVersion matches a prefix such as "23.5".
+func VersionMatchesPrefix(dbVersion, prefix string) bool {
+	if strings.TrimSpace(prefix) == "" {
+		return true
+	}
+	if dbVersion == prefix {
+		return true
+	}
+	return strings.HasPrefix(dbVersion, prefix+".")
+}
+
+// ExtractVersionFromText finds the first dotted version token in CLI output.
+func ExtractVersionFromText(text string) string {
+	m := versionTokenRe.FindStringSubmatch(text)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+// looksLikeVersion reports whether s is a dotted numeric version suffix.
+func looksLikeVersion(s string) bool {
+	if s == "" {
+		return false
+	}
+	_, err := ParseVersion(s)
+	return err == nil
+}
+
+type versionConstraint struct {
+	isRange bool
+	low     string
+	high    string
+}
+
+func parseSupportedSpec(spec string) []versionConstraint {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil
+	}
+	var out []versionConstraint
+	for _, token := range strings.Split(spec, ",") {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if c, ok := parseVersionConstraintToken(token); ok {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func parseVersionConstraintToken(token string) (versionConstraint, bool) {
+	if idx := strings.Index(token, "-"); idx > 0 {
+		low := strings.TrimSpace(token[:idx])
+		high := strings.TrimSpace(token[idx+1:])
+		if looksLikeVersion(low) && looksLikeVersion(high) {
+			return versionConstraint{isRange: true, low: low, high: high}, true
+		}
+	}
+	if looksLikeVersion(token) {
+		return versionConstraint{low: token}, true
+	}
+	return versionConstraint{}, false
+}
+
+func (c versionConstraint) matches(dbVersion string) bool {
+	if c.isRange {
+		if cmp, err := CompareVersions(dbVersion, c.low); err != nil || cmp < 0 {
+			return false
+		}
+		if cmp, err := CompareVersions(dbVersion, c.high); err != nil || cmp > 0 {
+			return false
+		}
+		return true
+	}
+	return VersionMatchesPrefix(dbVersion, c.low)
+}
+
+func (c versionConstraint) score(dbVersion string) int {
+	if !c.matches(dbVersion) {
+		return 0
+	}
+	if c.isRange {
+		width := len(strings.Split(c.high, ".")) - len(strings.Split(c.low, "."))
+		if width < 0 {
+			width = 0
+		}
+		return 150 + len(strings.Split(c.low, "."))*10 + width*5 + len(c.low) + len(c.high)
+	}
+	if dbVersion == c.low {
+		return 300 + len(strings.Split(c.low, "."))*20
+	}
+	return 200 + len(strings.Split(c.low, "."))*10 + len(c.low)
+}
+
+func constraintsMatch(constraints []versionConstraint, dbVersion string) bool {
+	if len(constraints) == 0 {
+		return false
+	}
+	for _, c := range constraints {
+		if c.matches(dbVersion) {
+			return true
+		}
+	}
+	return false
+}
+
+func bestConstraintScore(constraints []versionConstraint, dbVersion string) int {
+	best := 0
+	for _, c := range constraints {
+		if s := c.score(dbVersion); s > best {
+			best = s
+		}
+	}
+	return best
+}
 
 // CurrentDBVersion is the active database version for script resolution.
 // Set from --db-version or auto-detected via DB CLI -v.

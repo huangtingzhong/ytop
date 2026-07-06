@@ -174,11 +174,127 @@ func isBannerPromptLine(lines []string, bare string) bool {
 	return ok
 }
 
+// isPromptOrProLine reports whether line is a SQL*Plus PROMPT/PRO client command.
+func isPromptOrProLine(line string) bool {
+	_, ok := parseSQLPlusPromptLine(line)
+	return ok
+}
+
+// promptBlockLine is one logical line inside a contiguous PROMPT/PRO block.
+type promptBlockLine struct {
+	lineIndex int
+	text      string
+	blank     bool
+}
+
+// collectPromptBlocksInRange returns contiguous PROMPT/PRO blocks in [startLine, endLine).
+func collectPromptBlocksInRange(lines []string, startLine, endLine int) [][]promptBlockLine {
+	if startLine < 0 {
+		startLine = 0
+	}
+	if endLine < 0 || endLine > len(lines) {
+		endLine = len(lines)
+	}
+	if startLine >= endLine {
+		return nil
+	}
+
+	var blocks [][]promptBlockLine
+	var current []promptBlockLine
+
+	flush := func() {
+		if len(current) == 0 {
+			return
+		}
+		block := make([]promptBlockLine, len(current))
+		copy(block, current)
+		blocks = append(blocks, block)
+		current = current[:0]
+	}
+
+	for i := startLine; i < endLine; i++ {
+		line := lines[i]
+		if !isPromptOrProLine(line) {
+			flush()
+			continue
+		}
+		text, _ := parseSQLPlusPromptLine(line)
+		trimmed := strings.TrimSpace(line)
+		upper := strings.ToUpper(trimmed)
+		if upper == "PROMPT" {
+			current = append(current, promptBlockLine{lineIndex: i, blank: true})
+		} else {
+			current = append(current, promptBlockLine{lineIndex: i, text: text})
+		}
+	}
+	flush()
+	return blocks
+}
+
+// formatYashanDBPromptBlocks formats PROMPT/PRO blocks in [startLine, endLine) for terminal display.
+// Displayed line indices are recorded in displayed (if non-nil).
+func formatYashanDBPromptBlocks(script string, startLine, endLine int, displayed map[int]bool) string {
+	lines := splitScriptLines(script)
+	blocks := collectPromptBlocksInRange(lines, startLine, endLine)
+	if len(blocks) == 0 {
+		return ""
+	}
+
+	var out strings.Builder
+	for bi, block := range blocks {
+		if bi > 0 {
+			out.WriteByte('\n')
+		}
+		for _, pl := range block {
+			if displayed != nil && displayed[pl.lineIndex] {
+				continue
+			}
+			if displayed != nil {
+				displayed[pl.lineIndex] = true
+			}
+			if pl.blank {
+				out.WriteByte('\n')
+			} else {
+				out.WriteString(pl.text)
+				out.WriteByte('\n')
+			}
+		}
+	}
+	return strings.TrimRight(out.String(), "\n")
+}
+
+// printYashanDBPromptBlocks prints PROMPT/PRO blocks in [startLine, endLine).
+func printYashanDBPromptBlocks(script string, startLine, endLine int, displayed map[int]bool) {
+	text := formatYashanDBPromptBlocks(script, startLine, endLine, displayed)
+	if text == "" {
+		return
+	}
+	fmt.Println()
+	fmt.Println(text)
+}
+
+// yashanDBPromptWindow returns the half-open line range for PROMPT blocks shown before variables[i].
+func yashanDBPromptWindow(variables []string, varIndex int, lines []string) (start, end int) {
+	if varIndex < 0 || varIndex >= len(variables) {
+		return 0, 0
+	}
+	end = firstVariableLineIndex(lines, bareVariableName(variables[varIndex]))
+	if varIndex == 0 {
+		return 0, end
+	}
+	prev := firstVariableLineIndex(lines, bareVariableName(variables[varIndex-1]))
+	if prev < 0 {
+		return 0, end
+	}
+	return prev + 1, end
+}
+
 // resolveVariablePromptInfos maps each &var to hint/default (Oracle sqlplus-like rules).
 // Priority: ACCEPT > PROMPT banner containing &var > one PROMPT line per remaining variable
 // (before first use; if multiple candidates, prefer line after prior vars' ACCEPT).
 // Variables with no matching PROMPT keep empty Hint (standard "Enter value for &var:" input).
-func resolveVariablePromptInfos(script string, variables []string) map[string]variablePromptInfo {
+// displayedPromptLines marks PROMPT lines already shown via printYashanDBPromptBlocks (yashandb).
+func resolveVariablePromptInfos(script string, variables []string, displayedPromptLines map[int]bool) map[string]variablePromptInfo {
 	result := make(map[string]variablePromptInfo, len(variables))
 	if len(variables) == 0 {
 		return result
@@ -189,6 +305,9 @@ func resolveVariablePromptInfos(script string, variables []string) map[string]va
 	acceptByVar := parseAcceptByVariable(lines)
 	acceptLines := acceptLineByVariable(lines)
 	usedPrompt := make(map[int]bool)
+	for line := range displayedPromptLines {
+		usedPrompt[line] = true
+	}
 
 	firstIdx := make(map[string]int, len(variables))
 	for _, variable := range variables {
@@ -234,8 +353,8 @@ func resolveVariablePromptInfos(script string, variables []string) map[string]va
 
 func firstVariableLineIndex(lines []string, bare string) int {
 	patterns := []string{
-		regexp.QuoteMeta("&&" + bare) + `\b`,
-		regexp.QuoteMeta("&" + bare) + `\b`,
+		regexp.QuoteMeta("&&"+bare) + `\b`,
+		regexp.QuoteMeta("&"+bare) + `\b`,
 	}
 	for i, line := range lines {
 		if isSQLCommentLine(line) {
