@@ -73,19 +73,22 @@ func (e *Executor) executeSQLScript(ctx context.Context, scriptName string) (str
 	// Oracle sqlplus natively handles &var substitution with interactive prompts.
 	// All other DB types: ytop handles variable substitution (no terminal or CLI doesn't support &var).
 	if e.cfg.DBType != "oracle" {
-		variables := e.findVariables(scriptContent)
+		promptOrder := resolveVariablePromptOrder(scriptContent)
+		variables := promptOrder.Ordered
 		lines := splitScriptLines(scriptContent)
 		displayedPrompt := make(map[int]bool)
+		promptInfos := resolveVariablePromptInfos(scriptContent, variables, displayedPrompt, promptOrder.PreludeHints)
 		if e.cfg.DebugMode {
-			debugLogScriptVariables(variables, resolveVariablePromptInfos(scriptContent, variables, displayedPrompt))
+			logger.Debug("[script-variables] order_source=%s ordered=%v\n", promptOrder.Source, variables)
+			debugLogScriptVariables(variables, promptInfos)
 		}
 		varMap := make(map[string]string)
 		for i, variable := range variables {
 			if e.cfg.DBType == "yashandb" {
-				start, end := yashanDBPromptWindow(variables, i, lines)
+				start, end := yashanDBPromptWindow(variables, i, lines, promptOrder.PreludeLineIdx)
 				printYashanDBPromptBlocks(scriptContent, start, end, displayedPrompt)
 			}
-			info := resolveVariablePromptInfos(scriptContent, variables, displayedPrompt)[variable]
+			info := promptInfos[variable]
 			printVariableHint(info.Hint)
 			rawValue := terminal.PromptInput(formatVariableInputPrompt(variable, info.Default), 256)
 			value := rawValue

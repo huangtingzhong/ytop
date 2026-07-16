@@ -225,6 +225,42 @@ Enable debug mode to see detailed SQL queries and output:
 ./ytop -debug
 ```
 
+Debug output is written to `ytop_debug.log` (not stderr). Use `-D` when testing script variable order (`order_source=accept|prelude|sql`).
+
+## Built-in SQL Scripts
+
+ytop ships SQL scripts under `internal/scripts/sql/` (embedded at build time).
+
+```bash
+# List scripts with description and supported DB versions
+./ytop -S
+./ytop -S we
+
+# Run a script (prompts for &/&& variables when needed)
+./ytop -f stats_delete.sql
+./ytop -t host -u user -s /path/to/yasdb.env -f we.sql
+```
+
+### Script Authoring
+
+When adding or editing scripts:
+
+1. **File header** — `Purpose:`, optional `Supported:` for version-specific scripts (shown in `-S` output). See `.cursor/rules/script-purpose-header.mdc`.
+2. **Variable prompt order** — ytop resolves interaction order as: **ACCEPT file order** → **PROMPT prelude** (one line per variable before first `&/&&` in SQL) → **SQL first-use order**. If prompt order must differ from `DECLARE` order, use one `PROMPT` line per variable (see `stats_delete.sql`). Do not list params only in `-- Params:` comments.
+3. **Full guide** — [docs/sql-script-guide.md](docs/sql-script-guide.md) (§4.5 variable order, YashanDB SET/COL rules).
+
+Reference examples:
+
+| Pattern | Script |
+|---------|--------|
+| ACCEPT | `flashback_on.sql` |
+| PROMPT prelude reorder | `stats_delete.sql` |
+| Single-variable PROMPT | `para_mem_to_ini.sql` |
+| Banner PROMPT | `user_unlock.sql` |
+| SQL order only | `constraint_table.sql` |
+
+Integration tests: `YTOP_TEST_PROFILE=2888 ./test/integration/run_all_prompt_tests.sh --auto`
+
 ## License
 
 MIT License

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yihan/ytop/internal/scripts"
 )
 
 func TestCollectPromptBlocksInRange_contiguousWithBlank(t *testing.T) {
@@ -82,11 +84,11 @@ PROMPT table hint
 `
 	lines := splitScriptLines(script)
 	vars := []string{"&&owner", "&&tablename"}
-	s0, e0 := yashanDBPromptWindow(vars, 0, lines)
+	s0, e0 := yashanDBPromptWindow(vars, 0, lines, nil)
 	if s0 != 0 || e0 != 2 {
 		t.Fatalf("window0=%d..%d want 0..2", s0, e0)
 	}
-	s1, e1 := yashanDBPromptWindow(vars, 1, lines)
+	s1, e1 := yashanDBPromptWindow(vars, 1, lines, nil)
 	if s1 != 3 || e1 != 4 {
 		t.Fatalf("window1=%d..%d want 3..4", s1, e1)
 	}
@@ -108,7 +110,7 @@ DECLARE
   v_owner VARCHAR2(128) := '&&owner';
 `
 	displayed := map[int]bool{0: true, 1: true}
-	infos := resolveVariablePromptInfos(script, []string{"&&dryrun", "&&owner"}, displayed)
+	infos := resolveVariablePromptInfos(script, []string{"&&dryrun", "&&owner"}, displayed, nil)
 	if infos["&&dryrun"].Hint != "" || infos["&&owner"].Hint != "" {
 		t.Fatalf("hints should be empty after display: %+v", infos)
 	}
@@ -121,7 +123,7 @@ ACCEPT confirm PROMPT 'Confirm (1=on): '
 DECLARE
   v := TRIM('&&confirm');
 `
-	infos := resolveVariablePromptInfos(script, []string{"&&confirm"}, nil)
+	infos := resolveVariablePromptInfos(script, []string{"&&confirm"}, nil, nil)
 	if infos["&&confirm"].Hint != "Confirm (1=on): " {
 		t.Fatalf("hint=%q", infos["&&confirm"].Hint)
 	}
@@ -129,6 +131,100 @@ DECLARE
 	out := formatYashanDBPromptBlocks(script, 0, firstVariableLineIndex(splitScriptLines(script), "confirm"), displayed)
 	if !strings.Contains(out, "+---+") || !strings.Contains(out, "| warn |") {
 		t.Fatalf("banner out=%q", out)
+	}
+}
+
+func TestResolveVariablePromptOrder_statsDeleteEmbedded(t *testing.T) {
+	script, err := scripts.GetSQLScript("stats_delete.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := resolveVariablePromptOrder(script)
+	if order.Source != "prelude" {
+		t.Fatalf("embedded source=%q want prelude ordered=%v", order.Source, order.Ordered)
+	}
+}
+
+func TestResolveVariablePromptOrder_statsDeletePrelude(t *testing.T) {
+	script, err := readTestScript("stats_delete.sql")
+	if err != nil {
+		t.Skip(err)
+	}
+	order := resolveVariablePromptOrder(script)
+	if order.Source != "prelude" {
+		t.Fatalf("source=%q want prelude", order.Source)
+	}
+	want := []string{"&&dryrun", "&&owner", "&&tablename", "&&partname", "&&colname"}
+	if len(order.Ordered) != len(want) {
+		t.Fatalf("ordered=%v", order.Ordered)
+	}
+	for i, w := range want {
+		if order.Ordered[i] != w {
+			t.Fatalf("ordered[%d]=%q want %q full=%v", i, order.Ordered[i], w, order.Ordered)
+		}
+	}
+	if order.PreludeHints["&&dryrun"] == "" || order.PreludeHints["&&owner"] == "" {
+		t.Fatalf("prelude hints missing: %+v", order.PreludeHints)
+	}
+	if order.PreludeLineIdx["&&dryrun"] != 19 {
+		t.Fatalf("dryrun line=%d want 19", order.PreludeLineIdx["&&dryrun"])
+	}
+}
+
+func TestResolveVariablePromptOrder_acceptFirst(t *testing.T) {
+	script := `ACCEPT owner PROMPT 'Owner: '
+ACCEPT tablename PROMPT 'Table: '
+DECLARE
+  v_table VARCHAR2(128) := '&&tablename';
+  v_owner VARCHAR2(128) := '&&owner';
+`
+	order := resolveVariablePromptOrder(script)
+	if order.Source != "accept" {
+		t.Fatalf("source=%q want accept", order.Source)
+	}
+	want := []string{"&&owner", "&&tablename"}
+	for i, w := range want {
+		if order.Ordered[i] != w {
+			t.Fatalf("ordered[%d]=%q want %q", i, order.Ordered[i], w)
+		}
+	}
+}
+
+func TestResolveVariablePromptOrder_sqlFallback(t *testing.T) {
+	script := `PROMPT only one prelude line
+DECLARE
+  v_owner VARCHAR2(128) := '&&owner';
+  v_table VARCHAR2(128) := '&&tablename';
+`
+	order := resolveVariablePromptOrder(script)
+	if order.Source != "sql" {
+		t.Fatalf("source=%q want sql", order.Source)
+	}
+	want := []string{"&&owner", "&&tablename"}
+	for i, w := range want {
+		if order.Ordered[i] != w {
+			t.Fatalf("ordered[%d]=%q want %q", i, order.Ordered[i], w)
+		}
+	}
+}
+
+func TestYashanDBPromptWindow_preludeSingleLine(t *testing.T) {
+	script := `PROMPT Enter dryrun:
+PROMPT Enter owner:
+DECLARE
+  v_dryrun NUMBER := '&&dryrun';
+  v_owner VARCHAR2(128) := '&&owner';
+`
+	lines := splitScriptLines(script)
+	vars := []string{"&&dryrun", "&&owner"}
+	lineIdx := map[string]int{"&&dryrun": 0, "&&owner": 1}
+	s0, e0 := yashanDBPromptWindow(vars, 0, lines, lineIdx)
+	if s0 != 0 || e0 != 1 {
+		t.Fatalf("window0=%d..%d want 0..1", s0, e0)
+	}
+	s1, e1 := yashanDBPromptWindow(vars, 1, lines, lineIdx)
+	if s1 != 1 || e1 != 2 {
+		t.Fatalf("window1=%d..%d want 1..2", s1, e1)
 	}
 }
 
@@ -142,7 +238,7 @@ func TestFlashbackOnScriptPromptWindow(t *testing.T) {
 		t.Fatalf("vars=%v", vars)
 	}
 	lines := splitScriptLines(script)
-	start, end := yashanDBPromptWindow(vars, 0, lines)
+	start, end := yashanDBPromptWindow(vars, 0, lines, nil)
 	out := formatYashanDBPromptBlocks(script, start, end, nil)
 	for _, want := range []string{
 		"Database FLASHBACK ON / OFF",

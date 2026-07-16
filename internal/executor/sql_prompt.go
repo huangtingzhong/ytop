@@ -273,10 +273,201 @@ func printYashanDBPromptBlocks(script string, startLine, endLine int, displayed 
 	fmt.Println(text)
 }
 
+// variablePromptOrder holds resolved interaction order and optional prelude metadata.
+type variablePromptOrder struct {
+	Ordered        []string
+	Source         string // "accept", "prelude", or "sql"
+	PreludeHints   map[string]string
+	PreludeLineIdx map[string]int
+}
+
+// resolveVariablePromptOrder picks substitution variable interaction order.
+// Priority: ACCEPT file order (+ remaining SQL order) > PROMPT prelude name match > SQL first-use.
+func resolveVariablePromptOrder(script string) variablePromptOrder {
+	sqlOrder := collectScriptVariables(script)
+	out := variablePromptOrder{
+		Ordered:        sqlOrder,
+		Source:         "sql",
+		PreludeHints:   map[string]string{},
+		PreludeLineIdx: map[string]int{},
+	}
+	if len(sqlOrder) == 0 {
+		return out
+	}
+
+	lines := splitScriptLines(script)
+	tokenByBare := make(map[string]string, len(sqlOrder))
+	for _, v := range sqlOrder {
+		tokenByBare[strings.ToUpper(bareVariableName(v))] = v
+	}
+
+	acceptNames := parseAcceptOrderNames(lines)
+	if len(acceptNames) > 0 {
+		out.Ordered = orderByAcceptNames(acceptNames, sqlOrder, tokenByBare)
+		out.Source = "accept"
+		return out
+	}
+
+	firstVarLine := firstAnyVariableLineIndex(lines, sqlOrder)
+	if ordered, hints, lineIdx, ok := matchPreludePromptOrder(lines, firstVarLine, sqlOrder); ok {
+		out.Ordered = ordered
+		out.Source = "prelude"
+		out.PreludeHints = hints
+		out.PreludeLineIdx = lineIdx
+	}
+	return out
+}
+
+func parseAcceptOrderNames(lines []string) []string {
+	var names []string
+	seen := make(map[string]bool)
+	for _, line := range lines {
+		if vn, _, _, ok := parseAcceptLine(line); ok {
+			upper := strings.ToUpper(vn)
+			if !seen[upper] {
+				names = append(names, upper)
+				seen[upper] = true
+			}
+		}
+	}
+	return names
+}
+
+func orderByAcceptNames(acceptNames []string, sqlOrder []string, tokenByBare map[string]string) []string {
+	ordered := make([]string, 0, len(sqlOrder))
+	seen := make(map[string]bool)
+	for _, bareUpper := range acceptNames {
+		if tok, ok := tokenByBare[bareUpper]; ok && !seen[tok] {
+			ordered = append(ordered, tok)
+			seen[tok] = true
+		}
+	}
+	for _, v := range sqlOrder {
+		if !seen[v] {
+			ordered = append(ordered, v)
+			seen[v] = true
+		}
+	}
+	return ordered
+}
+
+func firstAnyVariableLineIndex(lines []string, variables []string) int {
+	first := -1
+	for _, variable := range variables {
+		idx := firstVariableLineIndex(lines, bareVariableName(variable))
+		if idx < 0 {
+			continue
+		}
+		if first < 0 || idx < first {
+			first = idx
+		}
+	}
+	return first
+}
+
+func preludePromptEntriesBeforeLine(lines []string, endLine int) []promptEntry {
+	if endLine < 0 {
+		endLine = len(lines)
+	}
+	blocks := collectPromptBlocksInRange(lines, 0, endLine)
+	var entries []promptEntry
+	for _, block := range blocks {
+		for _, pl := range block {
+			if pl.blank || pl.text == "" {
+				continue
+			}
+			entries = append(entries, promptEntry{line: pl.lineIndex, text: pl.text})
+		}
+	}
+	return entries
+}
+
+func matchVariableNameInPromptText(text, bare string) bool {
+	if bare == "" {
+		return false
+	}
+	for _, pat := range variablePromptPatterns(bare) {
+		if matched, _ := regexp.MatchString(pat, text); matched {
+			return true
+		}
+	}
+	return false
+}
+
+// variablePromptPatterns returns regexes that link a substitution variable to PROMPT text.
+// Includes common YashanDB script wording (e.g. "table name" for &&tablename).
+func variablePromptPatterns(bare string) []string {
+	pats := []string{`(?i)\b` + regexp.QuoteMeta(bare) + `\b`}
+	switch strings.ToLower(bare) {
+	case "tablename":
+		pats = append(pats, `(?i)\btable\b`)
+	case "partname":
+		pats = append(pats, `(?i)\bpartition\b`)
+	case "colname":
+		pats = append(pats, `(?i)\bcolumn\b`)
+	}
+	return pats
+}
+
+func matchPreludePromptOrder(lines []string, firstVarLine int, sqlOrder []string) ([]string, map[string]string, map[string]int, bool) {
+	prelude := preludePromptEntriesBeforeLine(lines, firstVarLine)
+	if len(prelude) != len(sqlOrder) {
+		return nil, nil, nil, false
+	}
+
+	ordered := make([]string, 0, len(sqlOrder))
+	hints := make(map[string]string, len(sqlOrder))
+	lineIdx := make(map[string]int, len(sqlOrder))
+	used := make(map[string]bool)
+
+	for _, pe := range prelude {
+		found := ""
+		for _, v := range sortVariablesByBareNameLen(sqlOrder) {
+			if used[v] {
+				continue
+			}
+			bare := bareVariableName(v)
+			if matchVariableNameInPromptText(pe.text, bare) {
+				found = v
+				break
+			}
+		}
+		if found == "" {
+			return nil, nil, nil, false
+		}
+		ordered = append(ordered, found)
+		hints[found] = pe.text
+		lineIdx[found] = pe.line
+		used[found] = true
+	}
+	if len(ordered) != len(sqlOrder) {
+		return nil, nil, nil, false
+	}
+	return ordered, hints, lineIdx, true
+}
+
+func sortVariablesByBareNameLen(variables []string) []string {
+	out := append([]string(nil), variables...)
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			li, lj := len(bareVariableName(out[i])), len(bareVariableName(out[j]))
+			if lj > li || (lj == li && out[j] < out[i]) {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out
+}
+
 // yashanDBPromptWindow returns the half-open line range for PROMPT blocks shown before variables[i].
-func yashanDBPromptWindow(variables []string, varIndex int, lines []string) (start, end int) {
+func yashanDBPromptWindow(variables []string, varIndex int, lines []string, preludeLineByVar map[string]int) (start, end int) {
 	if varIndex < 0 || varIndex >= len(variables) {
 		return 0, 0
+	}
+	if preludeLineByVar != nil {
+		if line, ok := preludeLineByVar[variables[varIndex]]; ok {
+			return line, line + 1
+		}
 	}
 	end = firstVariableLineIndex(lines, bareVariableName(variables[varIndex]))
 	if varIndex == 0 {
@@ -290,11 +481,9 @@ func yashanDBPromptWindow(variables []string, varIndex int, lines []string) (sta
 }
 
 // resolveVariablePromptInfos maps each &var to hint/default (Oracle sqlplus-like rules).
-// Priority: ACCEPT > PROMPT banner containing &var > one PROMPT line per remaining variable
-// (before first use; if multiple candidates, prefer line after prior vars' ACCEPT).
-// Variables with no matching PROMPT keep empty Hint (standard "Enter value for &var:" input).
+// Priority: ACCEPT > preludeHints > PROMPT banner containing &var > one PROMPT line per remaining variable.
 // displayedPromptLines marks PROMPT lines already shown via printYashanDBPromptBlocks (yashandb).
-func resolveVariablePromptInfos(script string, variables []string, displayedPromptLines map[int]bool) map[string]variablePromptInfo {
+func resolveVariablePromptInfos(script string, variables []string, displayedPromptLines map[int]bool, preludeHints map[string]string) map[string]variablePromptInfo {
 	result := make(map[string]variablePromptInfo, len(variables))
 	if len(variables) == 0 {
 		return result
@@ -325,6 +514,8 @@ func resolveVariablePromptInfos(script string, variables []string, displayedProm
 		bareUpper := strings.ToUpper(bareVariableName(variable))
 		if info, ok := acceptByVar[bareUpper]; ok {
 			result[variable] = info
+		} else if hint, ok := preludeHints[variable]; ok && hint != "" {
+			result[variable] = variablePromptInfo{Hint: hint}
 		} else if banner, _, ok := bannerPromptLineIndex(lines, bareVariableName(variable)); ok {
 			result[variable] = variablePromptInfo{Hint: banner}
 		}
@@ -335,7 +526,13 @@ func resolveVariablePromptInfos(script string, variables []string, displayedProm
 		if _, ok := acceptByVar[bareUpper]; ok {
 			continue
 		}
+		if _, ok := preludeHints[variable]; ok {
+			continue
+		}
 		if isBannerPromptLine(lines, bareVariableName(variable)) {
+			continue
+		}
+		if info, ok := result[variable]; ok && info.Hint != "" {
 			continue
 		}
 
@@ -345,7 +542,6 @@ func resolveVariablePromptInfos(script string, variables []string, displayedProm
 			result[variable] = variablePromptInfo{Hint: pe.text}
 			usedPrompt[pe.line] = true
 		}
-		// No dedicated PROMPT: leave Hint empty → executor shows "Enter value for &var:"
 	}
 
 	return result
