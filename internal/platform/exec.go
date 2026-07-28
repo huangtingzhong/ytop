@@ -649,6 +649,53 @@ func DefaultPythonBin(targetOS string) string {
 	return "python3"
 }
 
+// PythonCandidates returns interpreter names/paths to try when --python is unset.
+// Unix order: python3, python, RHEL/OLinux platform-python.
+func PythonCandidates(targetOS string) []string {
+	if targetOS == OSWindows {
+		return []string{"python"}
+	}
+	return []string{"python3", "python", "/usr/libexec/platform-python"}
+}
+
+// BuildPythonProbeCmd returns a shell one-liner that prints the first usable
+// Python absolute path (or PATH hit) and exits 1 when none are found.
+func BuildPythonProbeCmd(targetOS string) string {
+	cands := PythonCandidates(targetOS)
+	if targetOS == OSWindows {
+		// OpenSSH Windows often runs under cmd.exe; try where.exe for each candidate.
+		var parts []string
+		for _, c := range cands {
+			q := quoteWindowsScriptPath(c)
+			parts = append(parts, "where "+q+" 2>nul && exit /b 0")
+		}
+		parts = append(parts, "exit /b 1")
+		return strings.Join(parts, " & ")
+	}
+	var b strings.Builder
+	b.WriteString(`for c in`)
+	for _, c := range cands {
+		b.WriteByte(' ')
+		b.WriteString(ShellQuoteUnix(c))
+	}
+	b.WriteString(`; do`)
+	b.WriteString(` if command -v "$c" >/dev/null 2>&1; then command -v "$c"; exit 0; fi;`)
+	b.WriteString(` if [ -x "$c" ]; then echo "$c"; exit 0; fi;`)
+	b.WriteString(` done; exit 1`)
+	return b.String()
+}
+
+// ParsePythonProbeOutput returns the first non-empty trimmed line from probe stdout.
+func ParsePythonProbeOutput(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
 // BuildOSScriptRunCmd builds a shell command to run scriptPath with optional args.
 func BuildOSScriptRunCmd(targetOS, scriptPath string, args []string, kind OSScriptKind, pythonBin string) (string, error) {
 	if pythonBin == "" {

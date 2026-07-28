@@ -92,7 +92,7 @@ type Config struct {
 	CC      string // C compiler (default gcc)
 	CFLAGS  string // C compiler flags
 	LDFLAGS string // C linker flags (e.g. -lm)
-	Python  string // Python interpreter (default python3)
+	Python  string // Python interpreter; empty = auto-detect on target
 
 	// Set when interval/count come from INI (direct mode should not reset them).
 	iniIntervalSet       bool
@@ -225,7 +225,7 @@ func DefaultConfig() *Config {
 		DebugMode:          false,
 		DBType:             "yashandb",
 		CC:                 "gcc",
-		Python:             "python3",
+		Python:             "", // empty: auto-detect on target
 	}
 }
 
@@ -415,7 +415,7 @@ func LoadConfig() (*Config, error) {
 	cc := flag.String("cc", "", "C compiler for -f *.c (default: gcc)")
 	cflags := flag.String("cflags", "", "C compiler flags for -f *.c")
 	ldflags := flag.String("ldflags", "", "C linker flags for -f *.c (e.g. -lm)")
-	python := flag.String("python", "", "Python interpreter for -f *.py (default: python3)")
+	python := flag.String("python", "", "Python for -f *.py (default: auto-detect on target)")
 
 	if err := flag.CommandLine.Parse(normalizeFindScriptFlagArgs(os.Args)[1:]); err != nil {
 		return nil, err
@@ -994,8 +994,10 @@ func DebugLogSummary(cfg *Config) {
 	if cfg.LDFLAGS != "" {
 		logConfigField("LDFLAGS", cfg.LDFLAGS)
 	}
-	if cfg.Python != "" && cfg.Python != "python3" {
+	if cfg.Python != "" {
 		logConfigField("Python", cfg.Python)
+	} else {
+		logger.DebugKeyVal("Python", "(auto-detect)")
 	}
 	logger.Debug("  ini_sources: interval=%v count=%v connection_mode=%v session_top=%v\n",
 		cfg.iniIntervalSet, cfg.iniCountSet, cfg.iniConnectionModeSet, cfg.iniSessionTopSet)
@@ -1258,7 +1260,7 @@ func PrintScriptUsage() {
 	fmt.Println("  --cc <compiler>           C compiler for -f *.c (default: gcc)")
 	fmt.Println("  --cflags <flags>          C compile flags for -f *.c")
 	fmt.Println("  --ldflags <flags>         C link flags for -f *.c (e.g. -lm)")
-	fmt.Println("  --python <path>           Python for -f *.py (default: python3)")
+	fmt.Println("  --python <path>           Python for -f *.py (default: auto-detect)")
 	fmt.Println()
 	fmt.Println("Output:")
 	fmt.Println("  -o, --output <file>       Append output to file")

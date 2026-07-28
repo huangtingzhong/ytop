@@ -22,6 +22,6 @@ SELECT owner,
          TO_CHAR (created, 'yyyy-mm-dd hh24:mi:ss') createtime,
          TO_CHAR (last_ddl_time, 'yyyy-mm-dd hh24:mi:ss') ddtime
     FROM sys.dba_objects
-   WHERE object_name like '%'||upper('&objectname')||'%'
+   WHERE object_name like '%'||upper('&objectname')||'%' and object_id =nvl('&object_id',object_id) and data_object_id=nvl('&dataobject_id',data_object_id)
 ORDER BY owner, object_type
 /

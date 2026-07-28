@@ -2,26 +2,27 @@
 -- Purpose: YashanDB Show database open mode and log status
 -- Created: 20260516  by  huangtingzhong
 
-col database_name          for a15
-col host_name              for a15
-col PROTECTION_MODE        for a20
-col PROTECTION_LEVEL       for a20
-col SWITCHOVER_STATUS      for a20
-col flashback_on           for a12
-col status                 for a15
+col host                   for a15
+col name                   for a15
 col log_mode               for a10
 col open_mode              for a10
-col current_scn            for a20
+col scn                    for a20
+col status                 for a15
+col flashback              for a12
+col role                   for a16
+col prot_mode              for a20
+col prot_level             for a20
+col sw_status              for a20
 
-select host_name,
-       DATABASE_NAME,
+SELECT host_name              AS host,
+       database_name          AS name,
        log_mode,
        open_mode,
-       TO_CHAR(current_scn) AS current_scn,
+       TO_CHAR(current_scn)   AS scn,
        status,
-       flashback_on,
-       DATABASE_ROLE,
-       PROTECTION_MODE,
-       PROTECTION_LEVEL,
-       SWITCHOVER_STATUS
-  from v$database;
+       flashback_on           AS flashback,
+       database_role          AS role,
+       protection_mode        AS prot_mode,
+       protection_level       AS prot_level,
+       switchover_status      AS sw_status
+  FROM v$database;

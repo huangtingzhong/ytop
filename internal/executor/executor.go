@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -108,6 +109,10 @@ func (e *Executor) executeSQLScript(ctx context.Context, scriptName string) (str
 			if e.cfg.DebugMode {
 				debugLogVariableAssignment(variable, rawValue, value, source)
 			}
+		}
+		// 无变量或变量交互未覆盖的分节 PROMPT, 在剥离前补打到终端 (与文档 §4.2 一致).
+		if e.cfg.DBType == "yashandb" {
+			printYashanDBPromptBlocks(scriptContent, 0, len(lines), displayedPrompt)
 		}
 		beforeStrip := scriptContent
 		scriptContent = stripSQLPlusClientCommands(scriptContent)
@@ -404,7 +409,13 @@ func (e *Executor) executeOSScript(ctx context.Context, scriptName, scriptConten
 	}
 
 	pythonBin := e.cfg.Python
-	if pythonBin == "" {
+	if kind == platform.OSScriptKindPython {
+		resolved, err := e.resolvePythonBin(ctx, targetOS)
+		if err != nil {
+			return "", err
+		}
+		pythonBin = resolved
+	} else if pythonBin == "" {
 		pythonBin = platform.DefaultPythonBin(targetOS)
 	}
 
@@ -414,6 +425,55 @@ func (e *Executor) executeOSScript(ctx context.Context, scriptName, scriptConten
 		return e.executeOSScriptSSH(ctx, scriptContent, artifact, args, kind, pythonBin, targetOS)
 	}
 	return e.executeOSScriptLocal(ctx, scriptContent, artifact, args, kind, pythonBin, targetOS)
+}
+
+// resolvePythonBin returns cfg.Python when set; otherwise probes the target for a usable interpreter.
+func (e *Executor) resolvePythonBin(ctx context.Context, targetOS string) (string, error) {
+	if e.cfg.Python != "" {
+		return e.cfg.Python, nil
+	}
+	probe := platform.BuildPythonProbeCmd(targetOS)
+	var out string
+	if e.cfg.ConnectionMode == "ssh" {
+		sshConn, ok := e.conn.(*connector.SSHConnector)
+		if !ok {
+			return "", fmt.Errorf("not an SSH connection")
+		}
+		if e.cfg.DebugMode {
+			logger.Debug("Python auto-detect probe (ssh): %s\n", probe)
+		}
+		raw, err := sshConn.ExecuteCommand(ctx, probe)
+		out = raw
+		if err != nil && platform.ParsePythonProbeOutput(raw) == "" {
+			return "", fmt.Errorf("python interpreter not found on target (tried %s); set --python",
+				strings.Join(platform.PythonCandidates(targetOS), ", "))
+		}
+	} else {
+		if e.cfg.DebugMode {
+			logger.Debug("Python auto-detect probe (local): %s\n", probe)
+		}
+		var cmd *exec.Cmd
+		if targetOS == platform.OSWindows || platform.LocalOS() == platform.OSWindows {
+			cmd = exec.CommandContext(ctx, "cmd", "/C", probe)
+		} else {
+			cmd = exec.CommandContext(ctx, "bash", "-c", probe)
+		}
+		raw, err := cmd.Output()
+		out = string(raw)
+		if err != nil && platform.ParsePythonProbeOutput(out) == "" {
+			return "", fmt.Errorf("python interpreter not found on target (tried %s); set --python",
+				strings.Join(platform.PythonCandidates(targetOS), ", "))
+		}
+	}
+	bin := platform.ParsePythonProbeOutput(out)
+	if bin == "" {
+		return "", fmt.Errorf("python interpreter not found on target (tried %s); set --python",
+			strings.Join(platform.PythonCandidates(targetOS), ", "))
+	}
+	if e.cfg.DebugMode {
+		logger.DebugKeyVal("Python(resolved)", bin)
+	}
+	return bin, nil
 }
 
 func (e *Executor) executeOSScriptLocal(ctx context.Context, scriptContent, artifact string, args []string, kind platform.OSScriptKind, pythonBin, targetOS string) (string, error) {
@@ -773,8 +833,22 @@ func (e *Executor) executeSourceFile(ctx context.Context, source string, runArgs
 	if e.cfg.ConnectionMode != "ssh" {
 		targetOS = platform.LocalOS()
 	}
+	if targetOS == "" {
+		targetOS = platform.OSUnix
+	}
 	if targetOS == platform.OSWindows && kind == scripts.SourceKindC && binName != "" {
 		binName += ".exe"
+	}
+
+	// .py 源文件同样走目标机 Python 自动探测 (未指定 --python 时).
+	if kind == scripts.SourceKindPy && e.cfg.Python == "" {
+		py, err := e.resolvePythonBin(ctx, targetOS)
+		if err != nil {
+			return "", err
+		}
+		old := e.cfg.Python
+		e.cfg.Python = py
+		defer func() { e.cfg.Python = old }()
 	}
 
 	if e.cfg.ConnectionMode == "ssh" {
@@ -878,7 +952,8 @@ func cfgDefaults(c *config.Config) configWithDefaults {
 	}
 	py := c.Python
 	if py == "" {
-		py = "python3"
+		// 调用方应已 resolvePythonBin; 此处仅作兜底.
+		py = platform.DefaultPythonBin(platform.OSUnix)
 	}
 	return configWithDefaults{CC: cc, CFLAGS: c.CFLAGS, LDFLAGS: c.LDFLAGS, Python: py}
 }

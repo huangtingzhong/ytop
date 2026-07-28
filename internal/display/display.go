@@ -639,7 +639,7 @@ func (d *InteractiveDisplay) ShowHelp() string {
 	help.WriteString("                  Scripts with & or && variables will prompt for input\n")
 	help.WriteString("  - C sources:    memtest.c or memtest.c -i 1 -t 2 (compile on target, run with args)\n")
 	help.WriteString("                  Embedded in scripts/os/ or path ./file.c\n")
-	help.WriteString("  - Python:       probe.py or probe.py --verbose (run with python3 on target)\n")
+	help.WriteString("  - Python:       probe.py or probe.py --verbose (auto-detect python on target)\n")
 	help.WriteString("                  Embedded in scripts/os/\n")
 	help.WriteString("  - OS commands:  Enter any shell command (e.g., iostat 1 2)\n")
 	help.WriteString("                  Or embedded OS scripts from scripts/os/\n")
