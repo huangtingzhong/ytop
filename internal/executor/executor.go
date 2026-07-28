@@ -156,14 +156,14 @@ func (e *Executor) executeSQLViaSSHUpload(ctx context.Context, scriptContent, sc
 	logger.DebugKeyVal("bytes", fmt.Sprintf("%d", len(scriptForExec)))
 
 	basename := fmt.Sprintf("ytop_%s_%d.sql", filepath.Base(scriptName), os.Getpid())
-	output, err := sshConn.ExecuteRemoteSQLScript(ctx, []byte(scriptForExec), basename)
+	output, err := sshConn.ExecuteRemoteSQLScriptRealtime(ctx, []byte(scriptForExec), basename)
 	if err != nil {
 		return output, fmt.Errorf("failed to execute script via SSH: %w", err)
 	}
 	return output, nil
 }
 
-// executeSQLDirect executes SQL directly via local yasql with temp file
+// executeSQLDirect executes SQL directly via local yasql with temp file (realtime stream).
 func (e *Executor) executeSQLDirect(ctx context.Context, scriptContent string) (string, error) {
 	// Create temporary script file
 	tmpFile := platform.LocalTempPath(fmt.Sprintf("ytop_%d.sql", os.Getpid()))
@@ -189,16 +189,11 @@ func (e *Executor) executeSQLDirect(ctx context.Context, scriptContent string) (
 		logger.Debug("Executing SQL script locally: %v\n", cmd.Args)
 	}
 
-	output, err := cmd.CombinedOutput()
-	outStr := string(output)
-	if e.cfg.DebugMode {
-		logger.DebugCommandOutput("local-sql-script", outStr, err)
-	}
+	output, err := e.runLocalCmdRealtime(ctx, cmd, "local-sql-script")
 	if err != nil {
-		return outStr, fmt.Errorf("SQL script execution failed: %w", err)
+		return output, fmt.Errorf("SQL script execution failed: %w", err)
 	}
-
-	return outStr, nil
+	return output, nil
 }
 
 // executeOSCommand executes an OS command or script
@@ -268,11 +263,14 @@ func (e *Executor) executeOSCommandViaSSH(ctx context.Context, command string) (
 // executeOSCommandLocal executes OS command locally with real-time output
 func (e *Executor) executeOSCommandLocal(ctx context.Context, command string) (string, error) {
 	cmd := connector.BuildLocalOSExecCmd(ctx, e.cfg, command)
+	return e.runLocalCmdRealtime(ctx, cmd, "local-os-command")
+}
 
-	// Set process group ID so we can kill the entire process tree (platform-specific)
+// runLocalCmdRealtime runs a local *exec.Cmd with stdout/stderr streamed to the terminal.
+// Also accumulates output for return (callers that already streamed must not reprint).
+func (e *Executor) runLocalCmdRealtime(ctx context.Context, cmd *exec.Cmd, debugLabel string) (string, error) {
 	setProcAttributes(cmd)
 
-	// Create pipes for stdout and stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return "", fmt.Errorf("failed to create stdout pipe: %w", err)
@@ -283,25 +281,20 @@ func (e *Executor) executeOSCommandLocal(ctx context.Context, command string) (s
 		return "", fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
-	// Start the command
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("failed to start command: %w", err)
 	}
 
-	// Buffer to collect all output
 	var outputBuffer strings.Builder
 	var bufferMutex sync.Mutex
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Context cancellation: kill process to unblock Wait() and Read()
 	go func() {
 		<-ctx.Done()
 		killProcessGroup(cmd)
 	}()
 
-	// Read stdout in real-time byte by byte for immediate display
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 1)
@@ -326,7 +319,6 @@ func (e *Executor) executeOSCommandLocal(ctx context.Context, command string) (s
 		}
 	}()
 
-	// Read stderr in real-time byte by byte for immediate display
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 1)
@@ -351,16 +343,13 @@ func (e *Executor) executeOSCommandLocal(ctx context.Context, command string) (s
 		}
 	}()
 
-	// Wait for command to complete (unblocked by command exit or context cancel)
 	waitErr := cmd.Wait()
-
-	// Wait for readers to drain remaining buffered data
 	wg.Wait()
 
 	if ctx.Err() == context.Canceled {
 		result := outputBuffer.String()
 		if e.cfg.DebugMode {
-			logger.DebugCommandOutput("local-os-command", result, ctx.Err())
+			logger.DebugCommandOutput(debugLabel, result, ctx.Err())
 		}
 		return result, nil
 	}
@@ -368,14 +357,14 @@ func (e *Executor) executeOSCommandLocal(ctx context.Context, command string) (s
 	if waitErr != nil {
 		result := outputBuffer.String()
 		if e.cfg.DebugMode {
-			logger.DebugCommandOutput("local-os-command", result, waitErr)
+			logger.DebugCommandOutput(debugLabel, result, waitErr)
 		}
 		return result, fmt.Errorf("command failed: %w", waitErr)
 	}
 
 	result := outputBuffer.String()
 	if e.cfg.DebugMode {
-		logger.DebugCommandOutput("local-os-command", result, nil)
+		logger.DebugCommandOutput(debugLabel, result, nil)
 	}
 	return result, nil
 }
@@ -557,7 +546,7 @@ func (e *Executor) executeAdHocSQLViaSSH(ctx context.Context, sql string) (strin
 		if e.cfg.DebugMode {
 			logger.Debug("Executing ad-hoc SQL via SSH (login-cmd): %s\n", cmd)
 		}
-		return sshConn.ExecuteCommand(ctx, cmd)
+		return sshConn.ExecuteCommandRealtime(ctx, cmd)
 	}
 
 	cli := e.cfg.ResolveCLIForExec()
@@ -576,7 +565,7 @@ func (e *Executor) executeAdHocSQLViaSSH(ctx context.Context, sql string) (strin
 	default:
 		// Windows remote has no bash heredoc; upload script and run via @file / disql.
 		if e.cfg.TargetOS == platform.OSWindows {
-			return sshConn.ExecuteRemoteSQLScript(ctx, []byte(sqlExec), connector.RemoteScriptBasename("q"))
+			return sshConn.ExecuteRemoteSQLScriptRealtime(ctx, []byte(sqlExec), connector.RemoteScriptBasename("q"))
 		}
 		delim := randomHeredocMarker("YTOP_SQL")
 		remoteCmd = fmt.Sprintf("%s -S %s <<'%s'\n%s\nexit\n%s",
@@ -593,10 +582,10 @@ func (e *Executor) executeAdHocSQLViaSSH(ctx context.Context, sql string) (strin
 		logger.Debug("Executing ad-hoc SQL via SSH: %s\n", remoteCmd)
 	}
 
-	return sshConn.ExecuteCommand(ctx, remoteCmd)
+	return sshConn.ExecuteCommandRealtime(ctx, remoteCmd)
 }
 
-// executeAdHocSQLLocal executes ad-hoc SQL locally
+// executeAdHocSQLLocal executes ad-hoc SQL locally with realtime stream.
 func (e *Executor) executeAdHocSQLLocal(ctx context.Context, sql string) (string, error) {
 	sqlExec := connector.WrapSQLSuppressScriptEcho(e.cfg.DBType, sql)
 	sqlExec = connector.EnsureSQLStatementTerminator(sqlExec, e.cfg.DBType)
@@ -605,15 +594,11 @@ func (e *Executor) executeAdHocSQLLocal(ctx context.Context, sql string) (string
 	if e.cfg.DebugMode {
 		logger.Debug("Executing ad-hoc SQL locally: %v\n", cmd.Args)
 	}
-	output, err := cmd.CombinedOutput()
-	outStr := string(output)
-	if e.cfg.DebugMode {
-		logger.DebugCommandOutput("local-sql-adhoc", outStr, err)
-	}
+	output, err := e.runLocalCmdRealtime(ctx, cmd, "local-sql-adhoc")
 	if err != nil {
-		return outStr, fmt.Errorf("SQL execution failed: %w", err)
+		return output, fmt.Errorf("SQL execution failed: %w", err)
 	}
-	return outStr, nil
+	return output, nil
 }
 
 // yasqlDollarVar matches yasql $identifier substitution (e.g. $session in v$session).

@@ -739,7 +739,18 @@ func (c *SSHConnector) UploadFileToPath(_ context.Context, content []byte, remot
 }
 
 // ExecuteRemoteSQLScript uploads SQL via SFTP, runs it on the remote host, and cleans up.
+// Output is buffered (for collector / parse paths). Use ExecuteRemoteSQLScriptRealtime for
+// user-facing -f/-q so results stream to the terminal.
 func (c *SSHConnector) ExecuteRemoteSQLScript(ctx context.Context, content []byte, basename string) (string, error) {
+	return c.executeRemoteSQLScript(ctx, content, basename, false)
+}
+
+// ExecuteRemoteSQLScriptRealtime is like ExecuteRemoteSQLScript but streams stdout/stderr live.
+func (c *SSHConnector) ExecuteRemoteSQLScriptRealtime(ctx context.Context, content []byte, basename string) (string, error) {
+	return c.executeRemoteSQLScript(ctx, content, basename, true)
+}
+
+func (c *SSHConnector) executeRemoteSQLScript(ctx context.Context, content []byte, basename string, realtime bool) (string, error) {
 	sftpPath, execPath, err := c.UploadScriptSFTP(ctx, content, basename)
 	if err != nil {
 		return "", err
@@ -756,7 +767,12 @@ func (c *SSHConnector) ExecuteRemoteSQLScript(ctx context.Context, content []byt
 	execCmd := c.buildSSHSQLExecCmd(execPath)
 	logger.DebugKeyVal("ExecCmd", execCmd)
 
-	output, err := c.ExecuteCommand(ctx, execCmd)
+	var output string
+	if realtime {
+		output, err = c.ExecuteCommandRealtime(ctx, execCmd)
+	} else {
+		output, err = c.ExecuteCommand(ctx, execCmd)
+	}
 	if err != nil {
 		return output, fmt.Errorf("SSH SQL execution failed: %w\nOutput: %s", err, output)
 	}

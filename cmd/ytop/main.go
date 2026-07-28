@@ -223,31 +223,19 @@ func runDirectExecution(ctx context.Context, cfg *config.Config, conn connector.
 			time.Sleep(time.Duration(interval) * time.Second)
 		}
 
-		var output string
 		var err error
 
 		if cfg.ExecuteScript != "" {
-			// Execute script file
-			output, err = exec.ExecuteCommand(ctx, cfg.ExecuteScript)
+			// Execute script file (SQL/OS both stream to terminal)
+			_, err = exec.ExecuteCommand(ctx, cfg.ExecuteScript)
 		} else if cfg.ExecuteSQL != "" {
-			// Execute SQL query
-			output, err = exec.ExecuteAdHocSQL(ctx, cfg.ExecuteSQL)
+			// Execute SQL query (streams to terminal)
+			_, err = exec.ExecuteAdHocSQL(ctx, cfg.ExecuteSQL)
 		}
 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
-		}
-
-		// Display output (SQL only; OS commands already printed via real-time streaming)
-		if output != "" {
-			isSQL := cfg.ExecuteSQL != "" || scripts.IsSQLScriptInput(cfg.ExecuteScript)
-			if isSQL {
-				fmt.Print(output)
-				if !strings.HasSuffix(output, "\n") {
-					fmt.Println()
-				}
-			}
 		}
 	}
 }
@@ -532,12 +520,11 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 						if err != nil {
 							fmt.Fprintf(os.Stderr, "\r\nError executing SQL: %v\r\n", err)
 						}
-						// In raw mode use \r\n so output aligns (same as 's' key)
-						if output != "" {
-							fmt.Print("\r\n")
-							displayOutput := strings.ReplaceAll(output, "\n", "\r\n")
-							fmt.Print(displayOutput)
-							fmt.Print("\r\n")
+						// Output already streamed in realtime; only show empty hint.
+						if err == nil && output == "" {
+							fmt.Printf("\r\n\r\nNo output generated\r\n")
+						} else if err != nil {
+							fmt.Printf("\r\n")
 						}
 
 						// Resume keyboard reading before waiting for key press
@@ -665,18 +652,7 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 							logger.DebugTUIResult("exec-command", cmdErr, len(output))
 						}
 
-						// Display output if available (SQL scripts only;
-						// OS commands already printed via real-time streaming)
-						if output != "" && !cancelled {
-							isSQLScript := scripts.IsSQLScriptInput(command)
-							if isSQLScript {
-								fmt.Print("\r\n")
-								displayOutput := strings.ReplaceAll(output, "\n", "\r\n")
-								fmt.Print(displayOutput)
-								fmt.Print("\r\n")
-							}
-						}
-
+						// Output already streamed in realtime for both SQL and OS commands.
 						if cmdErr == nil && output == "" && !cancelled {
 							fmt.Printf("\r\n\r\nNo output generated\r\n")
 						} else if cmdErr != nil {

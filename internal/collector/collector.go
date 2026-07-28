@@ -290,45 +290,68 @@ func (c *Collector) CollectSessionDetails(ctx context.Context) ([]models.Session
 		instFilter = fmt.Sprintf(" AND a.INST_ID = %d", c.cfg.InstanceID)
 	}
 
+	// 与 we.sql 对齐: 在 SQL 内把 exec_ms 格式化为字符列 exec_time, 避免 NUMBER + COL FOR An.
 	sqlBody := fmt.Sprintf(`
 SELECT
-    x.sid_tid,
-    x.event,
-    x.username,
-    x.sql_id,
-    GREATEST(0,
-        EXTRACT(DAY FROM x.exec_delta) * 86400000 +
-        EXTRACT(HOUR FROM x.exec_delta) * 3600000 +
-        EXTRACT(MINUTE FROM x.exec_delta) * 60000 +
-        EXTRACT(SECOND FROM x.exec_delta) * 1000
-    ) AS exec_ms,
-    x.program,
-    x.client,
-    x.inst_id
+    sid_tid,
+    event,
+    username,
+    sql_id,
+    CASE
+        WHEN exec_ms < 1000 THEN
+            ROUND(exec_ms, 0) || 'MS'
+        WHEN exec_ms < 60000 THEN
+            ROUND(exec_ms / 1000, 2) || 'S'
+        WHEN exec_ms < 3600000 THEN
+            ROUND(exec_ms / 60000, 2) || 'M'
+        WHEN exec_ms < 86400000 THEN
+            ROUND(exec_ms / 3600000, 2) || 'H'
+        ELSE
+            ROUND(exec_ms / 86400000, 2) || 'D'
+    END AS exec_time,
+    program,
+    client,
+    TO_CHAR(inst_id) AS inst_id
 FROM (
     SELECT
-        a.inst_id||'.'||a.sid||'.'||a.serial#||'.'||b.thread_id AS sid_tid,
-        substr(a.wait_event,1,30) AS event,
-        a.username AS username,
-        substr(a.cli_program,1,30) AS program,
-        substr(c.command_name,1,3)||'.'||nvl(a.sql_id,a.sql_id) AS sql_id,
-        CAST(
-            CAST(SYSTIMESTAMP AS TIMESTAMP(6)) - CAST(a.exec_start_time AS TIMESTAMP(6))
-            AS INTERVAL DAY(9) TO SECOND(6)
-        ) AS exec_delta,
-        a.ip_address||'.'||a.ip_port AS client,
-        a.inst_id
-    FROM GV$SESSION a, GV$PROCESS b, V$SQLCOMMAND c
-    WHERE a.inst_id = b.inst_id
-      AND a.paddr = b.thread_addr
-      AND a.command = c.command_type(+)
-      AND a.TYPE NOT IN ('BACKGROUND')
-      AND a.status NOT IN ('INACTIVE')
-      AND NOT (a.INST_ID = TO_NUMBER(SYS_CONTEXT('USERENV', 'INSTANCE'))
-           AND a.SID = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')))%s
-) x
-ORDER BY exec_ms DESC
-FETCH FIRST %d ROWS ONLY
+        x.sid_tid,
+        x.event,
+        x.username,
+        x.program,
+        x.sql_id,
+        GREATEST(0,
+            EXTRACT(DAY FROM x.exec_delta) * 86400000 +
+            EXTRACT(HOUR FROM x.exec_delta) * 3600000 +
+            EXTRACT(MINUTE FROM x.exec_delta) * 60000 +
+            EXTRACT(SECOND FROM x.exec_delta) * 1000
+        ) AS exec_ms,
+        x.client,
+        x.inst_id
+    FROM (
+        SELECT
+            a.inst_id||'.'||a.sid||'.'||a.serial#||'.'||b.thread_id AS sid_tid,
+            substr(a.wait_event,1,30) AS event,
+            a.username AS username,
+            substr(a.cli_program,1,30) AS program,
+            substr(c.command_name,1,3)||'.'||nvl(a.sql_id,a.sql_id) AS sql_id,
+            CAST(
+                CAST(SYSTIMESTAMP AS TIMESTAMP(6)) - CAST(a.exec_start_time AS TIMESTAMP(6))
+                AS INTERVAL DAY(9) TO SECOND(6)
+            ) AS exec_delta,
+            a.ip_address||'.'||a.ip_port AS client,
+            a.inst_id
+        FROM GV$SESSION a, GV$PROCESS b, V$SQLCOMMAND c
+        WHERE a.inst_id = b.inst_id
+          AND a.paddr = b.thread_addr
+          AND a.command = c.command_type(+)
+          AND a.TYPE NOT IN ('BACKGROUND')
+          AND a.status NOT IN ('INACTIVE')
+          AND NOT (a.INST_ID = TO_NUMBER(SYS_CONTEXT('USERENV', 'INSTANCE'))
+               AND a.SID = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')))%s
+    ) x
+    ORDER BY exec_ms DESC
+    FETCH FIRST %d ROWS ONLY
+)
 `, instFilter, c.cfg.SessionDetailTopN)
 
 	sql := sessionDetailColPrefix(c.cfg.DBType) + sqlBody
@@ -367,6 +390,7 @@ FETCH FIRST %d ROWS ONLY
 }
 
 // sessionDetailColPrefix sets fixed column widths for yasql table output (aligned with we.sql).
+// 全部为字符列(含 TO_CHAR(inst_id) / CASE 拼出的 exec_time), 避免 NUMBER 直接 COL FOR An.
 func sessionDetailColPrefix(dbType string) string {
 	switch dbType {
 	case "yashandb", "oracle", "dameng":
@@ -374,7 +398,7 @@ func sessionDetailColPrefix(dbType string) string {
 col EVENT for a20
 col USERNAME for a15
 col SQL_ID for a20
-col EXEC_MS for a10
+col EXEC_TIME for a8
 col PROGRAM for a30
 col CLIENT for a20
 col INST_ID for a7
@@ -399,8 +423,8 @@ func normalizeSessionDetailHeader(h string) string {
 	h = strings.ToUpper(strings.TrimSpace(h))
 	h = strings.ReplaceAll(h, " ", "_")
 	switch h {
-	case "EXEC_TIME":
-		return "EXEC_MS"
+	case "EXEC_MS":
+		return "EXEC_TIME"
 	case "SID", "SID_SERIAL", "SID.SERIAL":
 		return "SID_TID"
 	}
@@ -429,7 +453,7 @@ func parseSessionDetailRow(header, row []string) (models.SessionDetail, bool) {
 		sqlID    string
 		program  string
 		client   string
-		execMs   float64
+		execTime string
 		instID   int
 	)
 
@@ -441,14 +465,14 @@ func parseSessionDetailRow(header, row []string) (models.SessionDetail, bool) {
 		program = get("PROGRAM")
 		client = get("CLIENT")
 		instID = parseSessionDetailInt(get("INST_ID"))
-		execMs = parseSessionDetailExecMs(get("EXEC_MS", "EXEC_TIME"))
+		execTime = resolveExecTime(get("EXEC_TIME", "EXEC_MS"))
 	} else if len(row) >= 8 {
 		// Fallback: column order aligned with we.sql / CollectSessionDetails SELECT.
 		sidTid = strings.TrimSpace(row[0])
 		event = row[1]
 		username = row[2]
 		sqlID = row[3]
-		execMs = parseSessionDetailExecMs(row[4])
+		execTime = resolveExecTime(row[4])
 		program = row[5]
 		client = row[6]
 		instID = parseSessionDetailInt(row[7])
@@ -467,35 +491,24 @@ func parseSessionDetailRow(header, row []string) (models.SessionDetail, bool) {
 		Username: username,
 		SqlID:    sqlID,
 		Program:  program,
-		ExecTime: formatExecTime(execMs),
+		ExecTime: execTime,
 		Client:   client,
 	}, true
 }
 
-func parseSessionDetailExecMs(s string) float64 {
+// resolveExecTime 优先沿用 we.sql 已格式化的 MS/S/M/H/D 字符串; 否则按毫秒数值再格式化.
+func resolveExecTime(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return 0
+		return formatExecTime(0)
 	}
 	upper := strings.ToUpper(s)
 	for _, suffix := range []string{"MS", "S", "M", "H", "D"} {
 		if strings.HasSuffix(upper, suffix) && len(s) > len(suffix) {
-			v := parseSessionDetailFloat(s[:len(s)-len(suffix)])
-			switch suffix {
-			case "MS":
-				return v
-			case "S":
-				return v * 1000
-			case "M":
-				return v * 60000
-			case "H":
-				return v * 3600000
-			case "D":
-				return v * 86400000
-			}
+			return s
 		}
 	}
-	return parseSessionDetailFloat(s)
+	return formatExecTime(parseSessionDetailFloat(s))
 }
 
 func parseSessionDetailFloat(s string) float64 {
