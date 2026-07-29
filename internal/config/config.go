@@ -40,7 +40,8 @@ type Config struct {
 	SessionDetailTopN int
 	ShowTimestamp     bool
 	ColorEnabled      bool
-	InstanceID        int // 0 = all instances, 1,2,... = specific instance
+	InstanceID        int  // 0 = all instances, 1,2,... = specific instance
+	SessionWideMode   bool // --wide: show all 20 session metrics (default short: 15 core)
 
 	// Metric settings
 	SysStatMetrics     []string // GV$SYSSTAT names to query (includes source-only TIME metrics)
@@ -141,8 +142,32 @@ func defaultSessionStatMetrics() []string {
 }
 
 // SessionStatDisplayNames is the session TOP metric column order (aligned with instance sysstat row).
+// Used by calculator for zero-metric init — always returns full list.
 func SessionStatDisplayNames() []string {
 	return SysStatDisplayNames()
+}
+
+// SessionStatShortDisplayNames is the short-mode session TOP metric column order (15 core metrics).
+// Drops CHECKPOINTS COMPLETED, VM OPEN, VM SWAP OUT (instance-level, session-almost-always-0),
+// plus LOGONS TOTAL and PARSE COUNT (HARD).
+func SessionStatShortDisplayNames() []string {
+	return []string{
+		"DB TIME",
+		"CPU TIME",
+		"COMMITS",
+		"REDO SIZE",
+		"QUERY COUNT",
+		"BLOCK CHANGES",
+		"INSERT COUNT",
+		"DISK READS",
+		"AVG READ MS",
+		"DISK WRITES",
+		"AVG WRITE MS",
+		"BUFFER GETS",
+		"EXECUTE COUNT",
+		"BUFFER CR GETS",
+		"USER IO WAIT TIME",
+	}
 }
 
 // defaultSysStatQueryMetrics lists all GV$SYSSTAT names collected in monitor mode.
@@ -394,6 +419,7 @@ func LoadConfig() (*Config, error) {
 	sessionTopN := flag.Int("session-top", 0, "Number of sessions to show in TOP N")
 	sessionSortBy := flag.String("session-sort", "", "Session sort column")
 	sessionDetailTopN := flag.Int("session-detail-top", 0, "Number of active sessions to show")
+	wideMode := flag.Bool("wide", false, "Show all 20 session metrics (default: 15 core metrics)")
 	instanceID := flag.Int("inst-id", 0, "Instance ID (0 = all instances, 1,2,... = specific instance)")
 	noColor := flag.Bool("no-color", false, "Disable color output")
 	noTimestamp := flag.Bool("no-timestamp", false, "Hide timestamp")
@@ -498,6 +524,9 @@ func LoadConfig() (*Config, error) {
 	}
 	if VisitedAny(visited, "no-timestamp") && *noTimestamp {
 		cfg.ShowTimestamp = false
+	}
+	if VisitedAny(visited, "wide") && *wideMode {
+		cfg.SessionWideMode = true
 	}
 	if VisitedAny(visited, "debug", "D") && (*debug || *debugShort) {
 		cfg.DebugMode = true

@@ -8,7 +8,7 @@ col PROGRAM           for a30
 col EVENT             for a30
 col USERNAME          for a15
 col SQL_ID            for a18
-col EXEC_TIME         for a8
+col EXEC_TIME         for a10
 col CLIENT            for a20
 
 SELECT 
@@ -17,6 +17,8 @@ SELECT
     username,
     sql_id,
     CASE 
+        WHEN exec_ms IS NULL THEN 
+            'N/A'
         WHEN exec_ms < 1000 THEN 
             ROUND(exec_ms, 0) || 'MS'
         WHEN exec_ms < 60000 THEN 

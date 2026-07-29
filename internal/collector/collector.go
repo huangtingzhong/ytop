@@ -298,6 +298,8 @@ SELECT
     username,
     sql_id,
     CASE
+        WHEN exec_ms IS NULL THEN
+            'N/A'
         WHEN exec_ms < 1000 THEN
             ROUND(exec_ms, 0) || 'MS'
         WHEN exec_ms < 60000 THEN
@@ -391,6 +393,7 @@ FROM (
 
 // sessionDetailColPrefix sets fixed column widths for yasql table output (aligned with we.sql).
 // 全部为字符列(含 TO_CHAR(inst_id) / CASE 拼出的 exec_time), 避免 NUMBER 直接 COL FOR An.
+// EXEC_TIME 至少 a9: 表头 "EXEC_TIME" 为 9 字符, a8 会截成 EXEC_TIM 导致解析不到而显示 0MS.
 func sessionDetailColPrefix(dbType string) string {
 	switch dbType {
 	case "yashandb", "oracle", "dameng":
@@ -398,7 +401,7 @@ func sessionDetailColPrefix(dbType string) string {
 col EVENT for a20
 col USERNAME for a15
 col SQL_ID for a20
-col EXEC_TIME for a8
+col EXEC_TIME for a10
 col PROGRAM for a30
 col CLIENT for a20
 col INST_ID for a7
@@ -423,7 +426,7 @@ func normalizeSessionDetailHeader(h string) string {
 	h = strings.ToUpper(strings.TrimSpace(h))
 	h = strings.ReplaceAll(h, " ", "_")
 	switch h {
-	case "EXEC_MS":
+	case "EXEC_MS", "EXEC_TIM": // EXEC_TIM: yasql truncates EXEC_TIME under COL a8
 		return "EXEC_TIME"
 	case "SID", "SID_SERIAL", "SID.SERIAL":
 		return "SID_TID"
@@ -466,6 +469,12 @@ func parseSessionDetailRow(header, row []string) (models.SessionDetail, bool) {
 		client = get("CLIENT")
 		instID = parseSessionDetailInt(get("INST_ID"))
 		execTime = resolveExecTime(get("EXEC_TIME", "EXEC_MS"))
+		// 表头仍截断/错位时, 按 SELECT 第 5 列 (exec_time) 回退
+		if !hasExecTimeSuffix(execTime) && len(row) >= 5 {
+			if raw := strings.TrimSpace(row[4]); hasExecTimeSuffix(raw) {
+				execTime = resolveExecTime(raw)
+			}
+		}
 	} else if len(row) >= 8 {
 		// Fallback: column order aligned with we.sql / CollectSessionDetails SELECT.
 		sidTid = strings.TrimSpace(row[0])
@@ -496,31 +505,43 @@ func parseSessionDetailRow(header, row []string) (models.SessionDetail, bool) {
 	}, true
 }
 
+func hasExecTimeSuffix(s string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(s))
+	for _, suffix := range []string{"MS", "S", "M", "H", "D"} {
+		if strings.HasSuffix(upper, suffix) && len(upper) > len(suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveExecTime 优先沿用 we.sql 已格式化的 MS/S/M/H/D 字符串; 否则按毫秒数值再格式化.
+// 当 exec_start_time 为 NULL 时 SQL 输出 'N/A'; 单字符后缀 (如裸 'D') 也是 NULL 串联残留, 按 N/A 处理.
 func resolveExecTime(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return formatExecTime(0)
+		return "N/A"
 	}
 	upper := strings.ToUpper(s)
+	// SQL outputs 'N/A' when exec_start_time is NULL — pass through directly.
+	if upper == "N/A" {
+		return s
+	}
+	// Single-character suffix strings (e.g. bare 'D' from NULL concatenation) are not valid times.
+	if len(s) == 1 {
+		return "N/A"
+	}
 	for _, suffix := range []string{"MS", "S", "M", "H", "D"} {
 		if strings.HasSuffix(upper, suffix) && len(s) > len(suffix) {
 			return s
 		}
 	}
-	return formatExecTime(parseSessionDetailFloat(s))
-}
-
-func parseSessionDetailFloat(s string) float64 {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0
-	}
+	// Numeric fallback — but 0 from failed parsing is misleading; return N/A.
 	v, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0
+	if err != nil || v < 0 {
+		return "N/A"
 	}
-	return v
+	return formatExecTime(v)
 }
 
 func parseSessionDetailInt(s string) int {

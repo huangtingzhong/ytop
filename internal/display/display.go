@@ -67,6 +67,9 @@ func (d *Display) Render(snapshot *models.Snapshot) {
 
 	var output strings.Builder
 
+	// Footer line width = session metrics panel width (always the widest)
+	footerWidth := sessionMetricsLineWidth(d.cfg)
+
 	// Header
 	d.renderHeader(&output, snapshot.Timestamp)
 
@@ -83,7 +86,7 @@ func (d *Display) Render(snapshot *models.Snapshot) {
 	d.renderSessionDetails(&output, snapshot.SessionDetails)
 
 	// Footer
-	d.renderFooter(&output)
+	d.renderFooter(&output, footerWidth)
 
 	// Print to terminal
 	fmt.Print(output.String())
@@ -111,21 +114,25 @@ func (d *Display) renderHeader(out *strings.Builder, timestamp time.Time) {
 
 // renderSysStats renders v$sysstat metrics in a single row (rates + IO latency ms).
 func (d *Display) renderSysStats(out *strings.Builder, metrics []models.SysStatMetric) {
+	sysStatNames := config.SysStatDisplayNames()
+	sysLineWidth := 3 + len(sysStatNames)*(1+6) // I(2)+space(1) + N×(space+colWidth6)
+	sysSep := strings.Repeat("-", sysLineWidth)
+
 	if len(metrics) == 0 {
 		out.WriteString(d.colorize("v$SYSSTAT Metrics (Per Second)\n", "yellow"))
-		out.WriteString(strings.Repeat("-", 120))
+		out.WriteString(sysSep)
 		out.WriteString("\nNo metrics available\n\n")
 		return
 	}
 
 	if !d.sysStatsReady(metrics) {
 		out.WriteString(d.colorize("v$SYSSTAT Metrics (Per Second)\n", "yellow"))
-		out.WriteString(strings.Repeat("-", 120))
+		out.WriteString(sysSep)
 		out.WriteString("\nCollecting baseline data...\n\n")
 		return
 	}
 
-	d.renderSysStatPanel(out, "v$SYSSTAT Metrics (Per Second)", config.SysStatDisplayNames(), metrics)
+	d.renderSysStatPanel(out, "v$SYSSTAT Metrics (Per Second)", sysStatNames, metrics, sysLineWidth)
 }
 
 func (d *Display) sysStatsReady(metrics []models.SysStatMetric) bool {
@@ -150,9 +157,9 @@ func (d *Display) sysStatsReady(metrics []models.SysStatMetric) bool {
 	return false
 }
 
-func (d *Display) renderSysStatPanel(out *strings.Builder, title string, order []string, metrics []models.SysStatMetric) {
+func (d *Display) renderSysStatPanel(out *strings.Builder, title string, order []string, metrics []models.SysStatMetric, lineWidth int) {
 	out.WriteString(d.colorize(title+"\n", "yellow"))
-	out.WriteString(strings.Repeat("-", 120))
+	out.WriteString(strings.Repeat("-", lineWidth))
 	out.WriteString("\n")
 
 	colWidth := 6
@@ -246,15 +253,6 @@ func sysStatShortNames() map[string]string {
 
 // renderSystemEvents renders v$system_event TOP N
 func (d *Display) renderSystemEvents(out *strings.Builder, events []models.SystemEvent) {
-	out.WriteString(d.colorize(fmt.Sprintf("v$SYSTEM_EVENT TOP %d (By Wait Time)\n", d.cfg.EventTopN), "yellow"))
-	out.WriteString(strings.Repeat("-", 120))
-	out.WriteString("\n")
-
-	if len(events) == 0 {
-		out.WriteString("Collecting baseline data...\n\n")
-		return
-	}
-
 	// Column widths
 	instWidth := 2
 	eventWidth := 40
@@ -262,6 +260,18 @@ func (d *Display) renderSystemEvents(out *strings.Builder, events []models.Syste
 	timeWidth := 15
 	avgWidth := 15
 	pctWidth := 10
+
+	eventLineWidth := instWidth + 1 + eventWidth + 1 + waitsWidth + 1 + timeWidth + 1 + avgWidth + 1 + pctWidth
+	eventSep := strings.Repeat("-", eventLineWidth)
+
+	out.WriteString(d.colorize(fmt.Sprintf("v$SYSTEM_EVENT TOP %d (By Wait Time)\n", d.cfg.EventTopN), "yellow"))
+	out.WriteString(eventSep)
+	out.WriteString("\n")
+
+	if len(events) == 0 {
+		out.WriteString("Collecting baseline data...\n\n")
+		return
+	}
 
 	// Header (right-aligned for numbers)
 	out.WriteString(d.colorize(fmt.Sprintf("%*s", instWidth, "I"), "bold"))
@@ -276,7 +286,7 @@ func (d *Display) renderSystemEvents(out *strings.Builder, events []models.Syste
 	out.WriteString(" ")
 	out.WriteString(d.colorize(fmt.Sprintf("%*s", pctWidth, "Pct%"), "bold"))
 	out.WriteString("\n")
-	out.WriteString(strings.Repeat("-", 120))
+	out.WriteString(eventSep)
 	out.WriteString("\n")
 
 	// Data rows (right-aligned for numbers)
@@ -301,15 +311,6 @@ func (d *Display) renderSystemEvents(out *strings.Builder, events []models.Syste
 
 // renderSessionMetrics renders session metrics TOP N
 func (d *Display) renderSessionMetrics(out *strings.Builder, metrics []models.SessionMetric) {
-	out.WriteString(d.colorize(fmt.Sprintf("Session Metrics TOP %d (Sorted by %s)\n", d.cfg.SessionTopN, d.cfg.SessionSortBy), "yellow"))
-	out.WriteString(strings.Repeat("-", 120))
-	out.WriteString("\n")
-
-	if len(metrics) == 0 {
-		out.WriteString("Collecting baseline data...\n\n")
-		return
-	}
-
 	// Column width
 	instWidth := 2
 	colWidth := 6
@@ -319,6 +320,24 @@ func (d *Display) renderSessionMetrics(out *strings.Builder, metrics []models.Se
 	programWidth := 20
 
 	metricNames := config.SessionStatDisplayNames()
+	if !d.cfg.SessionWideMode {
+		metricNames = config.SessionStatShortDisplayNames()
+	}
+
+	// Total line width = I + SID_TID + Username + SQL_ID + Program + N metrics
+	lineWidth := instWidth + 1 + sidTidWidth + 1 + usernameWidth + 1 + sqlIDWidth + 1 + programWidth
+	lineWidth += len(metricNames) * (1 + colWidth)
+	sepLine := strings.Repeat("-", lineWidth)
+
+	out.WriteString(d.colorize(fmt.Sprintf("Session Metrics TOP %d (Sorted by %s)\n", d.cfg.SessionTopN, d.cfg.SessionSortBy), "yellow"))
+	out.WriteString(sepLine)
+	out.WriteString("\n")
+
+	if len(metrics) == 0 {
+		out.WriteString("Collecting baseline data...\n\n")
+		return
+	}
+
 	nameMap := sysStatShortNames()
 
 	// Header row: I, SID.Serial.TID, Username, SQL_ID, Program, Metrics
@@ -339,7 +358,7 @@ func (d *Display) renderSessionMetrics(out *strings.Builder, metrics []models.Se
 		out.WriteString(d.colorize(fmt.Sprintf("%*s", colWidth, shortName), "bold"))
 	}
 	out.WriteString("\n")
-	out.WriteString(strings.Repeat("-", 120))
+	out.WriteString(sepLine)
 	out.WriteString("\n")
 
 	// Data rows
@@ -367,15 +386,6 @@ func (d *Display) renderSessionMetrics(out *strings.Builder, metrics []models.Se
 
 // renderSessionDetails renders session details
 func (d *Display) renderSessionDetails(out *strings.Builder, details []models.SessionDetail) {
-	out.WriteString(d.colorize(fmt.Sprintf("Active Sessions TOP %d (By Execution Time)\n", d.cfg.SessionDetailTopN), "yellow"))
-	out.WriteString(strings.Repeat("-", 120))
-	out.WriteString("\n")
-
-	if len(details) == 0 {
-		out.WriteString("No active sessions found\n\n")
-		return
-	}
-
 	// Column widths
 	instWidth := 2
 	sidWidth := 30
@@ -385,6 +395,18 @@ func (d *Display) renderSessionDetails(out *strings.Builder, details []models.Se
 	execTimeWidth := 10
 	programWidth := 20
 	clientWidth := 20
+
+	detailLineWidth := instWidth + 1 + sidWidth + 1 + eventWidth + 1 + usernameWidth + 1 + sqlIDWidth + 1 + execTimeWidth + 1 + programWidth + 1 + clientWidth
+	detailSep := strings.Repeat("-", detailLineWidth)
+
+	out.WriteString(d.colorize(fmt.Sprintf("Active Sessions TOP %d (By Execution Time)\n", d.cfg.SessionDetailTopN), "yellow"))
+	out.WriteString(detailSep)
+	out.WriteString("\n")
+
+	if len(details) == 0 {
+		out.WriteString("No active sessions found\n\n")
+		return
+	}
 
 	// Header
 	out.WriteString(d.colorize(fmt.Sprintf("%*s", instWidth, "I"), "bold"))
@@ -403,7 +425,7 @@ func (d *Display) renderSessionDetails(out *strings.Builder, details []models.Se
 	out.WriteString(" ")
 	out.WriteString(d.colorize(fmt.Sprintf("%-*s", clientWidth, "Client"), "bold"))
 	out.WriteString("\n")
-	out.WriteString(strings.Repeat("-", 120))
+	out.WriteString(detailSep)
 	out.WriteString("\n")
 
 	// Data rows
@@ -429,9 +451,19 @@ func (d *Display) renderSessionDetails(out *strings.Builder, details []models.Se
 	out.WriteString("\n")
 }
 
+// sessionMetricsLineWidth returns the full line width of the session metrics table.
+func sessionMetricsLineWidth(cfg *config.Config) int {
+	n := len(config.SessionStatDisplayNames())
+	if !cfg.SessionWideMode {
+		n = len(config.SessionStatShortDisplayNames())
+	}
+	// Fixed: instWidth(2) + 1 + sidTidWidth(18) + 1 + usernameWidth(12) + 1 + sqlIDWidth(15) + 1 + programWidth(20)
+	return 2 + 1 + 18 + 1 + 12 + 1 + 15 + 1 + 20 + n*(1+6)
+}
+
 // renderFooter renders the footer section
-func (d *Display) renderFooter(out *strings.Builder) {
-	out.WriteString(strings.Repeat(d.colorize("-", "cyan"), 120))
+func (d *Display) renderFooter(out *strings.Builder, lineWidth int) {
+	out.WriteString(strings.Repeat(d.colorize("-", "cyan"), lineWidth))
 	out.WriteString("\n")
 	out.WriteString(d.colorize("Press Ctrl+C to exit", "cyan"))
 	if d.cfg.OutputFile != "" {
@@ -547,6 +579,9 @@ func (d *InteractiveDisplay) RenderInteractive(snapshot *models.Snapshot) {
 
 	var output strings.Builder
 
+	// Footer line width = session metrics panel width (always the widest)
+	footerWidth := sessionMetricsLineWidth(d.cfg)
+
 	// Header
 	d.renderHeader(&output, snapshot.Timestamp)
 
@@ -563,7 +598,7 @@ func (d *InteractiveDisplay) RenderInteractive(snapshot *models.Snapshot) {
 	d.renderSessionDetails(&output, snapshot.SessionDetails)
 
 	// Footer with instructions
-	d.renderInteractiveFooter(&output)
+	d.renderInteractiveFooter(&output, footerWidth)
 
 	// In raw terminal mode, we need to replace \n with \r\n for proper line breaks
 	outputStr := strings.ReplaceAll(output.String(), "\n", "\r\n")
@@ -574,13 +609,13 @@ func (d *InteractiveDisplay) RenderInteractive(snapshot *models.Snapshot) {
 	// Write to file if configured (use original output without \r)
 	if d.outputFile != nil {
 		d.outputFile.WriteString(output.String())
-		d.outputFile.WriteString("\n" + strings.Repeat("=", 120) + "\n\n")
+		d.outputFile.WriteString("\n" + strings.Repeat("=", footerWidth) + "\n\n")
 	}
 }
 
 // renderInteractiveFooter renders footer with keyboard instructions
-func (d *InteractiveDisplay) renderInteractiveFooter(out *strings.Builder) {
-	out.WriteString(strings.Repeat("-", 120))
+func (d *InteractiveDisplay) renderInteractiveFooter(out *strings.Builder, lineWidth int) {
+	out.WriteString(strings.Repeat("-", lineWidth))
 	out.WriteString("\n")
 	out.WriteString("Press: [a] Ad-hoc SQL | [s] Script/Cmd | [r] Read | [c] Copy | [f] Find | [h] Help | [q/ESC] Quit\n")
 }
