@@ -1,0 +1,5 @@
+Manifest-Version: 1.0
+Main-Class: com.yashan.sqlcollect.Main
+Created-By: sql-collect build.sh
+Build-Target-Java: 8
+Implementation-Version: 2.0.0-java

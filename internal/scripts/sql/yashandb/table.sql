@@ -7,7 +7,7 @@ col table_name         for   a25
 col l_t                for   a5
 col degree             for   a6
 col part               for   a4
-col LAST_ANALYZED      for   a25
+col LAST_ANALYZED      for   a19
 col NUM_ROWS           for   a10
 col blocks             for   a10
 col EMPTY_BLOCKS       for   a5
@@ -34,7 +34,7 @@ col Tablespacename     for   a15
          trunc((b.blocks*tp.block_size)/1024/1024) block_size,
          trunc((b.AVG_ROW_LEN*b.NUM_ROWS)/1024/1024) avg_size,
          b.STALE_STATS,
-         a.LAST_ANALYZED
+         TO_CHAR(a.LAST_ANALYZED, 'yyyy-mm-dd hh24:mi:ss') AS last_analyzed
     FROM dba_tables a
         , dba_tab_statistics b
         ,dba_tablespaces tp

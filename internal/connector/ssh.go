@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -538,54 +539,16 @@ func (c *SSHConnector) ExecuteCommandRealtime(ctx context.Context, command strin
 		session.Close()
 	}()
 
-	// Read stdout in real-time byte by byte for immediate display
+	// Read stdout with buffered I/O for efficiency and correctness.
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 1)
-		for {
-			n, err := stdout.Read(buf)
-			if n > 0 {
-				if buf[0] == '\n' {
-					os.Stdout.Write([]byte("\r\n"))
-					bufferMutex.Lock()
-					outputBuffer.WriteByte('\n')
-					bufferMutex.Unlock()
-				} else {
-					os.Stdout.Write(buf[:n])
-					bufferMutex.Lock()
-					outputBuffer.Write(buf[:n])
-					bufferMutex.Unlock()
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
+		streamPipeCRLF(stdout, os.Stdout, &outputBuffer, &bufferMutex)
 	}()
 
-	// Read stderr in real-time byte by byte for immediate display
+	// Read stderr with buffered I/O for efficiency and correctness.
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 1)
-		for {
-			n, err := stderr.Read(buf)
-			if n > 0 {
-				if buf[0] == '\n' {
-					os.Stderr.Write([]byte("\r\n"))
-					bufferMutex.Lock()
-					outputBuffer.WriteByte('\n')
-					bufferMutex.Unlock()
-				} else {
-					os.Stderr.Write(buf[:n])
-					bufferMutex.Lock()
-					outputBuffer.Write(buf[:n])
-					bufferMutex.Unlock()
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
+		streamPipeCRLF(stderr, os.Stderr, &outputBuffer, &bufferMutex)
 	}()
 
 	// Wait for command to complete (unblocked by command exit or context cancel)
@@ -1085,4 +1048,35 @@ func runSSHInitRemoteCmd(client *ssh.Client, addr, action, remoteCmd string) err
 
 	logger.Debug("[ssh-init] remote command succeeded, output: %s\n", strings.TrimSpace(string(output)))
 	return nil
+}
+
+// streamPipeCRLF reads from r until EOF, writes CRLF-converted output to terminal w,
+// and accumulates raw output in buf (protected by mu). Uses a 4KB read buffer for
+// efficient I/O instead of byte-by-byte reads.
+func streamPipeCRLF(r io.Reader, w io.Writer, buf *strings.Builder, mu *sync.Mutex) {
+	data := make([]byte, 4096)
+	for {
+		n, err := r.Read(data)
+		if n > 0 {
+			chunk := data[:n]
+			// Batch terminal output with LF→CRLF conversion to avoid many small writes.
+			termBuf := make([]byte, 0, len(chunk)*2)
+			for _, b := range chunk {
+				if b == '\n' {
+					termBuf = append(termBuf, '\r', '\n')
+				} else {
+					termBuf = append(termBuf, b)
+				}
+			}
+			w.Write(termBuf)
+
+			// Accumulate raw output (with original LF).
+			mu.Lock()
+			buf.Write(chunk)
+			mu.Unlock()
+		}
+		if err != nil {
+			return
+		}
+	}
 }

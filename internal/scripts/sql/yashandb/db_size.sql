@@ -1,5 +1,5 @@
 -- File Name: db_size.sql
--- Purpose: YashanDB tablespace — usage vs autoextend capacity (hypothetical)
+-- Purpose: YashanDB tablespace - usage vs autoextend capacity (hypothetical)
 -- Created: 20251208  by  huangtingzhong
 -- Note: Max_MB / %U_Auto / RemAuto answer: "if datafiles use autoextend, how full am I?"
 --       Per-file auto cap: MAXBYTES when AUTOEXTEND ON; else platform default

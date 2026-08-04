@@ -1,6 +1,12 @@
 -- File Name: we.sql
 -- Purpose: YashanDB Session wait and SQL overview
 -- Created: 20251201  by  huangtingzhong
+--
+-- Notes:
+--   LEFT JOIN gv$process: sessions with NULL paddr (e.g. DBMS_SCHEDULER jobs) still show.
+--   RUNNING DBA_SCHEDULER_JOBS enriched via action/module = job_name:
+--     EXEC_TIME falls back to last_start_date; thread_id falls back to DBMS_SCHEDULER
+--     process matched by start order within instance; PROGRAM falls back to job_name.
 
 col SID_TID           for a20
 col PROGRAM           for a30
@@ -47,35 +53,84 @@ FROM (
         x.client
     FROM (
         SELECT 
-            a.inst_id||'.'||a.sid||'.'||a.serial#||'.'||b.thread_id AS sid_tid,
+            a.inst_id||'.'||a.sid||'.'||a.serial#||'.'
+              ||NVL(TO_CHAR(NVL(b.thread_id, schd.thread_id)), '-') AS sid_tid,
             substr(a.wait_event,1,30) AS event,
             a.username AS username,
-            substr(a.cli_program,1,30) AS program,
+            substr(NVL(a.cli_program, NVL(j.job_name, a.module)),1,30) AS program,
             substr(c.command_name,1,3)||'.'||nvl(a.sql_id,a.sql_id) AS sql_id,
-            CAST(
-                CAST(SYSTIMESTAMP AS TIMESTAMP(6)) - CAST(a.exec_start_time AS TIMESTAMP(6))
-                AS INTERVAL DAY(9) TO SECOND(6)
-            ) AS exec_delta,
-            a.ip_address||'.'||a.ip_port AS client
-        FROM gv$session a, gv$process b, v$SQLCOMMAND c  
-        WHERE a.inst_id = b.inst_id 
-          AND a.paddr = b.thread_addr  
-          AND a.command = c.command_type(+)
-          AND a.TYPE NOT IN ('BACKGROUND')
-          AND a.status NOT IN ('INACTIVE') 
+            CASE
+                WHEN a.exec_start_time IS NOT NULL THEN
+                    CAST(
+                        CAST(SYSTIMESTAMP AS TIMESTAMP(6))
+                          - CAST(a.exec_start_time AS TIMESTAMP(6))
+                        AS INTERVAL DAY(9) TO SECOND(6)
+                    )
+                WHEN j.last_start_date IS NOT NULL THEN
+                    CAST(
+                        CAST(SYSTIMESTAMP AS TIMESTAMP(6))
+                          - CAST(j.last_start_date AS TIMESTAMP(6))
+                        AS INTERVAL DAY(9) TO SECOND(6)
+                    )
+                ELSE NULL
+            END AS exec_delta,
+            CASE
+                WHEN a.ip_address IS NULL THEN NULL
+                ELSE a.ip_address||'.'||a.ip_port
+            END AS client
+        FROM gv$session a
+        LEFT JOIN gv$process b
+          ON a.inst_id = b.inst_id
+         AND a.paddr = b.thread_addr
+        LEFT JOIN (
+            SELECT
+                job_name,
+                running_instance,
+                last_start_date,
+                ROW_NUMBER() OVER (
+                    PARTITION BY NVL(running_instance, 1)
+                    ORDER BY last_start_date, job_name
+                ) AS rn
+            FROM dba_scheduler_jobs
+            WHERE state = 'RUNNING'
+        ) j
+          ON a.inst_id = NVL(j.running_instance, a.inst_id)
+         AND (
+                (a.action IS NOT NULL AND a.action = j.job_name)
+             OR (a.module IS NOT NULL AND a.module = j.job_name)
+         )
+        LEFT JOIN (
+            SELECT
+                inst_id,
+                thread_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY inst_id
+                    ORDER BY start_time, thread_id
+                ) AS rn
+            FROM gv$process
+            WHERE name = 'DBMS_SCHEDULER'
+        ) schd
+          ON schd.inst_id = a.inst_id
+         AND j.job_name IS NOT NULL
+         AND schd.rn = j.rn
+        LEFT JOIN v$sqlcommand c
+          ON a.command = c.command_type
+        WHERE a.TYPE NOT IN ('BACKGROUND')
+          AND NVL(NULLIF(TRIM(a.status), ''), 'ACTIVE') NOT IN ('INACTIVE')
           AND NOT (a.INST_ID = TO_NUMBER(SYS_CONTEXT('USERENV', 'INSTANCE'))
            AND a.SID = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')))
     ) x
-    ORDER BY exec_ms DESC
+    ORDER BY exec_ms DESC NULLS LAST
 )
 /
 
 SELECT 
       a.inst_id,a.sql_id,a.wait_event,count(*) hcount 
 FROM gv$session a 
-WHERE a.status NOT IN ('INACTIVE')  AND a.TYPE NOT IN ('BACKGROUND') 
-      AND NOT (a.INST_ID = TO_NUMBER(SYS_CONTEXT('USERENV', 'INSTANCE'))
-       AND a.SID = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')))
+WHERE NVL(NULLIF(TRIM(a.status), ''), 'ACTIVE') NOT IN ('INACTIVE')
+  AND a.TYPE NOT IN ('BACKGROUND') 
+  AND NOT (a.INST_ID = TO_NUMBER(SYS_CONTEXT('USERENV', 'INSTANCE'))
+   AND a.SID = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')))
 GROUP BY  inst_id,sql_id,wait_event HAVING count(*) >1
 ORDER BY hcount
 /

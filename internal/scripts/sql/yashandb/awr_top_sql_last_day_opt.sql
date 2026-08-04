@@ -29,6 +29,8 @@ DECLARE
     full_seg_objs t_obj_tab := t_obj_tab();
     in_list_plan   VARCHAR2(32767);
     in_list_table  VARCHAR2(32767);
+    uv_table       VARCHAR2(32767);
+    uv_plan        VARCHAR2(32767);
     in_list_index  VARCHAR2(32767);
     in_list_seg    VARCHAR2(32767);
     -- all TOP SQL_IDs for object and perf queries
@@ -40,6 +42,17 @@ DECLARE
     phv_list       t_phv_tab := t_phv_tab();
     phv            VARCHAR2(40);
     v_ord_seq      NUMBER := 0;
+    w_id           NUMBER;
+    w_pid          NUMBER;
+    w_ord          NUMBER;
+    w_op           NUMBER;
+    w_name         NUMBER;
+    w_rows         NUMBER;
+    w_cost         NUMBER;
+    w_time         NUMBER;
+    c_max_text     CONSTANT NUMBER := 120;
+    v_op_txt       VARCHAR2(4000);
+    v_name_txt     VARCHAR2(4000);
     v_display_pid  NUMBER;
     TYPE t_ord_map IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
     TYPE t_plan_rec IS RECORD (
@@ -127,15 +140,15 @@ DECLARE
     END fmt_num_kw;
 
     -- time input in microseconds, output ms/s/m/h per exec
-    FUNCTION fmt_time_us(p_us NUMBER) RETURN VARCHAR2 IS
+        FUNCTION fmt_time_us(p_us NUMBER) RETURN VARCHAR2 IS
         v_ms NUMBER;
     BEGIN
         IF p_us IS NULL THEN RETURN NULL; END IF;
         v_ms := p_us / 1000;  -- microseconds to milliseconds
         IF v_ms < 1000 THEN RETURN ROUND(v_ms, 2) || 'ms'; END IF;
-        IF v_ms/60 < 60 THEN RETURN ROUND(v_ms/60, 2) || 's'; END IF;
-        IF v_ms/60/60 < 60 THEN RETURN ROUND(v_ms/60/60, 2) || 'm'; END IF;
-        RETURN ROUND(v_ms/60/60/60, 2) || 'h';
+        IF v_ms/1000 < 60 THEN RETURN ROUND(v_ms/1000, 2) || 's'; END IF;
+        IF v_ms/1000/60 < 60 THEN RETURN ROUND(v_ms/1000/60, 2) || 'm'; END IF;
+        RETURN ROUND(v_ms/1000/60/60, 2) || 'h';
     END fmt_time_us;
 
     FUNCTION find_tab_access_parent(p_id NUMBER, p_parent_id NUMBER) RETURN NUMBER IS
@@ -158,13 +171,22 @@ DECLARE
 
     PROCEDURE load_plan_rows(p_sql VARCHAR2, p_phv VARCHAR2) IS
     BEGIN
+        -- One row per id for this PHV (collapse multi-child / multi-address copies)
         SELECT id, parent_id, position, operation, options
           BULK COLLECT INTO g_plan_rows
-          FROM v$sql_plan
-         WHERE sql_id = p_sql
-           AND TO_CHAR(plan_hash_value) = p_phv
-           AND id IS NOT NULL
-           AND operation IS NOT NULL;
+          FROM (
+            SELECT id, parent_id, position, operation, options,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY id
+                     ORDER BY child_number NULLS LAST, child_address, address
+                   ) AS rn
+              FROM v$sql_plan
+             WHERE sql_id = p_sql
+               AND TO_CHAR(plan_hash_value) = p_phv
+               AND id IS NOT NULL
+               AND operation IS NOT NULL
+          )
+         WHERE rn = 1;
     END load_plan_rows;
 
     PROCEDURE build_display_parent IS
@@ -237,6 +259,21 @@ DECLARE
         END LOOP;
     END walk_plan_ord;
 
+    FUNCTION grow_w(p_cur NUMBER, p_txt VARCHAR2) RETURN NUMBER IS
+    BEGIN
+        RETURN GREATEST(NVL(p_cur, 0), NVL(LENGTH(p_txt), 0));
+    END grow_w;
+
+    FUNCTION cell_l(p_txt VARCHAR2, p_w NUMBER) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN LPAD(SUBSTR(NVL(p_txt, ' '), 1, p_w), p_w);
+    END cell_l;
+
+    FUNCTION cell_r(p_txt VARCHAR2, p_w NUMBER) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN RPAD(SUBSTR(NVL(p_txt, ' '), 1, p_w), p_w);
+    END cell_r;
+
 BEGIN
     DBMS_OUTPUT.ENABLE(1000000);
     DBMS_OUTPUT.PUT_LINE('collect_top: start, v_top_n=' || v_top_n);
@@ -276,8 +313,17 @@ BEGIN
                 in_list_plan := in_list_plan || '(''' || REPLACE(plan_objs(i).obj_owner, '''', '''''') || ''',''' || REPLACE(plan_objs(i).obj_name, '''', '''''') || ''')';
             END LOOP;
         END IF;
+        -- Build dual-union for plan objects (small-set drive; avoid IN semi-join on dba_indexes)
+        uv_plan := 'SELECT CAST(NULL AS VARCHAR2(128)) AS owner, CAST(NULL AS VARCHAR2(128)) AS name FROM dual WHERE 1=0';
+        IF plan_objs IS NOT NULL AND plan_objs.COUNT > 0 THEN
+            uv_plan := '';
+            FOR i IN 1..plan_objs.COUNT LOOP
+                IF i > 1 THEN uv_plan := uv_plan || ' UNION ALL '; END IF;
+                uv_plan := uv_plan || 'SELECT ''' || REPLACE(plan_objs(i).obj_owner, '''', '''''') || ''' AS owner, ''' || REPLACE(plan_objs(i).obj_name, '''', '''''') || ''' AS name FROM dual';
+            END LOOP;
+        END IF;
         EXECUTE IMMEDIATE
-            'SELECT DISTINCT table_owner, table_name FROM dba_indexes WHERE (owner, index_name) IN (' || in_list_plan || ')'
+            'SELECT DISTINCT i.table_owner, i.table_name FROM dba_indexes i JOIN (' || uv_plan || ') p ON i.owner = p.owner AND i.index_name = p.name'
             BULK COLLECT INTO table_objs_idx;
         table_objs := table_objs_idx;
         FOR i IN 1..plan_objs.COUNT LOOP
@@ -297,15 +343,21 @@ BEGIN
             END;
         END LOOP;
         in_list_table := '(NULL,NULL)';
+        uv_table := 'SELECT CAST(NULL AS VARCHAR2(128)) AS owner, CAST(NULL AS VARCHAR2(128)) AS table_name FROM dual WHERE 1=0';
         IF table_objs IS NOT NULL AND table_objs.COUNT > 0 THEN
             in_list_table := '';
+            uv_table := '';
             FOR i IN 1..table_objs.COUNT LOOP
-                IF i > 1 THEN in_list_table := in_list_table || ','; END IF;
+                IF i > 1 THEN
+                    in_list_table := in_list_table || ',';
+                    uv_table := uv_table || ' UNION ALL ';
+                END IF;
                 in_list_table := in_list_table || '(''' || REPLACE(table_objs(i).obj_owner, '''', '''''') || ''',''' || REPLACE(table_objs(i).obj_name, '''', '''''') || ''')';
+                uv_table := uv_table || 'SELECT ''' || REPLACE(table_objs(i).obj_owner, '''', '''''') || ''' AS owner, ''' || REPLACE(table_objs(i).obj_name, '''', '''''') || ''' AS table_name FROM dual';
             END LOOP;
         END IF;
         EXECUTE IMMEDIATE
-            'SELECT i.OWNER, i.INDEX_NAME, i.status, i.PARTITIONED FROM DBA_INDEXES i WHERE (i.TABLE_OWNER, i.TABLE_NAME) IN (' || in_list_table || ') AND i.status NOT IN (''VALID'')'
+            'SELECT i.OWNER, i.INDEX_NAME, i.status, i.PARTITIONED FROM DBA_INDEXES i JOIN (' || uv_table || ') x ON i.TABLE_OWNER = x.owner AND i.TABLE_NAME = x.table_name WHERE i.status NOT IN (''VALID'')'
             BULK COLLECT INTO index_objs;
         in_list_index := NULL;
         FOR ix IN 1..NVL(index_objs.COUNT, 0) LOOP
@@ -400,50 +452,128 @@ BEGIN
             v_ord_seq := v_ord_seq + 1;
             g_ord(0) := v_ord_seq;
 
-            DBMS_OUTPUT.PUT_LINE('|' || LPAD('Id', 4) || '|' || LPAD('Pid', 4) || '|' || LPAD('Ord', 4) || '|' ||
-                                 RPAD('Operation', 39) || '|' || RPAD('Name', 29) || '|' ||
-                                 RPAD('Rows', 11) || '|' || RPAD('Cost', 9) || '|' || RPAD('Time', 9) || '|');
-            DBMS_OUTPUT.PUT_LINE('|' || LPAD('-', 4, '-') || '|' || LPAD('-', 4, '-') || '|' || LPAD('-', 4, '-') || '|' ||
-                                 RPAD('-', 39, '-') || '|' || RPAD('-', 29, '-') || '|' ||
-                                 LPAD('-', 11, '-') || '|' || LPAD('-', 9, '-') || '|' || LPAD('-', 9, '-') || '|');
+
+            -- Pass 1: measure column widths for this plan
+            w_id   := LENGTH('Id');
+            w_pid  := LENGTH('Pid');
+            w_ord  := LENGTH('Ord');
+            w_op   := LENGTH('Operation');
+            w_name := LENGTH('Name');
+            w_rows := LENGTH('Rows');
+            w_cost := LENGTH('Cost');
+            w_time := LENGTH('Time');
             FOR det IN (
                 SELECT id, parent_id, depth, position, operation, options, object_owner, object_name, object_type,
-                       cost, cardinality, bytes, access_predicates, filter_predicates, partition_start, partition_stop,
+                       cost, cardinality, access_predicates, filter_predicates, partition_start, partition_stop,
                        time AS plan_time
                   FROM v$sql_plan
                  WHERE sql_id = v_sql_id
                    AND TO_CHAR(plan_hash_value) = phv
                    AND id IS NOT NULL
                    AND operation IS NOT NULL
+                   AND child_number = (
+                         SELECT MIN(sp2.child_number)
+                           FROM v$sql_plan sp2
+                          WHERE sp2.sql_id = v_sql_id
+                            AND TO_CHAR(sp2.plan_hash_value) = phv
+                       )
                  ORDER BY id
             ) LOOP
-                v_line := '|' || LPAD(NVL(TO_CHAR(det.id), ' '), 4) || '|' ||
-                          LPAD(CASE WHEN g_disp_parent(det.id) IS NULL
-                                    THEN ' ' ELSE TO_CHAR(g_disp_parent(det.id)) END, 4) || '|' ||
-                          LPAD(TO_CHAR(g_ord(det.id)), 4) || '|' ||
-                          RPAD(SUBSTR(LPAD(' ', det.depth*2) || det.operation || NVL(' '||det.options,'') || NVL(' ('||det.object_name||')',''), 1, 39), 39) || '|' ||
-                          RPAD(SUBSTR(NVL(det.object_owner||'.'||det.object_name, ' '), 1, 29), 29) || '|' ||
-                          RPAD(NVL(TO_CHAR(det.cardinality), ' '), 11) || '|' ||
-                          RPAD(NVL(TO_CHAR(det.cost), ' '), 9) || '|' ||
-                          RPAD(NVL(TO_CHAR(det.plan_time), ' '), 9) || '|';
-                DBMS_OUTPUT.PUT_LINE(SUBSTR(NVL(v_line, ' '), 1, 32000));
+                v_op_txt := LPAD(' ', det.depth*2) || det.operation || NVL(' '||det.options,'');
+                IF det.object_name IS NOT NULL THEN
+                    v_name_txt := det.object_owner||'.'||det.object_name;
+                    IF det.object_type IS NOT NULL THEN
+                        v_name_txt := v_name_txt || ' [' || det.object_type || ']';
+                    END IF;
+                ELSE
+                    v_name_txt := '';
+                END IF;
+                w_id   := grow_w(w_id, TO_CHAR(det.id));
+                IF g_disp_parent(det.id) IS NOT NULL THEN
+                    w_pid := grow_w(w_pid, TO_CHAR(g_disp_parent(det.id)));
+                END IF;
+                w_ord  := grow_w(w_ord, TO_CHAR(g_ord(det.id)));
+                w_op   := grow_w(w_op, v_op_txt);
+                w_name := grow_w(w_name, v_name_txt);
+                w_rows := grow_w(w_rows, TO_CHAR(det.cardinality));
+                w_cost := grow_w(w_cost, TO_CHAR(det.cost));
+                w_time := grow_w(w_time, TO_CHAR(det.plan_time));
                 IF LENGTH(TRIM(NVL(det.access_predicates, ''))) > 0 THEN
-                    DBMS_OUTPUT.PUT_LINE(SUBSTR('|' || LPAD(' ', 4) || '|' || LPAD(' ', 4) || '|' || LPAD(' ', 4) || '|' ||
-                                              RPAD('  -> Access: ' || SUBSTR(det.access_predicates, 1, 26), 39) || '|' ||
-                                              RPAD(' ', 29) || '|' || RPAD(' ', 11) || '|' || RPAD(' ', 9) || '|' || RPAD(' ', 9) || '|', 1, 32000));
+                    w_op := grow_w(w_op, '  -> Access: ' || det.access_predicates);
                 END IF;
                 IF LENGTH(TRIM(NVL(det.filter_predicates, ''))) > 0 THEN
-                    DBMS_OUTPUT.PUT_LINE(SUBSTR('|' || LPAD(' ', 4) || '|' || LPAD(' ', 4) || '|' || LPAD(' ', 4) || '|' ||
-                                              RPAD('  -> Filter: ' || SUBSTR(det.filter_predicates, 1, 26), 39) || '|' ||
-                                              RPAD(' ', 29) || '|' || RPAD(' ', 11) || '|' || RPAD(' ', 9) || '|' || RPAD(' ', 9) || '|', 1, 32000));
+                    w_op := grow_w(w_op, '  -> Filter: ' || det.filter_predicates);
                 END IF;
                 IF NVL(det.partition_start, 0) <> 0 OR NVL(det.partition_stop, 0) <> 0 THEN
-                    DBMS_OUTPUT.PUT_LINE(SUBSTR('|' || LPAD(' ', 4) || '|' || LPAD(' ', 4) || '|' || LPAD(' ', 4) || '|' ||
-                                              RPAD('  -> Partition: ' || NVL(TO_CHAR(det.partition_start), '?') || '..' ||
-                                                   NVL(TO_CHAR(det.partition_stop), '?'), 39) || '|' ||
-                                              RPAD(' ', 29) || '|' || RPAD(' ', 11) || '|' || RPAD(' ', 9) || '|' || RPAD(' ', 9) || '|', 1, 32000));
+                    w_op := grow_w(w_op, '  -> Partition: ' || NVL(TO_CHAR(det.partition_start), '?') || '..' ||
+                                         NVL(TO_CHAR(det.partition_stop), '?'));
                 END IF;
             END LOOP;
+            w_op   := LEAST(w_op, c_max_text);
+            w_name := LEAST(w_name, c_max_text);
+
+            DBMS_OUTPUT.PUT_LINE('|' || cell_l('Id', w_id) || '|' || cell_l('Pid', w_pid) || '|' || cell_l('Ord', w_ord) || '|' ||
+                                 cell_r('Operation', w_op) || '|' || cell_r('Name', w_name) || '|' ||
+                                 cell_r('Rows', w_rows) || '|' || cell_r('Cost', w_cost) || '|' || cell_r('Time', w_time) || '|');
+            DBMS_OUTPUT.PUT_LINE('|' || LPAD('-', w_id, '-') || '|' || LPAD('-', w_pid, '-') || '|' || LPAD('-', w_ord, '-') || '|' ||
+                                 RPAD('-', w_op, '-') || '|' || RPAD('-', w_name, '-') || '|' ||
+                                 RPAD('-', w_rows, '-') || '|' || RPAD('-', w_cost, '-') || '|' || RPAD('-', w_time, '-') || '|');
+
+            -- Pass 2: print with measured widths
+            FOR det IN (
+                SELECT id, parent_id, depth, position, operation, options, object_owner, object_name, object_type,
+                       cost, cardinality, access_predicates, filter_predicates, partition_start, partition_stop,
+                       time AS plan_time
+                  FROM v$sql_plan
+                 WHERE sql_id = v_sql_id
+                   AND TO_CHAR(plan_hash_value) = phv
+                   AND id IS NOT NULL
+                   AND operation IS NOT NULL
+                   AND child_number = (
+                         SELECT MIN(sp2.child_number)
+                           FROM v$sql_plan sp2
+                          WHERE sp2.sql_id = v_sql_id
+                            AND TO_CHAR(sp2.plan_hash_value) = phv
+                       )
+                 ORDER BY id
+            ) LOOP
+                v_op_txt := LPAD(' ', det.depth*2) || det.operation || NVL(' '||det.options,'');
+                IF det.object_name IS NOT NULL THEN
+                    v_name_txt := det.object_owner||'.'||det.object_name;
+                    IF det.object_type IS NOT NULL THEN
+                        v_name_txt := v_name_txt || ' [' || det.object_type || ']';
+                    END IF;
+                ELSE
+                    v_name_txt := '';
+                END IF;
+                v_line := '|' || cell_l(NVL(TO_CHAR(det.id), ' '), w_id) || '|' ||
+                          cell_l(CASE WHEN g_disp_parent(det.id) IS NULL
+                                      THEN ' ' ELSE TO_CHAR(g_disp_parent(det.id)) END, w_pid) || '|' ||
+                          cell_l(TO_CHAR(g_ord(det.id)), w_ord) || '|' ||
+                          cell_r(v_op_txt, w_op) || '|' ||
+                          cell_r(v_name_txt, w_name) || '|' ||
+                          cell_r(TO_CHAR(det.cardinality), w_rows) || '|' ||
+                          cell_r(TO_CHAR(det.cost), w_cost) || '|' ||
+                          cell_r(TO_CHAR(det.plan_time), w_time) || '|';
+                DBMS_OUTPUT.PUT_LINE(SUBSTR(NVL(v_line, ' '), 1, 32000));
+                IF LENGTH(TRIM(NVL(det.access_predicates, ''))) > 0 THEN
+                    DBMS_OUTPUT.PUT_LINE(SUBSTR('|' || cell_l(' ', w_id) || '|' || cell_l(' ', w_pid) || '|' || cell_l(' ', w_ord) || '|' ||
+                                              cell_r('  -> Access: ' || det.access_predicates, w_op) || '|' ||
+                                              cell_r(' ', w_name) || '|' || cell_r(' ', w_rows) || '|' || cell_r(' ', w_cost) || '|' || cell_r(' ', w_time) || '|', 1, 32000));
+                END IF;
+                IF LENGTH(TRIM(NVL(det.filter_predicates, ''))) > 0 THEN
+                    DBMS_OUTPUT.PUT_LINE(SUBSTR('|' || cell_l(' ', w_id) || '|' || cell_l(' ', w_pid) || '|' || cell_l(' ', w_ord) || '|' ||
+                                              cell_r('  -> Filter: ' || det.filter_predicates, w_op) || '|' ||
+                                              cell_r(' ', w_name) || '|' || cell_r(' ', w_rows) || '|' || cell_r(' ', w_cost) || '|' || cell_r(' ', w_time) || '|', 1, 32000));
+                END IF;
+                IF NVL(det.partition_start, 0) <> 0 OR NVL(det.partition_stop, 0) <> 0 THEN
+                    DBMS_OUTPUT.PUT_LINE(SUBSTR('|' || cell_l(' ', w_id) || '|' || cell_l(' ', w_pid) || '|' || cell_l(' ', w_ord) || '|' ||
+                                              cell_r('  -> Partition: ' || NVL(TO_CHAR(det.partition_start), '?') || '..' ||
+                                                   NVL(TO_CHAR(det.partition_stop), '?'), w_op) || '|' ||
+                                              cell_r(' ', w_name) || '|' || cell_r(' ', w_rows) || '|' || cell_r(' ', w_cost) || '|' || cell_r(' ', w_time) || '|', 1, 32000));
+                END IF;
+            END LOOP;
+
             DBMS_OUTPUT.PUT_LINE('============================================================================');
         END LOOP;
 
@@ -617,7 +747,7 @@ BEGIN
         put_line( '****************************************************************************************');
         put_line( 'TABLES');
         put_line( '****************************************************************************************');
-        put_line(RPAD('OWNER',15) || RPAD('TABLE_NAME',25) || RPAD('L_T',5) || RPAD('DEGREE',7) || RPAD('PART',5) || RPAD('NUM_ROWS',10) || RPAD('BLOCKS',10) || RPAD('EMPTY_BLOCKS',13) || RPAD('AVG_SPACE',11) || RPAD('AVG_ROW_LEN',12) || RPAD('BLOCK_SIZE',11) || RPAD('AVG_SIZE',10) || RPAD('STALE_STATS',12) || RPAD('LAST_ANALYZED',25));
+        put_line(RPAD('OWNER',15) || RPAD('TABLE_NAME',25) || RPAD('L_T',5) || RPAD('DEGREE',7) || RPAD('PART',5) || RPAD('NUM_ROWS',10) || RPAD('BLOCKS',10) || RPAD('EMPTY_BLOCKS',13) || RPAD('AVG_SPACE',11) || RPAD('AVG_ROW_LEN',12) || RPAD('BLOCK_SIZE',11) || RPAD('AVG_SIZE',10) || RPAD('STALE_STATS',12) || RPAD('LAST_ANALYZED',19));
 
         DECLARE
             TYPE tbl_rec IS RECORD (owner VARCHAR2(128), table_name VARCHAR2(128), l_t VARCHAR2(20), degree VARCHAR2(40), part VARCHAR2(3), num_rows VARCHAR2(40), blocks VARCHAR2(40), empty_blocks VARCHAR2(40), avg_space VARCHAR2(40), avg_row_len VARCHAR2(40), block_size VARCHAR2(40), avg_size VARCHAR2(40), stale_stats VARCHAR2(20), last_analyzed DATE);
@@ -625,10 +755,10 @@ BEGIN
             tbl_coll tbl_tab;
         BEGIN
             EXECUTE IMMEDIATE
-                'SELECT a.owner, a.TABLE_NAME, a.LOGGING||''.''||a.TEMPORARY AS l_t, LTRIM(a.DEGREE) AS degree, a.PARTITIONED AS part, a.NUM_ROWS||'''' AS num_rows, a.BLOCKS||'''' AS blocks, a.EMPTY_BLOCKS||'''' AS empty_blocks, b.AVG_SPACE||'''' AS avg_space, b.AVG_ROW_LEN||'''' AS avg_row_len, TO_CHAR(TRUNC((b.blocks*tp.block_size)/1024/1024)) AS block_size, TO_CHAR(TRUNC((b.AVG_ROW_LEN*b.NUM_ROWS)/1024/1024)) AS avg_size, b.STALE_STATS||'''' AS stale_stats, a.LAST_ANALYZED FROM DBA_TABLES a, dba_tab_statistics b, dba_tablespaces tp WHERE (a.OWNER, a.TABLE_NAME) IN (' || in_list_table || ') AND a.owner = b.owner(+) AND a.table_name = b.table_name(+) AND a.tablespace_name = tp.tablespace_name ORDER BY a.owner, a.table_name'
+                'SELECT a.owner, a.TABLE_NAME, a.LOGGING||''.''||a.TEMPORARY AS l_t, LTRIM(a.DEGREE) AS degree, a.PARTITIONED AS part, a.NUM_ROWS||'''' AS num_rows, a.BLOCKS||'''' AS blocks, a.EMPTY_BLOCKS||'''' AS empty_blocks, b.AVG_SPACE||'''' AS avg_space, b.AVG_ROW_LEN||'''' AS avg_row_len, TO_CHAR(TRUNC((b.blocks*tp.block_size)/1024/1024)) AS block_size, TO_CHAR(TRUNC((b.AVG_ROW_LEN*b.NUM_ROWS)/1024/1024)) AS avg_size, b.STALE_STATS||'''' AS stale_stats, a.LAST_ANALYZED FROM (' || uv_table || ') x JOIN DBA_TABLES a ON a.owner = x.owner AND a.table_name = x.table_name LEFT JOIN dba_tab_statistics b ON b.owner = a.owner AND b.table_name = a.table_name AND b.object_type = ''TABLE'' LEFT JOIN dba_tablespaces tp ON tp.tablespace_name = a.tablespace_name ORDER BY a.owner, a.table_name'
                 BULK COLLECT INTO tbl_coll;
             FOR i IN 1..NVL(tbl_coll.COUNT, 0) LOOP
-                v_line := RPAD(SUBSTR(NVL(tbl_coll(i).owner,' '),1,15),15) || RPAD(SUBSTR(NVL(tbl_coll(i).table_name,' '),1,25),25) || RPAD(SUBSTR(NVL(tbl_coll(i).l_t,' '),1,5),5) || RPAD(SUBSTR(NVL(tbl_coll(i).degree,' '),1,7),7) || RPAD(SUBSTR(NVL(tbl_coll(i).part,' '),1,5),5) || RPAD(SUBSTR(NVL(tbl_coll(i).num_rows,' '),1,10),10) || RPAD(SUBSTR(NVL(tbl_coll(i).blocks,' '),1,10),10) || RPAD(SUBSTR(NVL(tbl_coll(i).empty_blocks,' '),1,13),13) || RPAD(SUBSTR(NVL(tbl_coll(i).avg_space,' '),1,11),11) || RPAD(SUBSTR(NVL(tbl_coll(i).avg_row_len,' '),1,12),12) || RPAD(SUBSTR(NVL(tbl_coll(i).block_size,' '),1,11),11) || RPAD(SUBSTR(NVL(tbl_coll(i).avg_size,' '),1,10),10) || RPAD(SUBSTR(NVL(tbl_coll(i).stale_stats,' '),1,12),12) || RPAD(SUBSTR(NVL(TO_CHAR(tbl_coll(i).last_analyzed,'yyyy-mm-dd hh24:mi:ss'),' '),1,25),25);
+                v_line := RPAD(SUBSTR(NVL(tbl_coll(i).owner,' '),1,15),15) || RPAD(SUBSTR(NVL(tbl_coll(i).table_name,' '),1,25),25) || RPAD(SUBSTR(NVL(tbl_coll(i).l_t,' '),1,5),5) || RPAD(SUBSTR(NVL(tbl_coll(i).degree,' '),1,7),7) || RPAD(SUBSTR(NVL(tbl_coll(i).part,' '),1,5),5) || RPAD(SUBSTR(NVL(tbl_coll(i).num_rows,' '),1,10),10) || RPAD(SUBSTR(NVL(tbl_coll(i).blocks,' '),1,10),10) || RPAD(SUBSTR(NVL(tbl_coll(i).empty_blocks,' '),1,13),13) || RPAD(SUBSTR(NVL(tbl_coll(i).avg_space,' '),1,11),11) || RPAD(SUBSTR(NVL(tbl_coll(i).avg_row_len,' '),1,12),12) || RPAD(SUBSTR(NVL(tbl_coll(i).block_size,' '),1,11),11) || RPAD(SUBSTR(NVL(tbl_coll(i).avg_size,' '),1,10),10) || RPAD(SUBSTR(NVL(tbl_coll(i).stale_stats,' '),1,12),12) || RPAD(SUBSTR(NVL(TO_CHAR(tbl_coll(i).last_analyzed,'yyyy-mm-dd hh24:mi:ss'),' '),1,19),19);
                 put_line(v_line);
             END LOOP;
         END;
@@ -637,7 +767,7 @@ BEGIN
         put_line( '****************************************************************************************');
         put_line( 'TABLE COLUMNS');
         put_line( '****************************************************************************************');
-        put_line(RPAD('OWNER',15) || ' ' || RPAD('TABLE_NAME',25) || ' ' || RPAD('COLUMN_NAME',15) || ' ' || RPAD('D_TYPE',20) || ' ' || RPAD('NUM_DISTINCT',13) || ' ' || RPAD('N',2) || ' ' || RPAD('NUM_NULLS',10) || ' ' || RPAD('DENSITY',14) || ' ' || RPAD('NUM_BUCKETS',12) || ' ' || RPAD('AVG_COL_LEN',12) || ' ' || RPAD('SAMPLE_SIZE',12) || ' ' || RPAD('HISTOGRAM',10) || ' ' || RPAD('LAST_ANALYZED',13));
+        put_line(RPAD('OWNER',15) || ' ' || RPAD('TABLE_NAME',25) || ' ' || RPAD('COLUMN_NAME',15) || ' ' || RPAD('D_TYPE',20) || ' ' || RPAD('NUM_DISTINCT',13) || ' ' || RPAD('N',2) || ' ' || RPAD('NUM_NULLS',10) || ' ' || RPAD('DENSITY',14) || ' ' || RPAD('NUM_BUCKETS',12) || ' ' || RPAD('AVG_COL_LEN',12) || ' ' || RPAD('SAMPLE_SIZE',12) || ' ' || RPAD('HISTOGRAM',10) || ' ' || RPAD('LAST_ANALYZED',19));
 
         DECLARE
             TYPE col_rec IS RECORD (owner VARCHAR2(128), table_name VARCHAR2(128), column_name VARCHAR2(128), d_type VARCHAR2(64), num_distinct VARCHAR2(40), n VARCHAR2(10), num_nulls VARCHAR2(40), density VARCHAR2(40), num_buckets VARCHAR2(40), avg_col_len VARCHAR2(40), sample_size VARCHAR2(40), histogram VARCHAR2(10), last_analyzed DATE);
@@ -645,7 +775,7 @@ BEGIN
             col_coll col_tab;
         BEGIN
             EXECUTE IMMEDIATE
-                'SELECT a.OWNER, a.TABLE_NAME, a.COLUMN_NAME, a.data_type||''(''||a.data_length||'')'' AS d_type, b.NUM_DISTINCT||'''' AS num_distinct, a.NULLABLE||'''' AS n, b.NUM_NULLS||'''' AS num_nulls, SUBSTR(NVL(TO_CHAR(b.DENSITY,''FM999999999990.999999999999''),'' ''),1,14) AS density, b.NUM_BUCKETS||'''' AS num_buckets, b.AVG_COL_LEN||'''' AS avg_col_len, b.sample_size||'''' AS sample_size, SUBSTR(b.HISTOGRAM,1,5) AS histogram, b.LAST_ANALYZED FROM DBA_TAB_COLS a, DBA_TAB_COL_STATISTICS b WHERE (a.OWNER, a.TABLE_NAME) IN (' || in_list_table || ') AND a.owner = b.owner(+) AND a.table_name = b.table_name(+) AND a.column_name = b.column_name(+) ORDER BY a.owner, a.table_name, a.COLUMN_ID'
+                'SELECT a.OWNER, a.TABLE_NAME, a.COLUMN_NAME, a.data_type||''(''||a.data_length||'')'' AS d_type, b.NUM_DISTINCT||'''' AS num_distinct, a.NULLABLE||'''' AS n, b.NUM_NULLS||'''' AS num_nulls, SUBSTR(NVL(TO_CHAR(b.DENSITY,''FM999999999990.999999999999''),'' ''),1,14) AS density, b.NUM_BUCKETS||'''' AS num_buckets, b.AVG_COL_LEN||'''' AS avg_col_len, b.sample_size||'''' AS sample_size, SUBSTR(b.HISTOGRAM,1,5) AS histogram, b.LAST_ANALYZED FROM (' || uv_table || ') x JOIN DBA_TAB_COLS a ON a.owner = x.owner AND a.table_name = x.table_name LEFT JOIN DBA_TAB_COL_STATISTICS b ON b.owner = a.owner AND b.table_name = a.table_name AND b.column_name = a.column_name ORDER BY a.owner, a.table_name, a.COLUMN_ID'
                 BULK COLLECT INTO col_coll;
             FOR i IN 1..NVL(col_coll.COUNT, 0) LOOP
                 v_line := RPAD(SUBSTR(NVL(col_coll(i).owner,' '),1,15),15) || ' '
@@ -660,7 +790,7 @@ BEGIN
                     || RPAD(SUBSTR(NVL(col_coll(i).avg_col_len,' '),1,12),12) || ' '
                     || RPAD(SUBSTR(NVL(col_coll(i).sample_size,' '),1,12),12) || ' '
                     || RPAD(SUBSTR(NVL(col_coll(i).histogram,' '),1,10),10) || ' '
-                    || RPAD(SUBSTR(NVL(TO_CHAR(col_coll(i).last_analyzed,'yyyy-mm-dd'),' '),1,13),13);
+                    || RPAD(SUBSTR(NVL(TO_CHAR(col_coll(i).last_analyzed,'yyyy-mm-dd hh24:mi:ss'),' '),1,19),19);
                 put_line(v_line);
             END LOOP;
         END;
@@ -710,7 +840,7 @@ BEGIN
             idx2_coll idx2_tab;
         BEGIN
             EXECUTE IMMEDIATE
-                'SELECT A.TABLE_OWNER, A.TABLE_NAME, A.INDEX_NAME, DECODE(A.UNIQUENESS,''UNIQUE'',''U'',''NONUNIQUE'',''N'',''O'')||DECODE(A.COMPRESSION,''ENABLED'',''E'',''DISABLED'',''N'',''O'')||DECODE(A.PARTITIONED,''YES'',''Y'',''NO'',''N'',''O'')||DECODE(A.TEMPORARY,''Y'',''Y'',''N'',''N'',''O'')||DECODE(A.VISIBILITY,''VISIBLE'',''V'',''INVISIBLE'',''I'',''O'') AS ucptv, B.COLUMN_NAME, B.COLUMN_POSITION, B.DESCEND FROM DBA_INDEXES A, DBA_IND_COLUMNS B WHERE (A.OWNER, A.table_name) IN (' || in_list_table || ') AND A.OWNER = B.INDEX_OWNER AND A.INDEX_NAME = B.INDEX_NAME ORDER BY A.table_owner, A.table_name, A.index_name, B.COLUMN_POSITION'
+                'SELECT A.TABLE_OWNER, A.TABLE_NAME, A.INDEX_NAME, DECODE(A.UNIQUENESS,''UNIQUE'',''U'',''NONUNIQUE'',''N'',''O'')||DECODE(A.COMPRESSION,''ENABLED'',''E'',''DISABLED'',''N'',''O'')||DECODE(A.PARTITIONED,''YES'',''Y'',''NO'',''N'',''O'')||DECODE(A.TEMPORARY,''Y'',''Y'',''N'',''N'',''O'')||DECODE(A.VISIBILITY,''VISIBLE'',''V'',''INVISIBLE'',''I'',''O'') AS ucptv, B.COLUMN_NAME, B.COLUMN_POSITION, B.DESCEND FROM (' || uv_table || ') x JOIN DBA_INDEXES A ON A.table_owner = x.owner AND A.table_name = x.table_name JOIN DBA_IND_COLUMNS B ON A.OWNER = B.INDEX_OWNER AND A.INDEX_NAME = B.INDEX_NAME ORDER BY A.table_owner, A.table_name, A.index_name, B.COLUMN_POSITION'
                 BULK COLLECT INTO idx2_coll;
             FOR i IN 1..NVL(idx2_coll.COUNT, 0) LOOP
                 v_line := RPAD(SUBSTR(NVL(idx2_coll(i).table_owner,' '),1,15),15) || RPAD(SUBSTR(NVL(idx2_coll(i).table_name,' '),1,25),25) || RPAD(SUBSTR(NVL(idx2_coll(i).index_name,' '),1,20),20) || RPAD(SUBSTR(NVL(idx2_coll(i).ucptv,' '),1,6),6) || RPAD(SUBSTR(NVL(idx2_coll(i).column_name,' '),1,30),30) || RPAD(SUBSTR(NVL(TO_CHAR(idx2_coll(i).column_position),' '),1,16),16) || RPAD(SUBSTR(NVL(idx2_coll(i).descend,' '),1,10),10);
@@ -731,7 +861,7 @@ BEGIN
             part_idx_coll part_idx_tab;
         BEGIN
             EXECUTE IMMEDIATE
-                'SELECT a.owner, a.name AS index_name, b.partitioning_type AS part_type, b.subpartitioning_type AS subpart_type, b.partition_count||'''' AS part_count, b.PARTITIONING_KEY_COUNT||'''' AS key_count, b.SUBPARTITIONING_KEY_COUNT||'''' AS subkey_cout, b.LOCALITY||'''' AS locality, a.COLUMN_NAME, a.COLUMN_POSITION FROM DBA_PART_KEY_COLUMNS a, dba_part_indexes b WHERE a.name = b.index_name AND (b.owner, b.index_name) IN (SELECT owner, index_name FROM dba_indexes WHERE (table_owner, table_name) IN (' || in_list_table || ')) AND a.owner = b.owner ORDER BY a.owner, a.name, a.column_position'
+                'SELECT a.owner, a.name AS index_name, b.partitioning_type AS part_type, b.subpartitioning_type AS subpart_type, b.partition_count||'''' AS part_count, b.PARTITIONING_KEY_COUNT||'''' AS key_count, b.SUBPARTITIONING_KEY_COUNT||'''' AS subkey_cout, b.LOCALITY||'''' AS locality, a.COLUMN_NAME, a.COLUMN_POSITION FROM DBA_PART_KEY_COLUMNS a JOIN dba_part_indexes b ON a.name = b.index_name AND a.owner = b.owner JOIN dba_indexes i ON i.owner = b.owner AND i.index_name = b.index_name JOIN (' || uv_table || ') x ON i.table_owner = x.owner AND i.table_name = x.table_name ORDER BY a.owner, a.name, a.column_position'
                 BULK COLLECT INTO part_idx_coll;
             FOR i IN 1..NVL(part_idx_coll.COUNT, 0) LOOP
                 v_line := RPAD(SUBSTR(NVL(part_idx_coll(i).owner,' '),1,15),15) || RPAD(SUBSTR(NVL(part_idx_coll(i).index_name,' '),1,20),20) || RPAD(SUBSTR(NVL(part_idx_coll(i).part_type,' '),1,15),15) || RPAD(SUBSTR(NVL(part_idx_coll(i).subpart_type,' '),1,15),15) || RPAD(SUBSTR(NVL(part_idx_coll(i).part_count,' '),1,11),11) || RPAD(SUBSTR(NVL(part_idx_coll(i).key_count,' '),1,10),10) || RPAD(SUBSTR(NVL(part_idx_coll(i).subkey_cout,' '),1,12),12) || RPAD(SUBSTR(NVL(part_idx_coll(i).locality,' '),1,10),10) || RPAD(SUBSTR(NVL(part_idx_coll(i).column_name,' '),1,30),30) || RPAD(SUBSTR(NVL(TO_CHAR(part_idx_coll(i).column_position),' '),1,16),16);
@@ -752,7 +882,7 @@ BEGIN
             part_tbl_coll part_tbl_tab;
         BEGIN
             EXECUTE IMMEDIATE
-                'SELECT a.owner, a.name AS table_name, b.partitioning_type AS part_type, b.subpartitioning_type AS subpart_type, b.partition_count||'''' AS part_count, b.PARTITIONING_KEY_COUNT||'''' AS key_count, b.SUBPARTITIONING_KEY_COUNT||'''' AS subkey_cout, a.COLUMN_NAME, a.COLUMN_POSITION FROM DBA_PART_KEY_COLUMNS a, dba_part_tables b WHERE a.name = b.table_name AND (a.owner, a.name) IN (' || in_list_table || ') AND a.owner = b.owner ORDER BY a.NAME, a.COLUMN_POSITION'
+                'SELECT a.owner, a.name AS table_name, b.partitioning_type AS part_type, b.subpartitioning_type AS subpart_type, b.partition_count||'''' AS part_count, b.PARTITIONING_KEY_COUNT||'''' AS key_count, b.SUBPARTITIONING_KEY_COUNT||'''' AS subkey_cout, a.COLUMN_NAME, a.COLUMN_POSITION FROM DBA_PART_KEY_COLUMNS a JOIN dba_part_tables b ON a.name = b.table_name AND a.owner = b.owner JOIN (' || uv_table || ') x ON a.owner = x.owner AND a.name = x.table_name ORDER BY a.NAME, a.COLUMN_POSITION'
                 BULK COLLECT INTO part_tbl_coll;
             FOR i IN 1..NVL(part_tbl_coll.COUNT, 0) LOOP
                 v_line := RPAD(SUBSTR(NVL(part_tbl_coll(i).owner,' '),1,15),15) || RPAD(SUBSTR(NVL(part_tbl_coll(i).table_name,' '),1,25),25) || RPAD(SUBSTR(NVL(part_tbl_coll(i).part_type,' '),1,15),15) || RPAD(SUBSTR(NVL(part_tbl_coll(i).subpart_type,' '),1,15),15) || RPAD(SUBSTR(NVL(part_tbl_coll(i).part_count,' '),1,11),11) || RPAD(SUBSTR(NVL(part_tbl_coll(i).key_count,' '),1,10),10) || RPAD(SUBSTR(NVL(part_tbl_coll(i).subkey_cout,' '),1,12),12) || RPAD(SUBSTR(NVL(part_tbl_coll(i).column_name,' '),1,30),30) || RPAD(SUBSTR(NVL(TO_CHAR(part_tbl_coll(i).column_position),' '),1,16),16);
@@ -765,18 +895,18 @@ BEGIN
         put_line( '****************************************************************************************');
         put_line( 'display every partition  info');
         put_line( '****************************************************************************************');
-        put_line(RPAD('TABLE_NAME',25) || RPAD('PARTITION_NAME',20) || RPAD('HIGH_VALUE',25) || RPAD('HIGH_VALUE_LENGTH',19) || RPAD('TABLESPACE_NAME',16) || RPAD('NUM_ROWS',10) || RPAD('BLOCKS',10) || RPAD('T_SIZE',10) || RPAD('EMPTY_BLOCKS',13) || RPAD('LAST_ANALYZED',14) || RPAD('AVG_SPACE',11) || RPAD('SUBPART_COUNT',13));
+        put_line(RPAD('TABLE_NAME',25) || RPAD('PARTITION_NAME',20) || RPAD('HIGH_VALUE',25) || RPAD('HIGH_VALUE_LENGTH',19) || RPAD('TABLESPACE_NAME',16) || RPAD('NUM_ROWS',10) || RPAD('BLOCKS',10) || RPAD('T_SIZE',10) || RPAD('EMPTY_BLOCKS',13) || RPAD('LAST_ANALYZED',19) || RPAD('AVG_SPACE',11) || RPAD('SPCNT',5));
 
         DECLARE
-            TYPE tab_part_rec IS RECORD (table_name VARCHAR2(128), partition_name VARCHAR2(128), high_value VARCHAR2(4000), high_value_length VARCHAR2(20), tablespace_name VARCHAR2(128), num_rows VARCHAR2(20), blocks VARCHAR2(20), t_size VARCHAR2(20), empty_blocks VARCHAR2(20), last_analyzed VARCHAR2(20), avg_space VARCHAR2(20), subpart_count VARCHAR2(20));
+            TYPE tab_part_rec IS RECORD (table_name VARCHAR2(128), partition_name VARCHAR2(128), high_value VARCHAR2(4000), high_value_length VARCHAR2(20), tablespace_name VARCHAR2(128), num_rows VARCHAR2(20), blocks VARCHAR2(20), t_size VARCHAR2(20), empty_blocks VARCHAR2(20), last_analyzed VARCHAR2(20), avg_space VARCHAR2(20), spcnt VARCHAR2(20));
             TYPE tab_part_tab IS TABLE OF tab_part_rec;
             tab_part_coll tab_part_tab;
         BEGIN
             EXECUTE IMMEDIATE
-                'SELECT table_name, PARTITION_NAME, SUBSTR(HIGH_VALUE,1,25) AS high_value, TO_CHAR(HIGH_VALUE_LENGTH) AS high_value_length, TABLESPACE_NAME, NUM_ROWS||'''' AS num_rows, BLOCKS||'''' AS blocks, TO_CHAR(ROUND(blocks*8/1024,2))||''KB'' AS t_size, EMPTY_BLOCKS||'''' AS empty_blocks, TO_CHAR(LAST_ANALYZED,''yyyy-mm-dd'') AS last_analyzed, AVG_SPACE||'''' AS avg_space, SUBPARTITION_COUNT||'''' AS subpart_count FROM DBA_TAB_PARTITIONS WHERE (table_owner, table_name) IN (' || in_list_table || ') ORDER BY table_name, PARTITION_POSITION'
+                'SELECT p.table_name, p.PARTITION_NAME, SUBSTR(p.HIGH_VALUE,1,25) AS high_value, TO_CHAR(p.HIGH_VALUE_LENGTH) AS high_value_length, p.TABLESPACE_NAME, p.NUM_ROWS||'''' AS num_rows, p.BLOCKS||'''' AS blocks, TO_CHAR(ROUND(p.blocks*8/1024,2))||''KB'' AS t_size, p.EMPTY_BLOCKS||'''' AS empty_blocks, TO_CHAR(p.LAST_ANALYZED,''yyyy-mm-dd hh24:mi:ss'') AS last_analyzed, p.AVG_SPACE||'''' AS avg_space, SUBSTR(p.SUBPARTITION_COUNT||'''',1,5) AS spcnt FROM DBA_TAB_PARTITIONS p JOIN (' || uv_table || ') x ON p.table_owner = x.owner AND p.table_name = x.table_name ORDER BY p.table_name, p.PARTITION_POSITION'
                 BULK COLLECT INTO tab_part_coll;
             FOR i IN 1..NVL(tab_part_coll.COUNT, 0) LOOP
-                v_line := RPAD(SUBSTR(NVL(tab_part_coll(i).table_name,' '),1,25),25) || RPAD(SUBSTR(NVL(tab_part_coll(i).partition_name,' '),1,20),20) || RPAD(SUBSTR(NVL(tab_part_coll(i).high_value,' '),1,25),25) || RPAD(SUBSTR(NVL(tab_part_coll(i).high_value_length,' '),1,19),19) || RPAD(SUBSTR(NVL(tab_part_coll(i).tablespace_name,' '),1,16),16) || RPAD(SUBSTR(NVL(tab_part_coll(i).num_rows,' '),1,10),10) || RPAD(SUBSTR(NVL(tab_part_coll(i).blocks,' '),1,10),10) || RPAD(SUBSTR(NVL(tab_part_coll(i).t_size,' '),1,10),10) || RPAD(SUBSTR(NVL(tab_part_coll(i).empty_blocks,' '),1,13),13) || RPAD(SUBSTR(NVL(tab_part_coll(i).last_analyzed,' '),1,14),14) || RPAD(SUBSTR(NVL(tab_part_coll(i).avg_space,' '),1,11),11) || RPAD(SUBSTR(NVL(tab_part_coll(i).subpart_count,' '),1,13),13);
+                v_line := RPAD(SUBSTR(NVL(tab_part_coll(i).table_name,' '),1,25),25) || RPAD(SUBSTR(NVL(tab_part_coll(i).partition_name,' '),1,20),20) || RPAD(SUBSTR(NVL(tab_part_coll(i).high_value,' '),1,25),25) || RPAD(SUBSTR(NVL(tab_part_coll(i).high_value_length,' '),1,19),19) || RPAD(SUBSTR(NVL(tab_part_coll(i).tablespace_name,' '),1,16),16) || RPAD(SUBSTR(NVL(tab_part_coll(i).num_rows,' '),1,10),10) || RPAD(SUBSTR(NVL(tab_part_coll(i).blocks,' '),1,10),10) || RPAD(SUBSTR(NVL(tab_part_coll(i).t_size,' '),1,10),10) || RPAD(SUBSTR(NVL(tab_part_coll(i).empty_blocks,' '),1,13),13) || RPAD(SUBSTR(NVL(tab_part_coll(i).last_analyzed,' '),1,19),19) || RPAD(SUBSTR(NVL(tab_part_coll(i).avg_space,' '),1,11),11) || RPAD(SUBSTR(NVL(tab_part_coll(i).spcnt,' '),1,5),5);
                 put_line(v_line);
             END LOOP;
         END;

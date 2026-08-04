@@ -188,7 +188,7 @@ SELECT
     n.NAME,
     st.VALUE
 FROM GV$SESSION s
-JOIN GV$PROCESS p ON s.INST_ID = p.INST_ID AND s.PADDR = p.THREAD_ADDR
+LEFT JOIN GV$PROCESS p ON s.INST_ID = p.INST_ID AND s.PADDR = p.THREAD_ADDR
 JOIN GV$SESSTAT st ON s.INST_ID = st.INST_ID AND s.SID = st.SID
 JOIN GV$STATNAME n ON st.INST_ID = n.INST_ID AND st.STATISTIC# = n.STATISTIC#
 WHERE n.NAME IN (%s)
@@ -331,27 +331,75 @@ FROM (
         x.inst_id
     FROM (
         SELECT
-            a.inst_id||'.'||a.sid||'.'||a.serial#||'.'||b.thread_id AS sid_tid,
+            a.inst_id||'.'||a.sid||'.'||a.serial#||'.'
+              ||NVL(TO_CHAR(NVL(b.thread_id, schd.thread_id)), '-') AS sid_tid,
             substr(a.wait_event,1,30) AS event,
             a.username AS username,
-            substr(a.cli_program,1,30) AS program,
+            substr(NVL(a.cli_program, NVL(j.job_name, a.module)),1,30) AS program,
             substr(c.command_name,1,3)||'.'||nvl(a.sql_id,a.sql_id) AS sql_id,
-            CAST(
-                CAST(SYSTIMESTAMP AS TIMESTAMP(6)) - CAST(a.exec_start_time AS TIMESTAMP(6))
-                AS INTERVAL DAY(9) TO SECOND(6)
-            ) AS exec_delta,
-            a.ip_address||'.'||a.ip_port AS client,
+            CASE
+                WHEN a.exec_start_time IS NOT NULL THEN
+                    CAST(
+                        CAST(SYSTIMESTAMP AS TIMESTAMP(6))
+                          - CAST(a.exec_start_time AS TIMESTAMP(6))
+                        AS INTERVAL DAY(9) TO SECOND(6)
+                    )
+                WHEN j.last_start_date IS NOT NULL THEN
+                    CAST(
+                        CAST(SYSTIMESTAMP AS TIMESTAMP(6))
+                          - CAST(j.last_start_date AS TIMESTAMP(6))
+                        AS INTERVAL DAY(9) TO SECOND(6)
+                    )
+                ELSE NULL
+            END AS exec_delta,
+            CASE
+                WHEN a.ip_address IS NULL THEN NULL
+                ELSE a.ip_address||'.'||a.ip_port
+            END AS client,
             a.inst_id
-        FROM GV$SESSION a, GV$PROCESS b, V$SQLCOMMAND c
-        WHERE a.inst_id = b.inst_id
-          AND a.paddr = b.thread_addr
-          AND a.command = c.command_type(+)
-          AND a.TYPE NOT IN ('BACKGROUND')
-          AND a.status NOT IN ('INACTIVE')
+        FROM GV$SESSION a
+        LEFT JOIN GV$PROCESS b
+          ON a.inst_id = b.inst_id
+         AND a.paddr = b.thread_addr
+        LEFT JOIN (
+            SELECT
+                job_name,
+                running_instance,
+                last_start_date,
+                ROW_NUMBER() OVER (
+                    PARTITION BY NVL(running_instance, 1)
+                    ORDER BY last_start_date, job_name
+                ) AS rn
+            FROM DBA_SCHEDULER_JOBS
+            WHERE state = 'RUNNING'
+        ) j
+          ON a.inst_id = NVL(j.running_instance, a.inst_id)
+         AND (
+                (a.action IS NOT NULL AND a.action = j.job_name)
+             OR (a.module IS NOT NULL AND a.module = j.job_name)
+         )
+        LEFT JOIN (
+            SELECT
+                inst_id,
+                thread_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY inst_id
+                    ORDER BY start_time, thread_id
+                ) AS rn
+            FROM GV$PROCESS
+            WHERE name = 'DBMS_SCHEDULER'
+        ) schd
+          ON schd.inst_id = a.inst_id
+         AND j.job_name IS NOT NULL
+         AND schd.rn = j.rn
+        LEFT JOIN V$SQLCOMMAND c
+          ON a.command = c.command_type
+        WHERE a.TYPE NOT IN ('BACKGROUND')
+          AND NVL(NULLIF(TRIM(a.status), ''), 'ACTIVE') NOT IN ('INACTIVE')
           AND NOT (a.INST_ID = TO_NUMBER(SYS_CONTEXT('USERENV', 'INSTANCE'))
                AND a.SID = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')))%s
     ) x
-    ORDER BY exec_ms DESC
+    ORDER BY exec_ms DESC NULLS LAST
     FETCH FIRST %d ROWS ONLY
 )
 `, instFilter, c.cfg.SessionDetailTopN)

@@ -8,7 +8,7 @@ col COLUMN_NAME        for   a25
 col l_t                for   a5
 col degree             for   a6
 col part               for   a4
-col LAST_ANALYZED      for   a25
+col LAST_ANALYZED      for   a19
 col NUM_ROWS           for   a10
 col blocks             for   a10
 col EMPTY_BLOCKS       for   a5
@@ -33,7 +33,7 @@ SELECT a.OWNER,
        b.AVG_COL_LEN,
        b.sample_size||'' sample_size,
        substr(b.HISTOGRAM,0,5) HISTOGRAM,
-       b.LAST_ANALYZED
+       TO_CHAR(b.LAST_ANALYZED, 'yyyy-mm-dd hh24:mi:ss') AS last_analyzed
   FROM DBA_TAB_COLS a,DBA_TAB_COL_STATISTICS b
  WHERE   a.owner =nvl(UPPER('&&owner'),  a.owner)
          and a.table_name =nvl(UPPER('&&tablename'),  a.table_name)

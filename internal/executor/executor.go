@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -90,8 +91,11 @@ func (e *Executor) executeSQLScript(ctx context.Context, scriptName string) (str
 				printYashanDBPromptBlocks(scriptContent, start, end, displayedPrompt)
 			}
 			info := promptInfos[variable]
-			printVariableHint(info.Hint)
-			rawValue := terminal.PromptInput(formatVariableInputPrompt(variable, info.Default), 256)
+			// ACCEPT PROMPT: use as input prompt (do not also print as a separate hint line).
+			if !(info.FromAccept && info.Hint != "") {
+				printVariableHint(info.Hint)
+			}
+			rawValue := terminal.PromptInput(formatInputPrompt(variable, info), 256)
 			value := rawValue
 			source := "input"
 			if value == "" && info.Default != "" {
@@ -268,83 +272,35 @@ func (e *Executor) executeOSCommandLocal(ctx context.Context, command string) (s
 
 // runLocalCmdRealtime runs a local *exec.Cmd with stdout/stderr streamed to the terminal.
 // Also accumulates output for return (callers that already streamed must not reprint).
+//
+// Instead of using StdoutPipe/StderrPipe (which create a race between manual readers and
+// cmd.Wait closing parentIOPipes), we set cmd.Stdout/Stderr to io.Writer implementations.
+// When these are not *os.File, Go's exec package internally creates pipes and goroutines
+// to copy data, and cmd.Wait() waits for those internal goroutines to complete BEFORE
+// closing the pipes — eliminating the data-loss race condition entirely.
 func (e *Executor) runLocalCmdRealtime(ctx context.Context, cmd *exec.Cmd, debugLabel string) (string, error) {
 	setProcAttributes(cmd)
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
+	var outputBuffer strings.Builder
+	var bufferMutex sync.Mutex
 
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return "", fmt.Errorf("failed to create stderr pipe: %w", err)
-	}
+	// Set Stdout/Stderr to CRLF-converting writers. Go internally creates pipes
+	// and io.Copy goroutines; cmd.Wait() awaits them before closing pipes.
+	cmd.Stdout = &crlfStreamWriter{w: os.Stdout, buf: &outputBuffer, mu: &bufferMutex}
+	cmd.Stderr = &crlfStreamWriter{w: os.Stderr, buf: &outputBuffer, mu: &bufferMutex}
 
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("failed to start command: %w", err)
 	}
 
-	var outputBuffer strings.Builder
-	var bufferMutex sync.Mutex
-	var wg sync.WaitGroup
-	wg.Add(2)
-
+	// Context cancellation: kill the process group so pipes get EOF and
+	// internal goroutines unblock.
 	go func() {
 		<-ctx.Done()
 		killProcessGroup(cmd)
 	}()
 
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 1)
-		for {
-			n, err := stdout.Read(buf)
-			if n > 0 {
-				if buf[0] == '\n' {
-					os.Stdout.Write([]byte("\r\n"))
-					bufferMutex.Lock()
-					outputBuffer.WriteByte('\n')
-					bufferMutex.Unlock()
-				} else {
-					os.Stdout.Write(buf[:n])
-					bufferMutex.Lock()
-					outputBuffer.Write(buf[:n])
-					bufferMutex.Unlock()
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 1)
-		for {
-			n, err := stderr.Read(buf)
-			if n > 0 {
-				if buf[0] == '\n' {
-					os.Stderr.Write([]byte("\r\n"))
-					bufferMutex.Lock()
-					outputBuffer.WriteByte('\n')
-					bufferMutex.Unlock()
-				} else {
-					os.Stderr.Write(buf[:n])
-					bufferMutex.Lock()
-					outputBuffer.Write(buf[:n])
-					bufferMutex.Unlock()
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
 	waitErr := cmd.Wait()
-	wg.Wait()
 
 	if ctx.Err() == context.Canceled {
 		result := outputBuffer.String()
@@ -409,11 +365,12 @@ func (e *Executor) executeOSScript(ctx context.Context, scriptName, scriptConten
 	}
 
 	artifact := osScriptArtifactName(scriptName)
+	companions := scripts.ListOSCompanions(scriptName)
 
 	if e.cfg.ConnectionMode == "ssh" {
-		return e.executeOSScriptSSH(ctx, scriptContent, artifact, args, kind, pythonBin, targetOS)
+		return e.executeOSScriptSSH(ctx, scriptName, scriptContent, artifact, companions, args, kind, pythonBin, targetOS)
 	}
-	return e.executeOSScriptLocal(ctx, scriptContent, artifact, args, kind, pythonBin, targetOS)
+	return e.executeOSScriptLocal(ctx, scriptName, scriptContent, artifact, companions, args, kind, pythonBin, targetOS)
 }
 
 // resolvePythonBin returns cfg.Python when set; otherwise probes the target for a usable interpreter.
@@ -465,7 +422,7 @@ func (e *Executor) resolvePythonBin(ctx context.Context, targetOS string) (strin
 	return bin, nil
 }
 
-func (e *Executor) executeOSScriptLocal(ctx context.Context, scriptContent, artifact string, args []string, kind platform.OSScriptKind, pythonBin, targetOS string) (string, error) {
+func (e *Executor) executeOSScriptLocal(ctx context.Context, scriptName, scriptContent, artifact string, companions []string, args []string, kind platform.OSScriptKind, pythonBin, targetOS string) (string, error) {
 	scriptPath := platform.LocalTempPath(artifact)
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0644); err != nil {
 		return "", fmt.Errorf("failed to write OS script: %w", err)
@@ -474,9 +431,22 @@ func (e *Executor) executeOSScriptLocal(ctx context.Context, scriptContent, arti
 		defer os.Remove(scriptPath)
 	}
 
+	envPrefix, companionPaths, err := e.stageOSCompanionsLocal(scriptName, artifact, companions)
+	if err != nil {
+		return "", err
+	}
+	if !e.cfg.DebugMode {
+		for _, p := range companionPaths {
+			defer os.Remove(p)
+		}
+	}
+
 	cmd, err := platform.BuildOSScriptRunCmd(targetOS, scriptPath, args, kind, pythonBin)
 	if err != nil {
 		return "", err
+	}
+	if envPrefix != "" {
+		cmd = envPrefix + cmd
 	}
 	if e.cfg.SourceCmd != "" {
 		cmd = connector.WrapSourceCmd(e.cfg.SourceCmd, cmd)
@@ -487,7 +457,7 @@ func (e *Executor) executeOSScriptLocal(ctx context.Context, scriptContent, arti
 	return e.executeOSCommandLocal(ctx, cmd)
 }
 
-func (e *Executor) executeOSScriptSSH(ctx context.Context, scriptContent, artifact string, args []string, kind platform.OSScriptKind, pythonBin, targetOS string) (string, error) {
+func (e *Executor) executeOSScriptSSH(ctx context.Context, scriptName, scriptContent, artifact string, companions []string, args []string, kind platform.OSScriptKind, pythonBin, targetOS string) (string, error) {
 	sshConn, ok := e.conn.(*connector.SSHConnector)
 	if !ok {
 		return "", fmt.Errorf("not an SSH connection")
@@ -502,15 +472,95 @@ func (e *Executor) executeOSScriptSSH(ctx context.Context, scriptContent, artifa
 		defer sshConn.CleanupRemoteScript(sftpPath)
 	}
 
+	envPrefix, companionSFTPs, err := e.stageOSCompanionsSSH(ctx, sshConn, scriptName, artifact, companions)
+	if err != nil {
+		return "", err
+	}
+	if !e.cfg.DebugMode {
+		for _, p := range companionSFTPs {
+			defer sshConn.CleanupRemoteScript(p)
+		}
+	}
+
 	cmd, err := platform.BuildOSScriptRunCmd(targetOS, execPath, args, kind, pythonBin)
 	if err != nil {
 		return "", err
+	}
+	if envPrefix != "" {
+		cmd = envPrefix + cmd
 	}
 	cmd = sshConn.WrapCmd(cmd)
 	if e.cfg.DebugMode {
 		logger.Debug("Executing OS script via SSH: %s\n", cmd)
 	}
 	return sshConn.ExecuteCommandRealtime(ctx, cmd)
+}
+
+// companionStagingName maps script artifact + companion to a unique staged basename
+// (ytop_sql_collect_123.sh + sql_collect.jar -> ytop_sql_collect_123.jar).
+func companionStagingName(scriptArtifact, companionName string) string {
+	return strings.TrimSuffix(scriptArtifact, filepath.Ext(scriptArtifact)) + filepath.Ext(companionName)
+}
+
+// stageOSCompanionsLocal writes companions next to the temp script; returns bash env prefix and staged paths.
+func (e *Executor) stageOSCompanionsLocal(scriptName, artifact string, companions []string) (envPrefix string, stagedPaths []string, err error) {
+	if len(companions) == 0 {
+		return "", nil, nil
+	}
+	tempDir := filepath.Dir(platform.LocalTempPath(artifact))
+	var envParts []string
+	for _, companion := range companions {
+		data, loadErr := scripts.LoadOSCompanionBytes(scriptName, companion)
+		if loadErr != nil {
+			return "", stagedPaths, fmt.Errorf("failed to load OS companion %s: %w", companion, loadErr)
+		}
+		staged := companionStagingName(artifact, companion)
+		companionPath := filepath.Join(tempDir, staged)
+		if writeErr := os.WriteFile(companionPath, data, 0644); writeErr != nil {
+			return "", stagedPaths, fmt.Errorf("failed to write OS companion %s: %w", companion, writeErr)
+		}
+		stagedPaths = append(stagedPaths, companionPath)
+		if e.cfg.DebugMode {
+			logger.DebugKeyVal("OSCompanion(local)", companionPath)
+		}
+		if strings.EqualFold(filepath.Ext(companion), ".jar") {
+			envParts = append(envParts, "SQL_COLLECT_JAR="+platform.ShellQuoteUnix(companionPath))
+		}
+	}
+	if len(envParts) == 0 {
+		return "", stagedPaths, nil
+	}
+	return strings.Join(envParts, " ") + " ", stagedPaths, nil
+}
+
+// stageOSCompanionsSSH uploads companions beside the remote script; returns bash env prefix and SFTP paths.
+func (e *Executor) stageOSCompanionsSSH(ctx context.Context, sshConn *connector.SSHConnector, scriptName, artifact string, companions []string) (envPrefix string, sftpPaths []string, err error) {
+	if len(companions) == 0 {
+		return "", nil, nil
+	}
+	var envParts []string
+	for _, companion := range companions {
+		data, loadErr := scripts.LoadOSCompanionBytes(scriptName, companion)
+		if loadErr != nil {
+			return "", sftpPaths, fmt.Errorf("failed to load OS companion %s: %w", companion, loadErr)
+		}
+		staged := companionStagingName(artifact, companion)
+		companionSFTP, companionExec, upErr := sshConn.UploadScriptSFTP(ctx, data, staged)
+		if upErr != nil {
+			return "", sftpPaths, fmt.Errorf("failed to upload OS companion %s: %w", companion, upErr)
+		}
+		sftpPaths = append(sftpPaths, companionSFTP)
+		if e.cfg.DebugMode {
+			logger.DebugKeyVal("OSCompanion(ssh)", companionExec)
+		}
+		if strings.EqualFold(filepath.Ext(companion), ".jar") {
+			envParts = append(envParts, "SQL_COLLECT_JAR="+platform.ShellQuoteUnix(companionExec))
+		}
+	}
+	if len(envParts) == 0 {
+		return "", sftpPaths, nil
+	}
+	return strings.Join(envParts, " ") + " ", sftpPaths, nil
 }
 
 // ExecuteAdHocSQL executes a single SQL statement directly
@@ -1029,4 +1079,32 @@ func escapeRunArgsWindows(args []string) string {
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// crlfStreamWriter is an io.Writer that converts LF to CRLF for terminal output
+// and accumulates raw (LF) output in a shared buffer.
+type crlfStreamWriter struct {
+	w   io.Writer        // terminal output (os.Stdout or os.Stderr)
+	buf *strings.Builder // shared accumulation buffer
+	mu  *sync.Mutex      // protects buf
+}
+
+func (cw *crlfStreamWriter) Write(p []byte) (int, error) {
+	// Batch LF→CRLF conversion to avoid many small writes.
+	termBuf := make([]byte, 0, len(p)*2)
+	for _, b := range p {
+		if b == '\n' {
+			termBuf = append(termBuf, '\r', '\n')
+		} else {
+			termBuf = append(termBuf, b)
+		}
+	}
+	cw.w.Write(termBuf)
+
+	// Accumulate raw output (with original LF).
+	cw.mu.Lock()
+	cw.buf.Write(p)
+	cw.mu.Unlock()
+
+	return len(p), nil
 }

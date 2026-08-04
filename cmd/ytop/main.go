@@ -422,7 +422,7 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 		return
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error in iteration: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error in iteration: %v\r\n", err)
 		if cfg.DebugMode {
 			logger.Debug("[tui] initial snapshot failed: %v\n", err)
 		}
@@ -450,7 +450,7 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 				return
 			}
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error in iteration: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error in iteration: %v\r\n", err)
 				if cfg.DebugMode {
 					logger.Debug("[tui] ticker snapshot failed: %v\n", err)
 				}
@@ -574,75 +574,28 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 					}
 
 					if command != "" {
-						fmt.Println() // Add blank line before output
+						fmt.Print("\r\n") // blank line before output
 
-						// Create cancellable context for command execution
+						// Restore terminal to cooked mode so yasql PROMPT/SELECT/DBMS_OUTPUT
+						// all align correctly (terminal driver handles LF→CRLF automatically).
+						// Raw mode only needed for ESC detection; Ctrl+C still works in cooked mode.
+						if globalOldState != nil {
+							term.Restore(int(os.Stdin.Fd()), globalOldState)
+						}
+
+						// Execute command synchronously (terminal in cooked mode)
 						cmdCtx, cmdCancel := context.WithCancel(ctx)
-						defer cmdCancel() // Ensure context is always cancelled
-
-						// Channel to receive command result
-						resultChan := make(chan struct {
-							output string
-							err    error
-						}, 1)
-
-						// Execute command in goroutine
-						go func() {
-							output, err := exec.ExecuteCommand(cmdCtx, command)
-							resultChan <- struct {
-								output string
-								err    error
-							}{output, err}
-						}()
-
-						// Monitor for ESC key to cancel command (in raw mode)
-						escChan := make(chan bool, 1)
-						escStopChan := make(chan bool, 1)
-						go func() {
-							buf := make([]byte, 1)
-							for {
-								select {
-								case <-escStopChan:
-									return
-								default:
-									// Set read timeout to allow checking stop channel
-									n, err := os.Stdin.Read(buf)
-									if err != nil || n == 0 {
-										continue
-									}
-									if buf[0] == 27 { // ESC key
-										escChan <- true
-										return
-									}
-									// Also check for Ctrl+C
-									if buf[0] == 3 {
-										restoreTerminal()
-										fmt.Println("\n\nExiting...")
-										os.Exit(0)
-									}
-								}
-							}
-						}()
-
-						// Wait for command completion or ESC
 						var output string
 						var cmdErr error
-						cancelled := false
-						select {
-						case result := <-resultChan:
-							output = result.output
-							cmdErr = result.err
-							escStopChan <- true // Stop ESC monitoring goroutine
-						case <-escChan:
-							cmdCancel() // Cancel the command
-							if cfg.DebugMode {
-								logger.DebugTUIAction("exec-command", "cancelled-by-user")
+						output, cmdErr = exec.ExecuteCommand(cmdCtx, command)
+						cmdCancel()
+
+						// Re-enter raw mode for TUI
+						if globalOldState != nil {
+							newState, rawErr := term.MakeRaw(int(os.Stdin.Fd()))
+							if rawErr == nil {
+								*globalOldState = *newState
 							}
-							fmt.Println("\n\n[Command cancelled by user - Press ESC]")
-							time.Sleep(500 * time.Millisecond) // Wait for command to clean up
-							output = ""
-							cmdErr = nil
-							cancelled = true
 						}
 
 						if cmdErr != nil {
@@ -653,7 +606,7 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 						}
 
 						// Output already streamed in realtime for both SQL and OS commands.
-						if cmdErr == nil && output == "" && !cancelled {
+						if cmdErr == nil && output == "" {
 							fmt.Printf("\r\n\r\nNo output generated\r\n")
 						} else if cmdErr != nil {
 							fmt.Printf("\r\n")
@@ -663,9 +616,9 @@ func runInteractiveMonitor(ctx context.Context, cfg *config.Config, conn connect
 						pauseReadChan <- false
 
 						// Wait for key press to continue (read from rawInputChan)
-						fmt.Print("\nPress any key to continue...")
+						fmt.Print("\r\nPress any key to continue...")
 						<-rawInputChan
-						fmt.Println()
+						fmt.Print("\r\n")
 
 						// Pause again for cleanup (will be resumed at end)
 						pauseReadChan <- true
@@ -1080,7 +1033,7 @@ func collectMonitorSnapshot(ctx context.Context, cfg *config.Config, conn connec
 
 	lastErr := err
 	for attempt := 1; attempt <= connector.MonitorSSHMaxRetries; attempt++ {
-		fmt.Fprintf(os.Stderr, "[WARN] SSH connection lost, retry %d/%d: %v\n",
+		fmt.Fprintf(os.Stderr, "\r\n[WARN] SSH connection lost, retry %d/%d: %v\r\n",
 			attempt, connector.MonitorSSHMaxRetries, lastErr)
 		if cfg.DebugMode {
 			logger.Debug("[tui] ssh retry %d/%d: %v\n", attempt, connector.MonitorSSHMaxRetries, lastErr)
@@ -1089,7 +1042,7 @@ func collectMonitorSnapshot(ctx context.Context, cfg *config.Config, conn connec
 		if reconnErr := sshConn.Reconnect(ctx); reconnErr != nil {
 			lastErr = reconnErr
 		} else if snapshot, err = collectSnapshot(ctx, coll, calc); err == nil {
-			fmt.Fprintf(os.Stderr, "[INFO] SSH reconnected (attempt %d/%d)\n",
+			fmt.Fprintf(os.Stderr, "\r\n[INFO] SSH reconnected (attempt %d/%d)\r\n",
 				attempt, connector.MonitorSSHMaxRetries)
 			return snapshot, nil
 		} else if !connector.IsRecoverableSSHError(err) {
@@ -1112,7 +1065,7 @@ func handleMonitorSSHFatal(err error) bool {
 	}
 	restoreTerminal()
 	stopGoroutines()
-	fmt.Fprintf(os.Stderr, "SSH connection lost after %d retries, exiting.\n", connector.MonitorSSHMaxRetries)
+	fmt.Fprintf(os.Stderr, "\r\nSSH connection lost after %d retries, exiting.\r\n", connector.MonitorSSHMaxRetries)
 	os.Exit(1)
 	return true
 }
@@ -1160,7 +1113,7 @@ func collectSnapshot(ctx context.Context, coll *collector.Collector, calc *calcu
 		collectDuration.Seconds(), totalDuration.Seconds(),
 		len(sysStats), len(systemEvents), len(sessionMetrics), len(sessionDetails))
 	if collectDuration > 500*time.Millisecond {
-		fmt.Fprintf(os.Stderr, "[WARN] Snapshot collection took %.2fs (collect=%.2fs)\n",
+		fmt.Fprintf(os.Stderr, "\r\n[WARN] Snapshot collection took %.2fs (collect=%.2fs)\r\n",
 			totalDuration.Seconds(), collectDuration.Seconds())
 		logger.Debug("[tui] collectSnapshot slow: collect=%.3fs total=%.3fs\n",
 			collectDuration.Seconds(), totalDuration.Seconds())

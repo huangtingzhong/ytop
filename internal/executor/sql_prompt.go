@@ -12,8 +12,9 @@ import (
 
 // variablePromptInfo holds client-side hint and default for a substitution variable.
 type variablePromptInfo struct {
-	Hint    string
-	Default string
+	Hint       string
+	Default    string
+	FromAccept bool // ACCEPT ... PROMPT: use Hint as input prompt (sqlplus-like)
 }
 
 var (
@@ -74,7 +75,7 @@ func parseAcceptByVariable(lines []string) map[string]variablePromptInfo {
 	out := make(map[string]variablePromptInfo)
 	for _, line := range lines {
 		if vn, hint, def, ok := parseAcceptLine(line); ok {
-			out[strings.ToUpper(vn)] = variablePromptInfo{Hint: hint, Default: def}
+			out[strings.ToUpper(vn)] = variablePromptInfo{Hint: hint, Default: def, FromAccept: true}
 		}
 	}
 	return out
@@ -653,6 +654,23 @@ func formatVariableInputPrompt(variable, defaultVal string) string {
 		return fmt.Sprintf("\r\nEnter value for %s (default %s): ", variable, defaultVal)
 	}
 	return fmt.Sprintf("\r\nEnter value for %s: ", variable)
+}
+
+// formatInputPrompt builds the interactive input line.
+// ACCEPT ... PROMPT text is used as the prompt itself (sqlplus-like), not only a hint above
+// the generic "Enter value for &&var".
+func formatInputPrompt(variable string, info variablePromptInfo) string {
+	if info.FromAccept && info.Hint != "" {
+		hint := info.Hint
+		if info.Default != "" {
+			base := strings.TrimRight(hint, " \t")
+			base = strings.TrimSuffix(base, ":")
+			base = strings.TrimRight(base, " \t")
+			return fmt.Sprintf("\r\n%s (default %s): ", base, info.Default)
+		}
+		return "\r\n" + hint
+	}
+	return formatVariableInputPrompt(variable, info.Default)
 }
 
 func printVariableHint(hint string) {

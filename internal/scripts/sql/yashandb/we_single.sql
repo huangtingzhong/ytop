@@ -47,32 +47,38 @@ FROM (
         x.client
     FROM (
         SELECT 
-            a.sid||'.'||a.serial#||'.'||b.thread_id AS sid_tid,
+            a.sid||'.'||a.serial#||'.'||NVL(TO_CHAR(b.thread_id),'-') AS sid_tid,
             substr(a.wait_event,1,30) AS event,
             a.username AS username,
-            substr(a.cli_program,1,30) AS program,
+            substr(NVL(a.cli_program, a.module),1,30) AS program,
             substr(c.command_name,1,3)||'.'||nvl(a.sql_id,a.sql_id) AS sql_id,
             CAST(
                 CAST(SYSTIMESTAMP AS TIMESTAMP(6)) - CAST(a.exec_start_time AS TIMESTAMP(6))
                 AS INTERVAL DAY(9) TO SECOND(6)
             ) AS exec_delta,
-            a.ip_address||'.'||a.ip_port AS client
-        FROM v$session a, v$process b, v$SQLCOMMAND c  
-        WHERE  a.paddr = b.thread_addr  
-          AND a.command = c.command_type(+)
-          AND a.TYPE NOT IN ('BACKGROUND')
-          AND a.status NOT IN ('INACTIVE') 
+            CASE
+                WHEN a.ip_address IS NULL THEN NULL
+                ELSE a.ip_address||'.'||a.ip_port
+            END AS client
+        FROM v$session a
+        LEFT JOIN v$process b
+          ON a.paddr = b.thread_addr
+        LEFT JOIN v$sqlcommand c
+          ON a.command = c.command_type
+        WHERE a.TYPE NOT IN ('BACKGROUND')
+          AND NVL(NULLIF(TRIM(a.status), ''), 'ACTIVE') NOT IN ('INACTIVE')
           AND a.SID = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))
     ) x
-    ORDER BY exec_ms DESC
+    ORDER BY exec_ms DESC NULLS LAST
 )
 /
 
 SELECT 
       a.sql_id,a.wait_event,count(*) hcount 
 FROM v$session a 
-WHERE a.status NOT IN ('INACTIVE')  AND a.TYPE NOT IN ('BACKGROUND') 
-       AND a.SID = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))
+WHERE NVL(NULLIF(TRIM(a.status), ''), 'ACTIVE') NOT IN ('INACTIVE')
+  AND a.TYPE NOT IN ('BACKGROUND') 
+  AND a.SID = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))
 GROUP BY  sql_id,wait_event HAVING count(*) >1
 ORDER BY hcount
 /

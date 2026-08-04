@@ -1,6 +1,10 @@
 -- File Name: sid_undo.sql
--- Purpose: Per-session UNDO snapshot (each output line <= ~300 chars)
+-- Purpose: Per-session UNDO blocks and size MB (optional SID filter)
 -- Created: 20250615  by  huangtingzhong
+-- Updated: 20260801 by huangtingzhong
+-- Oracle ref: /Users/yihan/Documents/owner/sql/sess_undosize.sql
+
+UNDEFINE sid
 
 col SessID       for a24
 col UserName     for a18
@@ -9,6 +13,7 @@ col Program      for a44
 col SqlID        for a28
 col ExecT        for a5
 col Ublk         for a9
+col UblkMb       for a10
 col TxAge        for a5
 col Client       for a30
 col Xid          for a18
@@ -16,6 +21,8 @@ col TxStat       for a6
 col Resid        for a5
 col Isol         for a8
 col Cmd          for a6
+
+ACCEPT sid PROMPT 'Enter SID (empty=all): '
 
 SELECT SUBSTR(b.sid_tid, 1, 24) AS sess_id,
        SUBSTR(NVL(b.username, '-'), 1, 18) AS user_name,
@@ -30,6 +37,7 @@ SELECT SUBSTR(b.sid_tid, 1, 24) AS sess_id,
            ELSE TO_CHAR(ROUND(b.exec_sec / 3600)) || 'H'
          END, 1, 5) AS exec_t,
        SUBSTR(TO_CHAR(b.used_ublk), 1, 9) AS ublk,
+       SUBSTR(TO_CHAR(ROUND(b.used_ublk * b.bs / 1024 / 1024, 3)), 1, 10) AS ublk_mb,
        SUBSTR(
          CASE
            WHEN b.tx_sec < 1 THEN TO_CHAR(ROUND(b.tx_sec * 1000)) || 'MS'
@@ -45,7 +53,7 @@ SELECT SUBSTR(b.sid_tid, 1, 24) AS sess_id,
        SUBSTR(NVL(TO_CHAR(b.command), '-'), 1, 6) AS cmd
   FROM (
         SELECT a.inst_id || '.' || a.sid || '.' || a.serial# || '.' ||
-               b.thread_id AS sid_tid,
+               NVL(TO_CHAR(b.thread_id), '-') AS sid_tid,
                a.username,
                a.status,
                a.wait_event,
@@ -63,17 +71,32 @@ SELECT SUBSTR(b.sid_tid, 1, 24) AS sess_id,
                d.residual,
                d.isolation_level,
                a.command,
-               TRUNC((SYSDATE - d.start_date) * 86400) AS tx_sec
-          FROM gv$session a,
-               gv$process b,
-               v$sqlcommand c,
-               gv$transaction d
-         WHERE a.inst_id = b.inst_id
+               TRUNC((SYSDATE - d.start_date) * 86400) AS tx_sec,
+               p.bs
+          FROM gv$session a
+          LEFT JOIN gv$process b
+            ON a.inst_id = b.inst_id
            AND a.paddr = b.thread_addr
-           AND a.inst_id = d.inst_id
+          LEFT JOIN v$sqlcommand c
+            ON a.command = c.command_type
+          JOIN gv$transaction d
+            ON a.inst_id = d.inst_id
            AND a.sid = d.sid
            AND a.xid = d.xid
-           AND a.command = c.command_type(+)
-           AND a.type != 'BACKGROUND'
+         CROSS JOIN (
+                SELECT CASE
+                         WHEN UPPER(value) = '8K' THEN 8192
+                         WHEN UPPER(value) = '16K' THEN 16384
+                         WHEN UPPER(value) = '32K' THEN 32768
+                         ELSE TO_NUMBER(value)
+                       END AS bs
+                  FROM v$parameter
+                 WHERE name = 'DB_BLOCK_SIZE'
+               ) p
+         WHERE a.type != 'BACKGROUND'
+           AND (
+                 NULLIF(TRIM('&&sid'), '') IS NULL
+                 OR a.sid = TO_NUMBER(TRIM('&&sid'))
+               )
          ORDER BY tx_sec DESC, used_ublk DESC
        ) b;

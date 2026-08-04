@@ -1,3 +1,7 @@
+-- File Name: instance.sql
+-- Purpose: YashanDB Show instance status role and startup info (GV$INSTANCE)
+-- Created: 20251201 by huangtingzhong
+
 COL i                FORMAT A2
 COL inst_name        FORMAT A16
 COL host             FORMAT A16

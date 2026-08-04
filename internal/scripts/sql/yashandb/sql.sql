@@ -1,29 +1,37 @@
 -- File Name: sql.sql
--- Purpose: YashanDB SQL tuning report with plan and objects
+-- Purpose: YashanDB SQL tuning report (ORIGINAL+LITERAL SQL, plan, objects)
 -- Created: 20251201  by  huangtingzhong
+-- Updated: 20260803 by huangtingzhong (ORIGINAL=executed CLOB; >32K chunked)
 
 set heading on;
 set serveroutput on;
 prompt
 prompt ****************************************************************************************
-prompt LITERAL SQL
+prompt ORIGINAL SQL / LITERAL SQL
 prompt ****************************************************************************************
 
 DECLARE
   c_sqlid           CONSTANT VARCHAR2(64) := '&&sqlid';
+  -- UTF8: SUBSTR into VARCHAR2(4000) may exceed byte limit; keep emit chunk small
+  c_chunk           CONSTANT PLS_INTEGER := 1000;
+  c_varchar_limit   CONSTANT PLS_INTEGER := 32000;
 
   lvc_sql_text      VARCHAR2(32000);
-  lvc_orig_sql_text VARCHAR2(32000);
+  lvc_orig_sql_text CLOB;
   ln_child          NUMBER := 10000;
+  ln_exec_child     NUMBER;
+  ln_hash           NUMBER;
+  ln_phv            NUMBER;
+  ln_sql_len        NUMBER;
   lvc_repl          VARCHAR2(2000);
   lvc_bind          VARCHAR2(200);
-  lvc_name          VARCHAR2(30);
+  lvc_name          VARCHAR2(64);
 
   ln_bind_count     NUMBER := 0;
   ln_sql_cnt        NUMBER := 0;
   ln_qpos           NUMBER;
 
-  CURSOR c1 IS
+  CURSOR c1(p_child NUMBER) IS
     SELECT child_number,
            name,
            position,
@@ -32,7 +40,41 @@ DECLARE
            sql_id
       FROM v$sql_bind_capture
      WHERE sql_id = c_sqlid
-     ORDER BY child_number, position;
+       AND child_number = p_child
+     ORDER BY position;
+
+  PROCEDURE put_clob(p_text IN CLOB) IS
+    v_len NUMBER;
+    v_off NUMBER := 1;
+    v_buf VARCHAR2(4000);
+  BEGIN
+    IF p_text IS NULL THEN
+      RETURN;
+    END IF;
+    v_len := NVL(DBMS_LOB.GETLENGTH(p_text), 0);
+    IF v_len = 0 THEN
+      RETURN;
+    END IF;
+    WHILE v_off <= v_len LOOP
+      v_buf := DBMS_LOB.SUBSTR(p_text, LEAST(c_chunk, v_len - v_off + 1), v_off);
+      DBMS_OUTPUT.PUT_LINE(v_buf);
+      v_off := v_off + c_chunk;
+    END LOOP;
+  END;
+
+  PROCEDURE put_varchar(p_text IN VARCHAR2) IS
+    v_len PLS_INTEGER;
+    v_off PLS_INTEGER := 1;
+  BEGIN
+    IF p_text IS NULL THEN
+      RETURN;
+    END IF;
+    v_len := NVL(LENGTH(p_text), 0);
+    WHILE v_off <= v_len LOOP
+      DBMS_OUTPUT.PUT_LINE(SUBSTR(p_text, v_off, c_chunk));
+      v_off := v_off + c_chunk;
+    END LOOP;
+  END;
 
   FUNCTION replace_first_outside_quotes(
     p_text        IN VARCHAR2,
@@ -139,40 +181,87 @@ BEGIN
     RETURN;
   END IF;
 
-  SELECT sql_fulltext
-    INTO lvc_orig_sql_text
-    FROM v$sql
-   WHERE sql_id = c_sqlid
-     AND ROWNUM = 1;
+  -- ORIGINAL = executed cursor text in library cache (most recently active)
+  SELECT sql_fulltext,
+         parsing_schema_name,
+         child_number,
+         hash_value,
+         plan_hash_value,
+         NVL(DBMS_LOB.GETLENGTH(sql_fulltext), 0)
+    INTO lvc_orig_sql_text,
+         lvc_name,
+         ln_exec_child,
+         ln_hash,
+         ln_phv,
+         ln_sql_len
+    FROM (
+           SELECT sql_fulltext,
+                  parsing_schema_name,
+                  child_number,
+                  hash_value,
+                  plan_hash_value
+             FROM v$sql
+            WHERE sql_id = c_sqlid
+            ORDER BY last_active_time DESC NULLS LAST,
+                     executions DESC NULLS LAST,
+                     child_number
+         )
+   WHERE ROWNUM = 1;
 
-  SELECT parsing_schema_name
-    INTO lvc_name
-    FROM v$sql
-   WHERE sql_id = c_sqlid
-     AND ROWNUM = 1;
+  DBMS_OUTPUT.PUT_LINE('===== ORIGINAL SQL =====');
+  DBMS_OUTPUT.PUT_LINE(
+    'source=v$sql.sql_fulltext (executed cursor) sql_id=' || c_sqlid
+    || ' child=' || TO_CHAR(ln_exec_child)
+    || ' schema=' || lvc_name
+    || ' hash=' || TO_CHAR(ln_hash)
+    || ' phv=' || TO_CHAR(ln_phv)
+    || ' chars=' || TO_CHAR(ln_sql_len)
+  );
+  put_clob(lvc_orig_sql_text);
+  DBMS_OUTPUT.PUT_LINE('--------------------------------------------------------');
 
   SELECT COUNT(*)
     INTO ln_bind_count
     FROM v$sql_bind_capture
-   WHERE sql_id = c_sqlid;
+   WHERE sql_id = c_sqlid
+     AND child_number = ln_exec_child;
 
   IF ln_bind_count = 0 THEN
-    DBMS_OUTPUT.PUT_LINE('Schema: ' || lvc_name);
-    DBMS_OUTPUT.PUT_LINE(lvc_orig_sql_text);
+    DBMS_OUTPUT.PUT_LINE('===== LITERAL SQL =====');
+    DBMS_OUTPUT.PUT_LINE(
+      'Schema: ' || lvc_name || ' child=' || TO_CHAR(ln_exec_child)
+      || ' (no bind capture on executed child; same as ORIGINAL SQL)'
+    );
+    put_clob(lvc_orig_sql_text);
     DBMS_OUTPUT.PUT_LINE('--------------------------------------------------------');
     RETURN;
   END IF;
 
-  FOR r1 IN c1 LOOP
+  IF ln_sql_len > c_varchar_limit THEN
+    DBMS_OUTPUT.PUT_LINE('===== LITERAL SQL =====');
+    DBMS_OUTPUT.PUT_LINE(
+      'WARN: SQL chars=' || TO_CHAR(ln_sql_len)
+      || ' > ' || TO_CHAR(c_varchar_limit)
+      || '; bind literal rewrite skipped (see ORIGINAL SQL)'
+    );
+    DBMS_OUTPUT.PUT_LINE('--------------------------------------------------------');
+    RETURN;
+  END IF;
+
+  -- short SQL: bind rewrite on VARCHAR2 copy of executed text
+  lvc_sql_text := DBMS_LOB.SUBSTR(lvc_orig_sql_text, ln_sql_len, 1);
+
+  FOR r1 IN c1(ln_exec_child) LOOP
     IF (r1.child_number <> ln_child) THEN
       IF ln_child <> 10000 THEN
-        DBMS_OUTPUT.PUT_LINE('Schema: ' || lvc_name);
-        DBMS_OUTPUT.PUT_LINE(lvc_sql_text);
+        DBMS_OUTPUT.PUT_LINE('===== LITERAL SQL =====');
+        DBMS_OUTPUT.PUT_LINE('Schema: ' || lvc_name || ' child=' || TO_CHAR(ln_child));
+        put_varchar(lvc_sql_text);
         DBMS_OUTPUT.PUT_LINE('--------------------------------------------------------');
       END IF;
 
       ln_child     := r1.child_number;
-      lvc_sql_text := lvc_orig_sql_text;
+      lvc_sql_text := DBMS_LOB.SUBSTR(lvc_orig_sql_text, ln_sql_len, 1);
     END IF;
 
     BEGIN
@@ -180,7 +269,8 @@ BEGIN
         INTO lvc_name
         FROM v$sql
        WHERE sql_id = r1.sql_id
-         AND child_number = r1.child_number;
+         AND child_number = r1.child_number
+         AND ROWNUM = 1;
     EXCEPTION
       WHEN OTHERS THEN NULL;
     END;
@@ -199,7 +289,7 @@ BEGIN
 
     lvc_bind := bind_pattern(r1.name);
 
-    IF lvc_bind IS NOT NULL AND NOT uses_question_bind(lvc_orig_sql_text) THEN
+    IF lvc_bind IS NOT NULL AND NOT uses_question_bind(lvc_sql_text) THEN
       lvc_sql_text := replace_first_outside_quotes(lvc_sql_text, lvc_bind, lvc_repl);
     ELSE
       ln_qpos := INSTR(lvc_sql_text, '?');
@@ -218,8 +308,12 @@ BEGIN
     END IF;
   END LOOP;
 
-  DBMS_OUTPUT.PUT_LINE('Schema: ' || lvc_name);
-  DBMS_OUTPUT.PUT_LINE(lvc_sql_text);
+  DBMS_OUTPUT.PUT_LINE('===== LITERAL SQL =====');
+  DBMS_OUTPUT.PUT_LINE(
+    'Schema: ' || lvc_name || ' child=' || TO_CHAR(ln_exec_child)
+    || ' (bind values from capture; not byte-identical to execute)'
+  );
+  put_varchar(lvc_sql_text);
   DBMS_OUTPUT.PUT_LINE('--------------------------------------------------------');
 END;
 /
@@ -230,314 +324,337 @@ prompt *************************************************************************
 prompt PLAN from v$sql_plan
 prompt ****************************************************************************************
 
-DECLARE
-    v_sql_id          VARCHAR2(13) := '&&sqlid';
-    v_plan_count      NUMBER := 0;
-    v_ord_seq         NUMBER := 0;
-    v_indent          VARCHAR2(100);
-    v_operation       VARCHAR2(4000);
-    v_object_info     VARCHAR2(200);
-    v_id_str          VARCHAR2(10);
-    v_pid_str         VARCHAR2(10);
-    v_display_pid     NUMBER;
-    v_ord_str         VARCHAR2(10);
-    v_operation_str   VARCHAR2(40);
-    v_name_str        VARCHAR2(30);
-    v_rows_str        VARCHAR2(12);
-    v_cost_str        VARCHAR2(10);
-    v_time_str        VARCHAR2(10);
+-- Pure SQL plan (no DBMS_OUTPUT); works on READ_ONLY standby.
+-- Do not set "col plan_line for aN": yasql pads every row to N chars.
 
-    TYPE t_ord_map IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
-    TYPE t_plan_rec IS RECORD (
-        id          NUMBER,
-        parent_id   NUMBER,
-        position    NUMBER,
-        operation   VARCHAR2(4000),
-        options     VARCHAR2(4000)
-    );
-    TYPE t_plan_tab IS TABLE OF t_plan_rec;
-    TYPE t_child_tab IS TABLE OF NUMBER;
-
-    g_ord         t_ord_map;
-    g_disp_parent t_ord_map;
-    g_plan_rows   t_plan_tab;
-
-    CURSOR c_plans IS
-        SELECT ph
-          FROM (
-                SELECT DISTINCT plan_hash_value AS ph
-                  FROM v$sql_plan
-                 WHERE sql_id = v_sql_id
-                 ORDER BY plan_hash_value
-               );
-
-    FUNCTION get_indent(p_depth INTEGER) RETURN VARCHAR2 IS
-    BEGIN
-        RETURN LPAD(' ', (p_depth * 2), ' ');
-    END;
-
-    -- YashanDB: INDEX may sit under JOIN with TABLE ACCESS BY INDEX ROWID;
-    -- Display tree hangs INDEX under TABLE ACCESS like Oracle XPLAN.
-    FUNCTION find_tab_access_parent(p_id NUMBER, p_parent_id NUMBER) RETURN NUMBER IS
-        v_tab_id NUMBER := NULL;
-    BEGIN
-        FOR i IN 1 .. g_plan_rows.COUNT LOOP
-            IF g_plan_rows(i).parent_id = p_parent_id
-               AND g_plan_rows(i).id < p_id
-               AND (
-                     g_plan_rows(i).operation LIKE '%BY INDEX ROWID%'
-                     OR NVL(g_plan_rows(i).options, ' ') LIKE '%INDEX ROWID%'
-                   ) THEN
-                IF v_tab_id IS NULL OR g_plan_rows(i).id > v_tab_id THEN
-                    v_tab_id := g_plan_rows(i).id;
-                END IF;
-            END IF;
-        END LOOP;
-        RETURN v_tab_id;
-    END find_tab_access_parent;
-
-    PROCEDURE load_plan_rows(p_ph NUMBER) IS
-    BEGIN
-        SELECT id, parent_id, position, operation, options
-          BULK COLLECT INTO g_plan_rows
-          FROM v$sql_plan
-         WHERE sql_id = v_sql_id
-           AND plan_hash_value = p_ph
-           AND id IS NOT NULL
-           AND operation IS NOT NULL;
-    END load_plan_rows;
-
-    PROCEDURE build_display_parent IS
-    BEGIN
-        g_disp_parent.DELETE;
-        FOR i IN 1 .. g_plan_rows.COUNT LOOP
-            IF g_plan_rows(i).parent_id IS NULL
-               OR g_plan_rows(i).operation NOT LIKE 'INDEX%' THEN
-                g_disp_parent(g_plan_rows(i).id) := g_plan_rows(i).parent_id;
-            ELSE
-                v_display_pid := find_tab_access_parent(
-                    g_plan_rows(i).id, g_plan_rows(i).parent_id
-                );
-                IF v_display_pid IS NOT NULL THEN
-                    g_disp_parent(g_plan_rows(i).id) := v_display_pid;
-                ELSE
-                    g_disp_parent(g_plan_rows(i).id) := g_plan_rows(i).parent_id;
-                END IF;
-            END IF;
-        END LOOP;
-    END build_display_parent;
-
-    FUNCTION plan_position(p_id NUMBER) RETURN NUMBER IS
-    BEGIN
-        FOR i IN 1 .. g_plan_rows.COUNT LOOP
-            IF g_plan_rows(i).id = p_id THEN
-                RETURN NVL(g_plan_rows(i).position, 0);
-            END IF;
-        END LOOP;
-        RETURN 0;
-    END plan_position;
-
-    FUNCTION list_display_children(p_parent_id NUMBER) RETURN t_child_tab IS
-        v_children t_child_tab := t_child_tab();
-        v_swap     NUMBER;
-        v_pos_i    NUMBER;
-        v_pos_j    NUMBER;
-    BEGIN
-        FOR i IN 1 .. g_plan_rows.COUNT LOOP
-            IF NVL(g_disp_parent(g_plan_rows(i).id), -1) = NVL(p_parent_id, -1) THEN
-                v_children.EXTEND;
-                v_children(v_children.COUNT) := g_plan_rows(i).id;
-            END IF;
-        END LOOP;
-        -- Oracle exec order: siblings by position/id ASC, post-order Ord
-        IF v_children.COUNT > 1 THEN
-            FOR i IN 1 .. v_children.COUNT - 1 LOOP
-                FOR j IN i + 1 .. v_children.COUNT LOOP
-                    v_pos_i := plan_position(v_children(i));
-                    v_pos_j := plan_position(v_children(j));
-                    IF v_pos_j < v_pos_i
-                       OR (v_pos_j = v_pos_i AND v_children(j) < v_children(i)) THEN
-                        v_swap := v_children(i);
-                        v_children(i) := v_children(j);
-                        v_children(j) := v_swap;
-                    END IF;
-                END LOOP;
-            END LOOP;
-        END IF;
-        RETURN v_children;
-    END list_display_children;
-
-    -- display tree, siblings ASC, post-order gives Ord
-    PROCEDURE walk_plan_ord(p_parent_id NUMBER, io_ord IN OUT NUMBER) IS
-        v_children t_child_tab;
-    BEGIN
-        v_children := list_display_children(p_parent_id);
-        FOR i IN 1 .. v_children.COUNT LOOP
-            walk_plan_ord(v_children(i), io_ord);
-            io_ord := io_ord + 1;
-            g_ord(v_children(i)) := io_ord;
-        END LOOP;
-    END walk_plan_ord;
-
-BEGIN
-    FOR rec_plan IN c_plans LOOP
-        v_plan_count := v_plan_count + 1;
-
-        g_ord.DELETE;
-        load_plan_rows(rec_plan.ph);
-        build_display_parent;
-        v_ord_seq := 0;
-        walk_plan_ord(0, v_ord_seq);
-        v_ord_seq := v_ord_seq + 1;
-        g_ord(0) := v_ord_seq;
-
-        DBMS_OUTPUT.PUT_LINE('');
-        DBMS_OUTPUT.PUT_LINE('============================================================================');
-        DBMS_OUTPUT.PUT_LINE('Plan Hash Value: ' || rec_plan.ph);
-        DBMS_OUTPUT.PUT_LINE('============================================================================');
-        DBMS_OUTPUT.PUT_LINE('');
-
-        DBMS_OUTPUT.PUT_LINE('|' ||
-                            LPAD('Id', 4) || '|' ||
-                            LPAD('Pid', 4) || '|' ||
-                            LPAD('Ord', 4) || '|' ||
-                            RPAD('Operation', 39) || '|' ||
-                            RPAD('Name', 29) || '|' ||
-                            RPAD('Rows', 11) || '|' ||
-                            RPAD('Cost', 9) || '|' ||
-                            RPAD('Time', 9) || '|');
-
-        DBMS_OUTPUT.PUT_LINE('|' ||
-                            LPAD('-', 4, '-') || '|' ||
-                            LPAD('-', 4, '-') || '|' ||
-                            LPAD('-', 4, '-') || '|' ||
-                            RPAD('-', 39, '-') || '|' ||
-                            RPAD('-', 29, '-') || '|' ||
-                            LPAD('-', 11, '-') || '|' ||
-                            LPAD('-', 9, '-') || '|' ||
-                            LPAD('-', 9, '-') || '|');
-
-        FOR rec_detail IN (
-            SELECT id,
-                   parent_id,
-                   depth,
-                   position,
-                   operation,
-                   options,
-                   object_owner,
-                   object_name,
-                   object_type,
-                   optimizer,
-                   cost,
-                   cardinality,
-                   bytes,
-                   cpu_cost,
-                   io_cost,
-                   access_predicates,
-                   filter_predicates,
-                   partition_start,
-                   partition_stop,
-                   other_tag,
-                   other,
-                   time AS plan_time
-              FROM v$sql_plan
-             WHERE sql_id = v_sql_id
-               AND plan_hash_value = rec_plan.ph
-               AND id IS NOT NULL
-               AND operation IS NOT NULL
-             ORDER BY id
-        ) LOOP
-            v_indent := get_indent(rec_detail.depth);
-            v_operation := v_indent || rec_detail.operation;
-            IF rec_detail.options IS NOT NULL THEN
-                v_operation := v_operation || ' ' || rec_detail.options;
-            END IF;
-
-            IF rec_detail.object_name IS NOT NULL THEN
-                v_object_info := rec_detail.object_owner || '.' || rec_detail.object_name;
-                IF rec_detail.object_type IS NOT NULL THEN
-                    v_object_info := v_object_info || ' [' || rec_detail.object_type || ']';
-                END IF;
-            ELSE
-                v_object_info := '';
-            END IF;
-
-            v_id_str := LPAD(TO_CHAR(rec_detail.id), 4);
-            v_display_pid := g_disp_parent(rec_detail.id);
-            IF v_display_pid IS NULL THEN
-                v_pid_str := LPAD(' ', 4);
-            ELSE
-                v_pid_str := LPAD(TO_CHAR(v_display_pid), 4);
-            END IF;
-            v_ord_str := LPAD(TO_CHAR(g_ord(rec_detail.id)), 4);
-            v_operation_str := RPAD(SUBSTR(NVL(v_operation, ' '), 1, 39), 39);
-            v_name_str := RPAD(SUBSTR(NVL(v_object_info, ' '), 1, 29), 29);
-            v_rows_str := RPAD(NVL(TO_CHAR(rec_detail.cardinality), ' '), 11);
-            v_cost_str := RPAD(NVL(TO_CHAR(rec_detail.cost), ' '), 9);
-            v_time_str := RPAD(NVL(TO_CHAR(rec_detail.plan_time), ' '), 9);
-
-            DBMS_OUTPUT.PUT_LINE(
-                '|' || v_id_str || '|' ||
-                v_pid_str || '|' ||
-                v_ord_str || '|' ||
-                v_operation_str || '|' ||
-                v_name_str || '|' ||
-                v_rows_str || '|' ||
-                v_cost_str || '|' ||
-                v_time_str || '|'
-            );
-
-            IF LENGTH(TRIM(NVL(rec_detail.access_predicates, ''))) > 0 THEN
-                DBMS_OUTPUT.PUT_LINE(
-                    '|' || LPAD(' ', 4) || '|' ||
-                    LPAD(' ', 4) || '|' ||
-                    LPAD(' ', 4) || '|' ||
-                    RPAD('  -> Access: ' || SUBSTR(rec_detail.access_predicates, 1, 26), 39) || '|' ||
-                    RPAD(' ', 29) || '|' ||
-                    RPAD(' ', 11) || '|' ||
-                    RPAD(' ', 9) || '|' ||
-                    RPAD(' ', 9) || '|'
-                );
-            END IF;
-
-            IF LENGTH(TRIM(NVL(rec_detail.filter_predicates, ''))) > 0 THEN
-                DBMS_OUTPUT.PUT_LINE(
-                    '|' || LPAD(' ', 4) || '|' ||
-                    LPAD(' ', 4) || '|' ||
-                    LPAD(' ', 4) || '|' ||
-                    RPAD('  -> Filter: ' || SUBSTR(rec_detail.filter_predicates, 1, 26), 39) || '|' ||
-                    RPAD(' ', 29) || '|' ||
-                    RPAD(' ', 11) || '|' ||
-                    RPAD(' ', 9) || '|' ||
-                    RPAD(' ', 9) || '|'
-                );
-            END IF;
-
-            IF NVL(rec_detail.partition_start, 0) <> 0
-               OR NVL(rec_detail.partition_stop, 0) <> 0 THEN
-                DBMS_OUTPUT.PUT_LINE(
-                    '|' || LPAD(' ', 4) || '|' ||
-                    LPAD(' ', 4) || '|' ||
-                    LPAD(' ', 4) || '|' ||
-                    RPAD('  -> Partition: ' ||
-                         NVL(TO_CHAR(rec_detail.partition_start), '?') || '..' ||
-                         NVL(TO_CHAR(rec_detail.partition_stop), '?'), 39) || '|' ||
-                    RPAD(' ', 29) || '|' ||
-                    RPAD(' ', 11) || '|' ||
-                    RPAD(' ', 9) || '|' ||
-                    RPAD(' ', 9) || '|'
-                );
-            END IF;
-        END LOOP;
-
-        DBMS_OUTPUT.PUT_LINE('============================================================================');
-    END LOOP;
-
-    IF v_plan_count = 0 THEN
-        DBMS_OUTPUT.PUT_LINE('No plan found in V$SQL_PLAN for sql_id=' || v_sql_id);
-    END IF;
-END;
+-- One row per (plan_hash_value, id): collapse multi-child / multi-address
+-- copies in v$sql_plan so each PHV prints a single plan tree.
+WITH ranked AS (
+  SELECT p.plan_hash_value AS phv,
+         p.id,
+         p.parent_id,
+         p.depth,
+         p.operation,
+         p.options,
+         p.object_owner,
+         p.object_name,
+         p.object_type,
+         p.object_alias,
+         p.cost,
+         p.cardinality,
+         p.bytes,
+         p.time AS plan_time,
+         p.cpu_cost,
+         p.io_cost,
+         p.search_columns,
+         p.access_predicates,
+         p.filter_predicates,
+         p.projection,
+         p.partition_info,
+         p.partition_start,
+         p.partition_stop,
+         p.other_tag,
+         p.temp_space,
+         LPAD(' ', NVL(p.depth, 0) * 2) || p.operation || NVL(' ' || p.options, '') AS op_txt,
+         CASE
+           WHEN p.object_name IS NOT NULL THEN
+             p.object_owner || '.' || p.object_name ||
+             CASE
+               WHEN p.object_type IS NOT NULL THEN ' [' || p.object_type || ']'
+               ELSE ''
+             END ||
+             CASE
+               WHEN LENGTH(TRIM(NVL(p.object_alias, ''))) > 0
+               THEN ' (' || TRIM(p.object_alias) || ')'
+               ELSE ''
+             END
+           WHEN LENGTH(TRIM(NVL(p.object_alias, ''))) > 0 THEN
+             TRIM(p.object_alias)
+           ELSE NULL
+         END AS name_txt,
+         CASE
+           WHEN LENGTH(TRIM(NVL(p.access_predicates, ''))) > 0
+           THEN '  -> Access: ' || p.access_predicates
+         END AS access_txt,
+         CASE
+           WHEN LENGTH(TRIM(NVL(p.filter_predicates, ''))) > 0
+           THEN '  -> Filter: ' || p.filter_predicates
+         END AS filter_txt,
+         -- Prefer PARTITION_INFO; append PARTITION_START..STOP when non-zero
+         CASE
+           WHEN LENGTH(TRIM(NVL(p.partition_info, ''))) > 0 THEN
+             '  -> Partition: ' || TRIM(p.partition_info) ||
+             CASE
+               WHEN NVL(p.partition_start, 0) <> 0 OR NVL(p.partition_stop, 0) <> 0
+               THEN ' (' || NVL(TO_CHAR(p.partition_start), '?') || '..' ||
+                    NVL(TO_CHAR(p.partition_stop), '?') || ')'
+               ELSE ''
+             END
+           WHEN NVL(p.partition_start, 0) <> 0 OR NVL(p.partition_stop, 0) <> 0 THEN
+             '  -> Partition: ' ||
+             NVL(TO_CHAR(p.partition_start), '?') || '..' ||
+             NVL(TO_CHAR(p.partition_stop), '?')
+         END AS part_txt,
+         CASE
+           WHEN LENGTH(TRIM(NVL(p.other_tag, ''))) > 0
+           THEN '  -> Other: ' || TRIM(p.other_tag)
+         END AS other_txt,
+         CASE
+           WHEN NVL(p.temp_space, 0) <> 0
+           THEN '  -> Temp: ' || TO_CHAR(p.temp_space)
+         END AS temp_txt,
+         CASE
+           WHEN NVL(p.search_columns, 0) <> 0
+           THEN '  -> SearchCols: ' || TO_CHAR(p.search_columns)
+         END AS search_txt,
+         CASE
+           WHEN NVL(p.cpu_cost, 0) <> 0 OR NVL(p.io_cost, 0) <> 0
+           THEN '  -> CpuIo: cpu=' || NVL(TO_CHAR(p.cpu_cost), '0') ||
+                ' io=' || NVL(TO_CHAR(p.io_cost), '0')
+         END AS cpuio_txt,
+         CASE
+           WHEN LENGTH(TRIM(NVL(p.projection, ''))) > 0
+           THEN '  -> Projection: ' || p.projection
+         END AS proj_txt,
+         ROW_NUMBER() OVER (
+           PARTITION BY p.plan_hash_value, p.id
+           ORDER BY p.child_number NULLS LAST, p.child_address, p.address
+         ) AS rn
+    FROM v$sql_plan p
+   WHERE p.sql_id = '&&sqlid'
+     AND p.id IS NOT NULL
+     AND p.operation IS NOT NULL
+),
+base AS (
+  SELECT phv, id, parent_id, depth, operation, options,
+         object_owner, object_name, object_type, object_alias,
+         cost, cardinality, bytes, plan_time, cpu_cost, io_cost,
+         search_columns, access_predicates, filter_predicates, projection,
+         partition_info, partition_start, partition_stop, other_tag, temp_space,
+         op_txt, name_txt, access_txt, filter_txt, part_txt, other_txt,
+         temp_txt, search_txt, cpuio_txt, proj_txt
+    FROM ranked
+   WHERE rn = 1
+),
+w AS (
+  SELECT phv,
+         GREATEST(LENGTH('Id'), NVL(MAX(LENGTH(TO_CHAR(id))), 0)) AS w_id,
+         GREATEST(LENGTH('Pid'), NVL(MAX(LENGTH(TO_CHAR(parent_id))), 0)) AS w_pid,
+         GREATEST(LENGTH('Ord'), NVL(MAX(LENGTH(TO_CHAR(id))), 0)) AS w_ord,
+         LEAST(
+           120,
+           GREATEST(
+             LENGTH('Operation'),
+             NVL(MAX(LENGTH(op_txt)), 0),
+             NVL(MAX(LENGTH(access_txt)), 0),
+             NVL(MAX(LENGTH(filter_txt)), 0),
+             NVL(MAX(LENGTH(part_txt)), 0),
+             NVL(MAX(LENGTH(other_txt)), 0),
+             NVL(MAX(LENGTH(temp_txt)), 0),
+             NVL(MAX(LENGTH(search_txt)), 0),
+             NVL(MAX(LENGTH(cpuio_txt)), 0),
+             NVL(MAX(LENGTH(proj_txt)), 0)
+           )
+         ) AS w_op,
+         LEAST(120, GREATEST(LENGTH('Name'), NVL(MAX(LENGTH(name_txt)), 0))) AS w_name,
+         GREATEST(LENGTH('Rows'), NVL(MAX(LENGTH(TO_CHAR(cardinality))), 0)) AS w_rows,
+         GREATEST(LENGTH('Bytes'), NVL(MAX(LENGTH(TO_CHAR(bytes))), 0)) AS w_bytes,
+         GREATEST(LENGTH('Cost'), NVL(MAX(LENGTH(TO_CHAR(cost))), 0)) AS w_cost,
+         GREATEST(LENGTH('Time'), NVL(MAX(LENGTH(TO_CHAR(plan_time))), 0)) AS w_time
+    FROM base
+   GROUP BY phv
+),
+phvs AS (
+  SELECT DISTINCT phv FROM base
+),
+lines AS (
+  SELECT p.phv,
+         0 AS sek,
+         0 AS sid,
+         '============================================================================' AS plan_line
+    FROM phvs p
+  UNION ALL
+  SELECT p.phv, 1, 0,
+         'Plan Hash Value: ' || TO_CHAR(p.phv)
+    FROM phvs p
+  UNION ALL
+  SELECT p.phv, 2, 0,
+         '============================================================================'
+    FROM phvs p
+  UNION ALL
+  SELECT p.phv, 4, 0,
+         '|' || LPAD('Id', w.w_id) || '|' ||
+         LPAD('Pid', w.w_pid) || '|' ||
+         LPAD('Ord', w.w_ord) || '|' ||
+         RPAD('Operation', w.w_op) || '|' ||
+         RPAD('Name', w.w_name) || '|' ||
+         RPAD('Rows', w.w_rows) || '|' ||
+         RPAD('Bytes', w.w_bytes) || '|' ||
+         RPAD('Cost', w.w_cost) || '|' ||
+         RPAD('Time', w.w_time) || '|'
+    FROM phvs p
+    JOIN w ON w.phv = p.phv
+  UNION ALL
+  SELECT p.phv, 5, 0,
+         '|' || LPAD('-', w.w_id, '-') || '|' ||
+         LPAD('-', w.w_pid, '-') || '|' ||
+         LPAD('-', w.w_ord, '-') || '|' ||
+         RPAD('-', w.w_op, '-') || '|' ||
+         RPAD('-', w.w_name, '-') || '|' ||
+         RPAD('-', w.w_rows, '-') || '|' ||
+         RPAD('-', w.w_bytes, '-') || '|' ||
+         RPAD('-', w.w_cost, '-') || '|' ||
+         RPAD('-', w.w_time, '-') || '|'
+    FROM phvs p
+    JOIN w ON w.phv = p.phv
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20,
+         '|' || LPAD(TO_CHAR(b.id), w.w_id) || '|' ||
+         LPAD(NVL(TO_CHAR(b.parent_id), ' '), w.w_pid) || '|' ||
+         LPAD(TO_CHAR(b.id), w.w_ord) || '|' ||
+         RPAD(SUBSTR(NVL(b.op_txt, ' '), 1, w.w_op), w.w_op) || '|' ||
+         RPAD(SUBSTR(NVL(b.name_txt, ' '), 1, w.w_name), w.w_name) || '|' ||
+         RPAD(SUBSTR(NVL(TO_CHAR(b.cardinality), ' '), 1, w.w_rows), w.w_rows) || '|' ||
+         RPAD(SUBSTR(NVL(TO_CHAR(b.bytes), ' '), 1, w.w_bytes), w.w_bytes) || '|' ||
+         RPAD(SUBSTR(NVL(TO_CHAR(b.cost), ' '), 1, w.w_cost), w.w_cost) || '|' ||
+         RPAD(SUBSTR(NVL(TO_CHAR(b.plan_time), ' '), 1, w.w_time), w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 1,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.access_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.access_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 2,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.filter_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.filter_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 3,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.part_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.part_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 4,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.other_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.other_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 5,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.temp_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.temp_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 6,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.search_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.search_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 7,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.cpuio_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.cpuio_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 8,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.proj_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.proj_txt IS NOT NULL
+  UNION ALL
+  SELECT p.phv, 7, 0,
+         '============================================================================'
+    FROM phvs p
+),
+empty_msg AS (
+  SELECT CAST(NULL AS NUMBER) AS phv,
+         0 AS sek,
+         0 AS sid,
+         'No plan found in V$SQL_PLAN for sql_id=&&sqlid' AS plan_line
+    FROM dual
+   WHERE NOT EXISTS (SELECT 1 FROM base)
+)
+SELECT plan_line
+  FROM (
+        SELECT phv, sek, sid, plan_line FROM lines
+        UNION ALL
+        SELECT phv, sek, sid, plan_line FROM empty_msg
+       )
+ ORDER BY phv NULLS LAST, sek, sid
 /
+
+
 PROMPT
 PROMPT +------------------------------------------------------------------------+
 PROMPT | information from v$sqlarea                |
@@ -576,22 +693,24 @@ SELECT PLAN_HASH_VALUE||'' PHV,
         ELSE TO_CHAR(ROUND(EXECUTIONS / 10000, 2)) || 'W'
         END AS EXEC,
        CASE
+        WHEN CPU_TIME IS NULL THEN NULL
         WHEN CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
         END AS CPU_P_E,
        CASE
+        WHEN ELAPSED_TIME IS NULL THEN NULL
         WHEN ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
         END AS ELA_P_E,
        CASE
         WHEN DISK_READS / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) < 1000
@@ -620,49 +739,54 @@ SELECT PLAN_HASH_VALUE||'' PHV,
         ELSE TO_CHAR(ROUND(fetches / DECODE(executions, 0, 1, executions) / 10000, 2)) || 'W'
         END AS ROWS_P_F,
       CASE
+        WHEN APPLICATION_WAIT_TIME IS NULL THEN NULL
         WHEN APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS APP_W_P,
         CASE
+        WHEN CONCURRENCY_WAIT_TIME IS NULL THEN NULL
         WHEN CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS CON_W_P,
          case
+               WHEN CLUSTER_WAIT_TIME IS NULL THEN NULL
                WHEN CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS CLU_W_P,
                CASE
+        WHEN USER_IO_WAIT_TIME IS NULL THEN NULL
         WHEN USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS IO_W_P,
     CASE
+        WHEN PLSQL_EXEC_TIME IS NULL THEN NULL
         WHEN PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS PLSQL_W_P,
     OUTLINE_CATEGORY outline
   FROM v$sqlarea
@@ -685,22 +809,24 @@ SELECT
     child_number||'' AS c,
     PARSING_SCHEMA_NAME AS username,
       CASE
+        WHEN CPU_TIME IS NULL THEN NULL
         WHEN CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(CPU_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS CPU_P_E,
     CASE
+        WHEN ELAPSED_TIME IS NULL THEN NULL
         WHEN ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(ELAPSED_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS ELA_P_E,
     CASE
         WHEN DISK_READS / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) < 1000
@@ -731,49 +857,54 @@ SELECT
         ELSE TO_CHAR(ROUND(ROWS_PROCESSED / DECODE(FETCHES, 0, 1, FETCHES) / 10000, 2)) || 'W'
     END AS ROWS_P_F,
   CASE
+        WHEN APPLICATION_WAIT_TIME IS NULL THEN NULL
         WHEN APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(APPLICATION_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS APP_P_E,
         CASE
+        WHEN CONCURRENCY_WAIT_TIME IS NULL THEN NULL
         WHEN CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(CONCURRENCY_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS CON_P_E,
         CASE
+        WHEN CLUSTER_WAIT_TIME IS NULL THEN NULL
         WHEN CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(CLUSTER_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS CLU_W_P,
         CASE
+        WHEN USER_IO_WAIT_TIME IS NULL THEN NULL
         WHEN USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(USER_IO_WAIT_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS IO_W_P,
         CASE
+        WHEN PLSQL_EXEC_TIME IS NULL THEN NULL
         WHEN PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 < 1000
             THEN ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000, 2) || 'ms'
-        WHEN PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 < 60
-            THEN ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60, 2) || 's'
-        WHEN PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 < 60
-            THEN ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 < 60
+            THEN ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000, 2) || 's'
+        WHEN PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 < 60
+            THEN ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(PLSQL_EXEC_TIME / DECODE(EXECUTIONS, 0, 1, EXECUTIONS) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS PLSQL_W_P,
     SUBSTR(FIRST_LOAD_TIME, 6, 10) || '.' || SUBSTR(LAST_LOAD_TIME, 6, 10) AS f_l_time
 FROM v$sql s
@@ -797,16 +928,18 @@ SELECT TO_CHAR (END_INTERVAL_TIME, 'dd hh24') end_time,
         ELSE TO_CHAR(ROUND(executions_delta / 10000, 2)) || 'W'
     END AS EXEC,
     CASE
+        WHEN cpu_time_delta IS NULL THEN NULL
         WHEN cpu_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 < 1000 THEN ROUND(cpu_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000, 2) || 'ms'
-        WHEN cpu_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 < 60 THEN ROUND(cpu_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60, 2) || 's'
-        WHEN cpu_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 < 60 THEN ROUND(cpu_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(cpu_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN cpu_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 < 60 THEN ROUND(cpu_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000, 2) || 's'
+        WHEN cpu_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 < 60 THEN ROUND(cpu_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(cpu_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS CPU_P_E,
     CASE
+        WHEN elapsed_time_delta IS NULL THEN NULL
         WHEN elapsed_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 < 1000 THEN ROUND(elapsed_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000, 2) || 'ms'
-        WHEN elapsed_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 < 60 THEN ROUND(elapsed_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60, 2) || 's'
-        WHEN elapsed_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 < 60 THEN ROUND(elapsed_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(elapsed_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN elapsed_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 < 60 THEN ROUND(elapsed_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000, 2) || 's'
+        WHEN elapsed_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 < 60 THEN ROUND(elapsed_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(elapsed_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS ELA_P_E,
     CASE
         WHEN disk_reads_delta / DECODE(executions_delta, 0, 1, executions_delta) < 1000 THEN TO_CHAR(ROUND(disk_reads_delta / DECODE(executions_delta, 0, 1, executions_delta),2))
@@ -834,10 +967,11 @@ SELECT TO_CHAR (END_INTERVAL_TIME, 'dd hh24') end_time,
         ELSE TO_CHAR(ROUND(direct_writes_delta / DECODE(executions_delta, 0, 1, executions_delta) / 10000, 2)) || 'W'
     END AS WRITE_P_E,
     CASE
+        WHEN IOWAIT_DELTA IS NULL THEN NULL
         WHEN IOWAIT_DELTA / DECODE(executions_delta, 0, 1, executions_delta) / 1000 < 1000 THEN ROUND(IOWAIT_DELTA / DECODE(executions_delta, 0, 1, executions_delta) / 1000, 2) || 'ms'
-        WHEN IOWAIT_DELTA / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 < 60 THEN ROUND(IOWAIT_DELTA / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60, 2) || 's'
-        WHEN IOWAIT_DELTA / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 < 60 THEN ROUND(IOWAIT_DELTA / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(IOWAIT_DELTA / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN IOWAIT_DELTA / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 < 60 THEN ROUND(IOWAIT_DELTA / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000, 2) || 's'
+        WHEN IOWAIT_DELTA / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 < 60 THEN ROUND(IOWAIT_DELTA / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(IOWAIT_DELTA / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS IOW_P_E,
     -- CASE
     --     WHEN parse_calls_delta / DECODE(executions_delta, 0, 1, executions_delta) < 1000 THEN TO_CHAR(ROUND(parse_calls_delta / DECODE(executions_delta, 0, 1, executions_delta),2))
@@ -850,28 +984,32 @@ SELECT TO_CHAR (END_INTERVAL_TIME, 'dd hh24') end_time,
         ELSE TO_CHAR(ROUND(sorts_delta / DECODE(executions_delta, 0, 1, executions_delta) / 10000, 2)) || 'W'
     END AS SORTS_P_E,
     CASE
+        WHEN apwait_delta IS NULL THEN NULL
         WHEN apwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 < 1000 THEN ROUND(apwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000, 2) || 'ms'
-        WHEN apwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 < 60 THEN ROUND(apwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60, 2) || 's'
-        WHEN apwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 < 60 THEN ROUND(apwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(apwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN apwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 < 60 THEN ROUND(apwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000, 2) || 's'
+        WHEN apwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 < 60 THEN ROUND(apwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(apwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS APP_P_E,
     CASE
+        WHEN ccwait_delta IS NULL THEN NULL
         WHEN ccwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 < 1000 THEN ROUND(ccwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000, 2) || 'ms'
-        WHEN ccwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 < 60 THEN ROUND(ccwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60, 2) || 's'
-        WHEN ccwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 < 60 THEN ROUND(ccwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(ccwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN ccwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 < 60 THEN ROUND(ccwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000, 2) || 's'
+        WHEN ccwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 < 60 THEN ROUND(ccwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(ccwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS CON_P_E,
     CASE
+        WHEN clwait_delta IS NULL THEN NULL
         WHEN clwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 < 1000 THEN ROUND(clwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000, 2) || 'ms'
-        WHEN clwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 < 60 THEN ROUND(clwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60, 2) || 's'
-        WHEN clwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 < 60 THEN ROUND(clwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(clwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN clwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 < 60 THEN ROUND(clwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000, 2) || 's'
+        WHEN clwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 < 60 THEN ROUND(clwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(clwait_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS CLU_W_P,
     CASE
+        WHEN plsexec_time_delta IS NULL THEN NULL
         WHEN plsexec_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 < 1000 THEN ROUND(plsexec_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000, 2) || 'ms'
-        WHEN plsexec_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 < 60 THEN ROUND(plsexec_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60, 2) || 's'
-        WHEN plsexec_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 < 60 THEN ROUND(plsexec_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60, 2) || 'm'
-        ELSE ROUND(plsexec_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 60 / 60 / 60, 2) || 'h'
+        WHEN plsexec_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 < 60 THEN ROUND(plsexec_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000, 2) || 's'
+        WHEN plsexec_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 < 60 THEN ROUND(plsexec_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60, 2) || 'm'
+        ELSE ROUND(plsexec_time_delta / DECODE(executions_delta, 0, 1, executions_delta) / 1000 / 1000 / 60 / 60, 2) || 'h'
     END AS PLSQL_W_P
     FROM WRH$_SQLSTAT  a, WRM$_SNAPSHOT b
    WHERE     a.sql_id = '&&sqlid'
@@ -886,64 +1024,51 @@ prompt
 prompt ****************************************************************************************
 prompt OBJECT SIZE
 prompt ****************************************************************************************
+-- Object resolution: small v$sql_plan set -> tbl (index->table UNION table), then JOIN.
+-- Avoid (owner,name) IN (UNION dba_indexes/dba_tables) semi-join explosion.
+-- seg = [***]owner.name  (*** = table)
 
-col owner              for   a15
-col index_owner        for   a15
-col table_owner        for   a15
-col table_name         for   a25
-col l_t                for   a5
-col degree             for   a6
-col part               for   a4
-col LAST_ANALYZED      for   a25
-col NUM_ROWS           for   a10
-col blocks             for   a10
-col EMPTY_BLOCKS       for   a5
-col COLUMN_NAME        for   a15
-col d_type             for   a20
-col NUM_DISTINCT       for   a10
-col N                  for   a1
-col NUM_NULLS          for   a8
-col sample_size        for   a10
-col HISTOGRAM          for   a10
+col seg                for   a50
+col typ                for   a18
+col sz                 for   a8
 
-
-col segment_size for a15
-WITH t
-     AS (SELECT /*+ materialize */
-                DISTINCT OBJECT_OWNER, OBJECT_NAME
-           FROM (SELECT OBJECT_OWNER, OBJECT_NAME
-                   FROM V$SQL_PLAN
-                  WHERE SQL_ID = '&&sqlid'  AND OBJECT_NAME IS NOT NULL)),
-     tt
-     AS (SELECT /*+materialize  no_merge */
-                DISTINCT table_owner, table_name
-           FROM (SELECT table_owner, table_name
-                   FROM dba_indexes
-                  WHERE (owner, index_name) IN
-                            (SELECT object_owner, object_name
-                               FROM t)
-                 UNION
-                 SELECT owner, table_name
-                   FROM dba_tables
-                  WHERE (owner, table_name) IN
-                            (SELECT object_owner, object_name FROM t)))
-SELECT owner,
-                    (SELECT '***'
-                       FROM tt
-                      WHERE     b.owner = tt.table_owner
-                            AND b.segment_name = tt.table_name)
-                 || segment_name
-                     segment_name,
-                 segment_type,
-                 trunc(bytes/1024/1024)||'M' segment_size
-            FROM (SELECT owner,
-                         segment_name,
-                         segment_type,
-                         sum(bytes) bytes
-                   from dba_segments a
-                    where (a.owner, a.segment_name) IN (SELECT object_owner, object_name FROM t union select table_owner,table_name from tt)
-                    GROUP BY owner, segment_type, segment_name)  b
-ORDER BY owner, segment_name
+WITH t AS (
+  SELECT DISTINCT object_owner AS owner, object_name AS name
+    FROM v$sql_plan
+   WHERE sql_id = '&&sqlid'
+     AND object_name IS NOT NULL
+),
+tbl AS (
+  SELECT DISTINCT i.table_owner AS owner, i.table_name
+    FROM t
+    JOIN dba_indexes i ON i.owner = t.owner AND i.index_name = t.name
+  UNION
+  SELECT t.owner, t.name
+    FROM t
+    JOIN dba_tables dt ON dt.owner = t.owner AND dt.table_name = t.name
+),
+objs AS (
+  SELECT owner, name AS segment_name FROM t
+  UNION
+  SELECT owner, table_name FROM tbl
+)
+SELECT CASE WHEN EXISTS (
+              SELECT 1 FROM tbl tt
+               WHERE tt.owner = b.owner AND tt.table_name = b.segment_name
+            )
+            THEN '***' ELSE '' END
+       || b.owner || '.' || b.segment_name AS seg,
+       b.segment_type AS typ,
+       TRUNC(b.bytes / 1024 / 1024) || 'M' AS sz
+  FROM (
+        SELECT s.owner, s.segment_name, s.segment_type, SUM(s.bytes) AS bytes
+          FROM dba_segments s
+          JOIN objs o
+            ON s.owner = o.owner
+           AND s.segment_name = o.segment_name
+         GROUP BY s.owner, s.segment_type, s.segment_name
+       ) b
+ ORDER BY b.owner, b.segment_name
 /
 
 
@@ -953,42 +1078,74 @@ prompt *************************************************************************
 prompt TABLES
 prompt ****************************************************************************************
 
+col tab                for a40
+col l_t                for a5
+col degree             for a6
+col part               for a4
+col nrows              for a8
+col blks               for a8
+col eblks              for a6
+col avg_sp             for a6
+col avg_rlen           for a6
+col blk_mb             for a8
+col avg_mb             for a8
+col stale              for a5
+col last_analyzed      for a19
 
-WITH t
-     AS (SELECT /*+ materialize */
-               DISTINCT OBJECT_OWNER, OBJECT_NAME
-           FROM (SELECT OBJECT_OWNER, OBJECT_NAME
-                   FROM V$SQL_PLAN
-                  WHERE SQL_ID = '&&sqlid' AND OBJECT_NAME IS NOT NULL))
-  SELECT a.owner,
-         a.TABLE_NAME,
-         -- TABLESPACE_NAME,
-         a.LOGGING||'.'||a.TEMPORARY l_t,
-         LTRIM (a.DEGREE) DEGREE,
-         a.PARTITIONED as part,
-         a.NUM_ROWS||'' NUM_ROWS,
-         a.BLOCKS||'' BLOCKS,
-         a.EMPTY_BLOCKS||'' EMPTY_BLOCKS,
-         b.AVG_SPACE,
-         b.AVG_ROW_LEN,
-         trunc((b.blocks*tp.block_size)/1024/1024) block_size,
-         trunc((b.AVG_ROW_LEN*b.NUM_ROWS)/1024/1024) avg_size,
-         b.STALE_STATS,
-         a.LAST_ANALYZED
-    FROM DBA_TABLES a
-        , dba_tab_statistics b
-        ,dba_tablespaces tp
-   WHERE     (a.OWNER, a.TABLE_NAME) IN
-                (SELECT table_owner, table_name
-                   FROM dba_indexes
-                  WHERE (owner, index_name) IN (SELECT * FROM t)
-                 UNION ALL
-                 SELECT * FROM t)
-           AND a.owner = b.owner(+)
-         AND a.table_name = b.table_name(+)
-         and a.tablespace_name=tp.tablespace_name
-ORDER BY owner, table_name;
-
+WITH t AS (
+  SELECT DISTINCT object_owner AS owner, object_name AS name
+    FROM v$sql_plan
+   WHERE sql_id = '&&sqlid'
+     AND object_name IS NOT NULL
+),
+tbl AS (
+  SELECT DISTINCT i.table_owner AS owner, i.table_name
+    FROM t
+    JOIN dba_indexes i ON i.owner = t.owner AND i.index_name = t.name
+  UNION
+  SELECT t.owner, t.name
+    FROM t
+    JOIN dba_tables dt ON dt.owner = t.owner AND dt.table_name = t.name
+)
+SELECT a.owner || '.' || a.table_name AS tab,
+       a.logging || '.' || a.temporary AS l_t,
+       LTRIM(a.degree) AS degree,
+       a.partitioned AS part,
+       CASE
+         WHEN a.num_rows IS NULL THEN NULL
+         WHEN a.num_rows < 1000 THEN TO_CHAR(a.num_rows)
+         WHEN a.num_rows < 1000000 THEN TO_CHAR(ROUND(a.num_rows / 1000, 1)) || 'K'
+         ELSE TO_CHAR(ROUND(a.num_rows / 1000000, 2)) || 'M'
+       END AS nrows,
+       CASE
+         WHEN a.blocks IS NULL THEN NULL
+         WHEN a.blocks < 1000 THEN TO_CHAR(a.blocks)
+         WHEN a.blocks < 1000000 THEN TO_CHAR(ROUND(a.blocks / 1000, 1)) || 'K'
+         ELSE TO_CHAR(ROUND(a.blocks / 1000000, 2)) || 'M'
+       END AS blks,
+       CASE
+         WHEN a.empty_blocks IS NULL THEN NULL
+         WHEN a.empty_blocks < 1000 THEN TO_CHAR(a.empty_blocks)
+         WHEN a.empty_blocks < 1000000 THEN TO_CHAR(ROUND(a.empty_blocks / 1000, 1)) || 'K'
+         ELSE TO_CHAR(ROUND(a.empty_blocks / 1000000, 2)) || 'M'
+       END AS eblks,
+       b.avg_space || '' AS avg_sp,
+       b.avg_row_len || '' AS avg_rlen,
+       TRUNC((b.blocks * tp.block_size) / 1024 / 1024) || 'M' AS blk_mb,
+       TRUNC((b.avg_row_len * b.num_rows) / 1024 / 1024) || 'M' AS avg_mb,
+       b.stale_stats || '' AS stale,
+       TO_CHAR(a.last_analyzed, 'yyyy-mm-dd hh24:mi:ss') AS last_analyzed
+  FROM tbl x
+  JOIN dba_tables a
+    ON a.owner = x.owner AND a.table_name = x.table_name
+  LEFT JOIN dba_tab_statistics b
+    ON b.owner = a.owner
+   AND b.table_name = a.table_name
+   AND b.object_type = 'TABLE'
+  LEFT JOIN dba_tablespaces tp
+    ON tp.tablespace_name = a.tablespace_name
+ ORDER BY a.owner, a.table_name
+/
 
 
 
@@ -996,33 +1153,75 @@ prompt
 prompt ****************************************************************************************
 prompt TABLE COLUMNS
 prompt ****************************************************************************************
+-- tab = owner.table; col_type = column_name(datatype(len)); counts use K/M units
 
-WITH t
-     AS (SELECT /*+ materialize */
-               DISTINCT OBJECT_OWNER, OBJECT_NAME
-           FROM (SELECT OBJECT_OWNER, OBJECT_NAME
-                   FROM V$SQL_PLAN
-                  WHERE SQL_ID = '&&sqlid' AND OBJECT_NAME IS NOT NULL))
-SELECT a.OWNER,
-       a.TABLE_NAME,
-       a.COLUMN_NAME,
-       a.data_type || '(' || a.data_length || ')' d_type,
-       b.NUM_DISTINCT||'' NUM_DISTINCT,
-       a.NULLABLE||'' N,
-       b.NUM_NULLS||'' NUM_NULLS,
-       b.DENSITY,
-       b.NUM_BUCKETS,
-       b.AVG_COL_LEN,
-       b.sample_size||'' sample_size,
-       substr(b.HISTOGRAM,0,5) HISTOGRAM,
-       b.LAST_ANALYZED
-  FROM DBA_TAB_COLS a,DBA_TAB_COL_STATISTICS b
- WHERE (a.OWNER, a.TABLE_NAME) IN
-       (SELECT table_owner,table_name FROM dba_indexes
-         WHERE (owner,index_name) IN (SELECT * FROM t)
-        UNION ALL SELECT * FROM t)
-       and a.owner=b.owner(+) and a.table_name=b.table_name(+) and a.column_name=b.column_name(+)
- ORDER BY owner,table_name,COLUMN_ID;
+col tab                for a40
+col col_type           for a40
+col ndist              for a8
+col n                  for a1
+col nnulls             for a8
+col density            for a12
+col nbucket            for a6
+col avg_len            for a6
+col sample             for a8
+col hist               for a5
+col last_analyzed      for a19
+
+WITH t AS (
+  SELECT DISTINCT object_owner AS owner, object_name AS name
+    FROM v$sql_plan
+   WHERE sql_id = '&&sqlid'
+     AND object_name IS NOT NULL
+),
+tbl AS (
+  SELECT DISTINCT i.table_owner AS owner, i.table_name
+    FROM t
+    JOIN dba_indexes i ON i.owner = t.owner AND i.index_name = t.name
+  UNION
+  SELECT t.owner, t.name
+    FROM t
+    JOIN dba_tables dt ON dt.owner = t.owner AND dt.table_name = t.name
+)
+SELECT a.owner || '.' || a.table_name AS tab,
+       a.column_name || '(' || a.data_type || '(' || a.data_length || '))' AS col_type,
+       CASE
+         WHEN b.num_distinct IS NULL THEN NULL
+         WHEN b.num_distinct < 1000 THEN TO_CHAR(b.num_distinct)
+         WHEN b.num_distinct < 1000000 THEN TO_CHAR(ROUND(b.num_distinct / 1000, 1)) || 'K'
+         ELSE TO_CHAR(ROUND(b.num_distinct / 1000000, 2)) || 'M'
+       END AS ndist,
+       a.nullable || '' AS n,
+       CASE
+         WHEN b.num_nulls IS NULL THEN NULL
+         WHEN b.num_nulls < 1000 THEN TO_CHAR(b.num_nulls)
+         WHEN b.num_nulls < 1000000 THEN TO_CHAR(ROUND(b.num_nulls / 1000, 1)) || 'K'
+         ELSE TO_CHAR(ROUND(b.num_nulls / 1000000, 2)) || 'M'
+       END AS nnulls,
+       TO_CHAR(b.density, 'FM999999999990.999999999999') AS density,
+       CASE
+         WHEN b.num_buckets IS NULL THEN NULL
+         WHEN b.num_buckets < 1000 THEN TO_CHAR(b.num_buckets)
+         WHEN b.num_buckets < 1000000 THEN TO_CHAR(ROUND(b.num_buckets / 1000, 1)) || 'K'
+         ELSE TO_CHAR(ROUND(b.num_buckets / 1000000, 2)) || 'M'
+       END AS nbucket,
+       b.avg_col_len || '' AS avg_len,
+       CASE
+         WHEN b.sample_size IS NULL THEN NULL
+         WHEN b.sample_size < 1000 THEN TO_CHAR(b.sample_size)
+         WHEN b.sample_size < 1000000 THEN TO_CHAR(ROUND(b.sample_size / 1000, 1)) || 'K'
+         ELSE TO_CHAR(ROUND(b.sample_size / 1000000, 2)) || 'M'
+       END AS sample,
+       SUBSTR(b.histogram, 1, 5) AS hist,
+       TO_CHAR(b.last_analyzed, 'yyyy-mm-dd hh24:mi:ss') AS last_analyzed
+  FROM tbl x
+  JOIN dba_tab_cols a
+    ON a.owner = x.owner AND a.table_name = x.table_name
+  LEFT JOIN dba_tab_col_statistics b
+    ON b.owner = a.owner
+   AND b.table_name = a.table_name
+   AND b.column_name = a.column_name
+ ORDER BY a.owner, a.table_name, a.column_id
+/
 
 
 
@@ -1031,61 +1230,66 @@ prompt *************************************************************************
 prompt INDEX STATUS
 prompt ****************************************************************************************
 
-col index_name                 for a20
-col PARTITION_NAME             for a20
-col SUBPARTITION_NAME          for a20
-WITH t
-     AS (SELECT /*+ materialize */
-                DISTINCT OBJECT_OWNER, OBJECT_NAME
-           FROM (SELECT OBJECT_OWNER, OBJECT_NAME
-                   FROM V$SQL_PLAN
-                  WHERE SQL_ID = '&&sqlid' AND OBJECT_NAME IS NOT NULL)),
-     tt
-     AS (SELECT /*+ materialize */
-               i.OWNER,
-                i.INDEX_NAME,
-                i.status,
-                PARTITIONED
-           FROM DBA_INDEXES i
-          WHERE     (i.TABLE_OWNER, i.TABLE_NAME) IN (SELECT table_owner,
-                                                             table_name
-                                                        FROM dba_indexes
-                                                       WHERE (owner,
-                                                              index_name) IN (SELECT *
-                                                                                FROM t)
-                                                      UNION ALL
-                                                      SELECT * FROM t)
-                AND i.status NOT IN ('VALID'))
-SELECT OWNER,
-       INDEX_NAME,
-       '' PARTITION_NAME,
-       '' SUBPARTITION_NAME,
+col idx                    for a50
+col PARTITION_NAME         for a20
+col SUBPARTITION_NAME      for a20
+col status                 for a10
+
+WITH t AS (
+  SELECT DISTINCT object_owner AS owner, object_name AS name
+    FROM v$sql_plan
+   WHERE sql_id = '&&sqlid'
+     AND object_name IS NOT NULL
+),
+tbl AS (
+  SELECT DISTINCT i.table_owner AS owner, i.table_name
+    FROM t
+    JOIN dba_indexes i ON i.owner = t.owner AND i.index_name = t.name
+  UNION
+  SELECT t.owner, t.name
+    FROM t
+    JOIN dba_tables dt ON dt.owner = t.owner AND dt.table_name = t.name
+),
+tt AS (
+  SELECT i.owner,
+         i.index_name,
+         i.status,
+         i.partitioned
+    FROM dba_indexes i
+    JOIN tbl x
+      ON i.table_owner = x.owner
+     AND i.table_name = x.table_name
+   WHERE i.status NOT IN ('VALID')
+)
+SELECT owner || '.' || index_name AS idx,
+       '' AS partition_name,
+       '' AS subpartition_name,
        status
   FROM tt
- WHERE tt.PARTITIONED = 'NO'
+ WHERE tt.partitioned = 'NO'
 UNION ALL
-SELECT p.INDEX_OWNER,
-       p.INDEX_NAME,
-       PARTITION_NAME,
-       '' SUBPARTITION_NAME,
+SELECT p.index_owner || '.' || p.index_name AS idx,
+       p.partition_name,
+       '' AS subpartition_name,
        p.status
   FROM dba_ind_partitions p
- WHERE     (p.INDEX_OWNER, p.INDEX_NAME) IN (SELECT index_owner, INDEX_NAME
-                                               FROM tt
-                                              WHERE tt.PARTITIONED = 'YES')
-       AND p.status NOT IN ('USABLE')
+  JOIN tt
+    ON p.index_owner = tt.owner
+   AND p.index_name = tt.index_name
+ WHERE tt.partitioned = 'YES'
+   AND p.status NOT IN ('USABLE')
 UNION ALL
-SELECT p.INDEX_OWNER,
-       p.INDEX_NAME,
-       PARTITION_NAME,
-       SUBPARTITION_NAME,
+SELECT p.index_owner || '.' || p.index_name AS idx,
+       p.partition_name,
+       p.subpartition_name,
        p.status
   FROM dba_ind_subpartitions p
- WHERE     (p.INDEX_OWNER, p.INDEX_NAME) IN (SELECT index_owner, INDEX_NAME
-                                               FROM tt
-                                              WHERE tt.PARTITIONED = 'YES')
-       AND p.status NOT IN ('USABLE')
-ORDER BY 1,2,3,4
+  JOIN tt
+    ON p.index_owner = tt.owner
+   AND p.index_name = tt.index_name
+ WHERE tt.partitioned = 'YES'
+   AND p.status NOT IN ('USABLE')
+ ORDER BY 1, 2, 3, 4
 /
 
 prompt
@@ -1093,37 +1297,45 @@ prompt *************************************************************************
 prompt INDEX INFO
 prompt ****ucptdvs "UNIQUENESS COMPRESSION PARTITIONED TEMPORARY  VISIBILITY                "**
 prompt ****************************************************************************************
-WITH t
-     AS (SELECT /*+ materialize */
-                DISTINCT OBJECT_OWNER, OBJECT_NAME
-           FROM (SELECT OBJECT_OWNER, OBJECT_NAME
-                   FROM V$SQL_PLAN
-                  WHERE SQL_ID = '&&sqlid' AND OBJECT_NAME IS NOT NULL))
-SELECT A.TABLE_OWNER,
-       A.TABLE_NAME,
-       A.INDEX_NAME,
-          DECODE (A.UNIQUENESS,  'UNIQUE', 'U',  'NONUNIQUE', 'N',  'O')
-       || DECODE (A.COMPRESSION,  'ENABLED', 'E',  'DISABLED', 'N',  'O')
-       || DECODE (A.PARTITIONED,  'YES', 'Y',  'NO', 'N',  'O')
-       || DECODE (A.TEMPORARY,  'Y', 'Y',  'N', 'N',  'O')
-       || DECODE (A.VISIBILITY,  'VISIBLE', 'V',  'INVISIBLE', 'I',  'O')
-                       ucptv,
-        B.COLUMN_NAME,
-        B.COLUMN_POSITION,
-        B.DESCEND
-        FROM DBA_INDEXES A, DBA_IND_COLUMNS B
-              WHERE     (A.OWNER, A.table_name) IN (SELECT table_owner, table_name
-                                                      FROM dba_indexes
-                                                     WHERE (owner, index_name) IN (SELECT *
-                                                                                     FROM t)
-                                                    UNION ALL
-                                                    SELECT * FROM t)
-                    AND A.OWNER = B.INDEX_OWNER
-                    AND A.INDEX_NAME = B.INDEX_NAME
-           ORDER BY table_owner,
-                    table_name,
-                    index_name,
-                    COLUMN_POSITION
+
+col tab                for a40
+col idx                for a64
+col ucptv              for a6
+col col_pos            for a28
+col descend            for a4
+
+WITH t AS (
+  SELECT DISTINCT object_owner AS owner, object_name AS name
+    FROM v$sql_plan
+   WHERE sql_id = '&&sqlid'
+     AND object_name IS NOT NULL
+),
+tbl AS (
+  SELECT DISTINCT i.table_owner AS owner, i.table_name
+    FROM t
+    JOIN dba_indexes i ON i.owner = t.owner AND i.index_name = t.name
+  UNION
+  SELECT t.owner, t.name
+    FROM t
+    JOIN dba_tables dt ON dt.owner = t.owner AND dt.table_name = t.name
+)
+SELECT a.table_owner || '.' || a.table_name AS tab,
+       a.index_name AS idx,
+          DECODE(a.uniqueness,  'UNIQUE', 'U',  'NONUNIQUE', 'N',  'O')
+       || DECODE(a.compression, 'ENABLED', 'E',  'DISABLED', 'N',  'O')
+       || DECODE(a.partitioned, 'YES', 'Y',  'NO', 'N',  'O')
+       || DECODE(a.temporary,  'Y', 'Y',  'N', 'N',  'O')
+       || DECODE(a.visibility, 'VISIBLE', 'V',  'INVISIBLE', 'I',  'O') AS ucptv,
+       b.column_name || '(' || b.column_position || ')' AS col_pos,
+       b.descend
+  FROM tbl x
+  JOIN dba_indexes a
+    ON a.table_owner = x.owner
+   AND a.table_name = x.table_name
+  JOIN dba_ind_columns b
+    ON a.owner = b.index_owner
+   AND a.index_name = b.index_name
+ ORDER BY a.table_owner, a.table_name, a.index_name, b.column_position
 /
 
 
@@ -1132,37 +1344,46 @@ prompt *************************************************************************
 prompt PARTITION INDEX
 prompt ****************************************************************************************
 
-WITH t
-     AS (SELECT /*+ materialize */
-                DISTINCT OBJECT_OWNER, OBJECT_NAME
-           FROM (SELECT OBJECT_OWNER, OBJECT_NAME
-                   FROM V$SQL_PLAN
-                  WHERE SQL_ID = '&&sqlid' AND OBJECT_NAME IS NOT NULL))
-SELECT a.owner,
-       a.name index_name,
-       b.partitioning_type part_type,
-       b.subpartitioning_type subpart_type,
-       b.partition_count part_count,
-       b.PARTITIONING_KEY_COUNT key_count,
-       b.SUBPARTITIONING_KEY_COUNT subkey_cout,
-       b.LOCALITY,
-       a.COLUMN_NAME,
-       a.COLUMN_POSITION
-  FROM DBA_PART_KEY_COLUMNS a, dba_part_indexes b
- WHERE     a.name = b.index_name
-       AND (b.owner, b.index_name) IN (SELECT owner, index_name
-                                         FROM dba_indexes
-                                        WHERE (table_owner, table_name) IN (SELECT table_owner,
-                                                                                   table_name
-                                                                              FROM dba_indexes
-                                                                             WHERE (owner,
-                                                                                    index_name) IN (SELECT *
-                                                                                                      FROM t)
-                                                                            UNION ALL
-                                                                            SELECT *
-                                                                              FROM t))
-       AND a.owner = b.owner
-ORDER BY a.owner,a.name,a.column_position
+col idx                for a50
+col part_type          for a10
+col subpart_type       for a10
+col locality           for a10
+col col_pos            for a28
+
+WITH t AS (
+  SELECT DISTINCT object_owner AS owner, object_name AS name
+    FROM v$sql_plan
+   WHERE sql_id = '&&sqlid'
+     AND object_name IS NOT NULL
+),
+tbl AS (
+  SELECT DISTINCT i.table_owner AS owner, i.table_name
+    FROM t
+    JOIN dba_indexes i ON i.owner = t.owner AND i.index_name = t.name
+  UNION
+  SELECT t.owner, t.name
+    FROM t
+    JOIN dba_tables dt ON dt.owner = t.owner AND dt.table_name = t.name
+)
+SELECT a.owner || '.' || a.name AS idx,
+       b.partitioning_type AS part_type,
+       b.subpartitioning_type AS subpart_type,
+       b.partition_count || '' AS part_cnt,
+       b.partitioning_key_count || '' AS key_cnt,
+       b.subpartitioning_key_count || '' AS subkey_cnt,
+       b.locality,
+       a.column_name || '(' || a.column_position || ')' AS col_pos
+  FROM dba_part_key_columns a
+  JOIN dba_part_indexes b
+    ON a.owner = b.owner
+   AND a.name = b.index_name
+  JOIN dba_indexes i
+    ON i.owner = b.owner
+   AND i.index_name = b.index_name
+  JOIN tbl x
+    ON i.table_owner = x.owner
+   AND i.table_name = x.table_name
+ ORDER BY a.owner, a.name, a.column_position
 /
 
 
@@ -1171,31 +1392,41 @@ prompt *************************************************************************
 prompt PARTITION TABLE
 prompt ****************************************************************************************
 
+col tab                for a40
+col part_type          for a10
+col subpart_type       for a10
+col col_pos            for a28
 
-WITH t
-     AS (SELECT /*+ materialize */
-                DISTINCT OBJECT_OWNER, OBJECT_NAME
-           FROM (SELECT OBJECT_OWNER, OBJECT_NAME
-                   FROM V$SQL_PLAN
-                  WHERE SQL_ID = '&&sqlid' AND OBJECT_NAME IS NOT NULL))
-SELECT a.owner,
-       a.name table_name,
-       b.partitioning_type part_type,
-       b.subpartitioning_type subpart_type,
-       b.partition_count part_count,
-       b.PARTITIONING_KEY_COUNT key_count,
-       b.SUBPARTITIONING_KEY_COUNT subkey_cout,
-       a.COLUMN_NAME,
-       a.COLUMN_POSITION
-  FROM DBA_PART_KEY_COLUMNS a, dba_part_tables b
- WHERE a.name = b.table_name
-   AND (a.owner, a.name) in (SELECT table_owner, table_name
-                               FROM dba_indexes
-                              WHERE (owner, index_name) IN (SELECT * FROM t)
-                             UNION ALL
-                             SELECT * FROM t)
-   AND a.owner = b.owner
- ORDER BY a.NAME, a.COLUMN_POSITION
+WITH t AS (
+  SELECT DISTINCT object_owner AS owner, object_name AS name
+    FROM v$sql_plan
+   WHERE sql_id = '&&sqlid'
+     AND object_name IS NOT NULL
+),
+tbl AS (
+  SELECT DISTINCT i.table_owner AS owner, i.table_name
+    FROM t
+    JOIN dba_indexes i ON i.owner = t.owner AND i.index_name = t.name
+  UNION
+  SELECT t.owner, t.name
+    FROM t
+    JOIN dba_tables dt ON dt.owner = t.owner AND dt.table_name = t.name
+)
+SELECT a.owner || '.' || a.name AS tab,
+       b.partitioning_type AS part_type,
+       b.subpartitioning_type AS subpart_type,
+       b.partition_count || '' AS part_cnt,
+       b.partitioning_key_count || '' AS key_cnt,
+       b.subpartitioning_key_count || '' AS subkey_cnt,
+       a.column_name || '(' || a.column_position || ')' AS col_pos
+  FROM dba_part_key_columns a
+  JOIN dba_part_tables b
+    ON a.owner = b.owner
+   AND a.name = b.table_name
+  JOIN tbl x
+    ON a.owner = x.owner
+   AND a.name = x.table_name
+ ORDER BY a.name, a.column_position
 /
 
 
@@ -1205,35 +1436,64 @@ prompt *************************************************************************
 prompt display every partition  info
 prompt ****************************************************************************************
 
-col tablespace_name         for a15
-col HIGH_VALUE              for a25
+col tab                     for a40
+col partition_name          for a20
+col high_value              for a25
+col ts                      for a15
+col nrows                   for a8
+col blks                    for a8
 col t_size                  for a10
+col eblks                   for a6
+col last_analyzed           for a19
+col avg_sp                  for a6
+col spcnt                   for a5
 
-WITH t
-     AS (SELECT /*+ materialize */
-                DISTINCT OBJECT_OWNER, OBJECT_NAME
-           FROM (SELECT OBJECT_OWNER, OBJECT_NAME
-                   FROM V$SQL_PLAN
-                  WHERE SQL_ID = '&&sqlid' AND OBJECT_NAME IS NOT NULL))
-SELECT table_name ,PARTITION_NAME,
-       HIGH_VALUE,
-       HIGH_VALUE_LENGTH,
-       TABLESPACE_NAME,
-       NUM_ROWS||'' NUM_ROWS,
-       BLOCKS||'' BLOCKS,
-       round(blocks * 8 / 1024, 2) || 'KB' t_size,
-       EMPTY_BLOCKS||'' EMPTY_BLOCKS,
-       to_char(LAST_ANALYZED, 'yyyy-mm-dd') LAST_ANALYZED,
-       AVG_SPACE||'' AVG_SPACE,
-       SUBPARTITION_COUNT||'' SUBPART_COUNT
-  FROM sys.DBA_TAB_PARTITIONS
- WHERE (table_owner, table_name) in
-       (SELECT table_owner, table_name
-          FROM dba_indexes
-         WHERE (owner, index_name) IN (SELECT * FROM t)
-        UNION ALL
-        SELECT * FROM t)
- ORDER BY table_name,PARTITION_POSITION
+WITH t AS (
+  SELECT DISTINCT object_owner AS owner, object_name AS name
+    FROM v$sql_plan
+   WHERE sql_id = '&&sqlid'
+     AND object_name IS NOT NULL
+),
+tbl AS (
+  SELECT DISTINCT i.table_owner AS owner, i.table_name
+    FROM t
+    JOIN dba_indexes i ON i.owner = t.owner AND i.index_name = t.name
+  UNION
+  SELECT t.owner, t.name
+    FROM t
+    JOIN dba_tables dt ON dt.owner = t.owner AND dt.table_name = t.name
+)
+SELECT p.table_owner || '.' || p.table_name AS tab,
+       p.partition_name,
+       p.high_value,
+       p.tablespace_name AS ts,
+       CASE
+         WHEN p.num_rows IS NULL THEN NULL
+         WHEN p.num_rows < 1000 THEN TO_CHAR(p.num_rows)
+         WHEN p.num_rows < 1000000 THEN TO_CHAR(ROUND(p.num_rows / 1000, 1)) || 'K'
+         ELSE TO_CHAR(ROUND(p.num_rows / 1000000, 2)) || 'M'
+       END AS nrows,
+       CASE
+         WHEN p.blocks IS NULL THEN NULL
+         WHEN p.blocks < 1000 THEN TO_CHAR(p.blocks)
+         WHEN p.blocks < 1000000 THEN TO_CHAR(ROUND(p.blocks / 1000, 1)) || 'K'
+         ELSE TO_CHAR(ROUND(p.blocks / 1000000, 2)) || 'M'
+       END AS blks,
+       ROUND(p.blocks * 8 / 1024, 2) || 'KB' AS t_size,
+       CASE
+         WHEN p.empty_blocks IS NULL THEN NULL
+         WHEN p.empty_blocks < 1000 THEN TO_CHAR(p.empty_blocks)
+         WHEN p.empty_blocks < 1000000 THEN TO_CHAR(ROUND(p.empty_blocks / 1000, 1)) || 'K'
+         ELSE TO_CHAR(ROUND(p.empty_blocks / 1000000, 2)) || 'M'
+       END AS eblks,
+       TO_CHAR(p.last_analyzed, 'yyyy-mm-dd hh24:mi:ss') AS last_analyzed,
+       p.avg_space || '' AS avg_sp,
+       SUBSTR(p.subpartition_count || '', 1, 5) AS spcnt
+  FROM dba_tab_partitions p
+  JOIN tbl x
+    ON p.table_owner = x.owner
+   AND p.table_name = x.table_name
+ ORDER BY p.table_name, p.partition_position
 /
 
 

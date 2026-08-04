@@ -1,319 +1,347 @@
 -- File Name: plan_by_sqlid.sql
 -- Purpose: YashanDB Show execution plan by sql_id from v$sql_plan
 -- Created: 20260516  by  huangtingzhong
-
-set heading on;
-set serveroutput on;
+-- Updated: 20260802  by  huangtingzhong
+-- Notes:
+--   Pure SQL output (no DBMS_OUTPUT / anonymous PL/SQL).
+--   Works on READ_ONLY standby where DBMS_OUTPUT.PUT_LINE raises YAS-05398.
+--   Column widths auto-size per plan_hash_value (Operation/Name capped at 120).
+--   One row per (plan_hash_value, id); no duplicate plan lines.
+--   Pid = parent_id; Ord = id order (no PL/SQL tree walk).
+--   Table: Rows / Bytes / Cost / Time.
+--   Extra lines (when present): Access / Filter / Partition / Other / Temp /
+--     SearchCols / CpuIo / Projection. OBJECT_ALIAS appended in Name.
 
 prompt ****************************************************************************************
 prompt PLAN from v$sql_plan  (sql_id = &&sqlid)
 prompt ****************************************************************************************
 
-DECLARE
-    v_sql_id          VARCHAR2(13) := '&&sqlid';
-    v_plan_count      NUMBER := 0;
-    v_ord_seq         NUMBER := 0;
-    v_indent          VARCHAR2(100);
-    v_operation       VARCHAR2(4000);
-    v_object_info     VARCHAR2(200);
-    v_id_str          VARCHAR2(10);
-    v_pid_str         VARCHAR2(10);
-    v_display_pid     NUMBER;
-    v_ord_str         VARCHAR2(10);
-    v_operation_str   VARCHAR2(40);
-    v_name_str        VARCHAR2(30);
-    v_rows_str        VARCHAR2(12);
-    v_cost_str        VARCHAR2(10);
-    v_time_str        VARCHAR2(10);
+-- Do not set "col plan_line for aN": yasql pads every row to N chars,
+-- leaving a large blank area after the trailing "|".
 
-    TYPE t_ord_map IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
-    TYPE t_plan_rec IS RECORD (
-        id          NUMBER,
-        parent_id   NUMBER,
-        position    NUMBER,
-        operation   VARCHAR2(4000),
-        options     VARCHAR2(4000)
-    );
-    TYPE t_plan_tab IS TABLE OF t_plan_rec;
-    TYPE t_child_tab IS TABLE OF NUMBER;
-
-    g_ord         t_ord_map;
-    g_disp_parent t_ord_map;
-    g_plan_rows   t_plan_tab;
-
-    CURSOR c_plans IS
-        SELECT ph
-          FROM (
-                SELECT DISTINCT plan_hash_value AS ph
-                  FROM v$sql_plan
-                 WHERE sql_id = v_sql_id
-                 ORDER BY plan_hash_value
-               );
-
-    FUNCTION get_indent(p_depth INTEGER) RETURN VARCHAR2 IS
-    BEGIN
-        RETURN LPAD(' ', (p_depth * 2), ' ');
-    END;
-
-    -- YashanDB: INDEX may sit under JOIN with TABLE ACCESS BY INDEX ROWID;
-    -- Display tree hangs INDEX under TABLE ACCESS like Oracle XPLAN.
-    FUNCTION find_tab_access_parent(p_id NUMBER, p_parent_id NUMBER) RETURN NUMBER IS
-        v_tab_id NUMBER := NULL;
-    BEGIN
-        FOR i IN 1 .. g_plan_rows.COUNT LOOP
-            IF g_plan_rows(i).parent_id = p_parent_id
-               AND g_plan_rows(i).id < p_id
-               AND (
-                     g_plan_rows(i).operation LIKE '%BY INDEX ROWID%'
-                     OR NVL(g_plan_rows(i).options, ' ') LIKE '%INDEX ROWID%'
-                   ) THEN
-                IF v_tab_id IS NULL OR g_plan_rows(i).id > v_tab_id THEN
-                    v_tab_id := g_plan_rows(i).id;
-                END IF;
-            END IF;
-        END LOOP;
-        RETURN v_tab_id;
-    END find_tab_access_parent;
-
-    PROCEDURE load_plan_rows(p_ph NUMBER) IS
-    BEGIN
-        SELECT id, parent_id, position, operation, options
-          BULK COLLECT INTO g_plan_rows
-          FROM v$sql_plan
-         WHERE sql_id = v_sql_id
-           AND plan_hash_value = p_ph
-           AND id IS NOT NULL
-           AND operation IS NOT NULL;
-    END load_plan_rows;
-
-    PROCEDURE build_display_parent IS
-    BEGIN
-        g_disp_parent.DELETE;
-        FOR i IN 1 .. g_plan_rows.COUNT LOOP
-            IF g_plan_rows(i).parent_id IS NULL
-               OR g_plan_rows(i).operation NOT LIKE 'INDEX%' THEN
-                g_disp_parent(g_plan_rows(i).id) := g_plan_rows(i).parent_id;
-            ELSE
-                v_display_pid := find_tab_access_parent(
-                    g_plan_rows(i).id, g_plan_rows(i).parent_id
-                );
-                IF v_display_pid IS NOT NULL THEN
-                    g_disp_parent(g_plan_rows(i).id) := v_display_pid;
-                ELSE
-                    g_disp_parent(g_plan_rows(i).id) := g_plan_rows(i).parent_id;
-                END IF;
-            END IF;
-        END LOOP;
-    END build_display_parent;
-
-    FUNCTION plan_position(p_id NUMBER) RETURN NUMBER IS
-    BEGIN
-        FOR i IN 1 .. g_plan_rows.COUNT LOOP
-            IF g_plan_rows(i).id = p_id THEN
-                RETURN NVL(g_plan_rows(i).position, 0);
-            END IF;
-        END LOOP;
-        RETURN 0;
-    END plan_position;
-
-    FUNCTION list_display_children(p_parent_id NUMBER) RETURN t_child_tab IS
-        v_children t_child_tab := t_child_tab();
-        v_swap     NUMBER;
-        v_pos_i    NUMBER;
-        v_pos_j    NUMBER;
-    BEGIN
-        FOR i IN 1 .. g_plan_rows.COUNT LOOP
-            IF NVL(g_disp_parent(g_plan_rows(i).id), -1) = NVL(p_parent_id, -1) THEN
-                v_children.EXTEND;
-                v_children(v_children.COUNT) := g_plan_rows(i).id;
-            END IF;
-        END LOOP;
-        -- Oracle exec order: siblings by position/id ASC, post-order Ord
-        IF v_children.COUNT > 1 THEN
-            FOR i IN 1 .. v_children.COUNT - 1 LOOP
-                FOR j IN i + 1 .. v_children.COUNT LOOP
-                    v_pos_i := plan_position(v_children(i));
-                    v_pos_j := plan_position(v_children(j));
-                    IF v_pos_j < v_pos_i
-                       OR (v_pos_j = v_pos_i AND v_children(j) < v_children(i)) THEN
-                        v_swap := v_children(i);
-                        v_children(i) := v_children(j);
-                        v_children(j) := v_swap;
-                    END IF;
-                END LOOP;
-            END LOOP;
-        END IF;
-        RETURN v_children;
-    END list_display_children;
-
-    -- display tree, siblings ASC, post-order gives Ord
-    PROCEDURE walk_plan_ord(p_parent_id NUMBER, io_ord IN OUT NUMBER) IS
-        v_children t_child_tab;
-    BEGIN
-        v_children := list_display_children(p_parent_id);
-        FOR i IN 1 .. v_children.COUNT LOOP
-            walk_plan_ord(v_children(i), io_ord);
-            io_ord := io_ord + 1;
-            g_ord(v_children(i)) := io_ord;
-        END LOOP;
-    END walk_plan_ord;
-
-BEGIN
-    FOR rec_plan IN c_plans LOOP
-        v_plan_count := v_plan_count + 1;
-
-        g_ord.DELETE;
-        load_plan_rows(rec_plan.ph);
-        build_display_parent;
-        v_ord_seq := 0;
-        walk_plan_ord(0, v_ord_seq);
-        v_ord_seq := v_ord_seq + 1;
-        g_ord(0) := v_ord_seq;
-
-        DBMS_OUTPUT.PUT_LINE('');
-        DBMS_OUTPUT.PUT_LINE('============================================================================');
-        DBMS_OUTPUT.PUT_LINE('Plan Hash Value: ' || rec_plan.ph);
-        DBMS_OUTPUT.PUT_LINE('============================================================================');
-        DBMS_OUTPUT.PUT_LINE('');
-
-        DBMS_OUTPUT.PUT_LINE('|' ||
-                            LPAD('Id', 4) || '|' ||
-                            LPAD('Pid', 4) || '|' ||
-                            LPAD('Ord', 4) || '|' ||
-                            RPAD('Operation', 39) || '|' ||
-                            RPAD('Name', 29) || '|' ||
-                            RPAD('Rows', 11) || '|' ||
-                            RPAD('Cost', 9) || '|' ||
-                            RPAD('Time', 9) || '|');
-
-        DBMS_OUTPUT.PUT_LINE('|' ||
-                            LPAD('-', 4, '-') || '|' ||
-                            LPAD('-', 4, '-') || '|' ||
-                            LPAD('-', 4, '-') || '|' ||
-                            RPAD('-', 39, '-') || '|' ||
-                            RPAD('-', 29, '-') || '|' ||
-                            LPAD('-', 11, '-') || '|' ||
-                            LPAD('-', 9, '-') || '|' ||
-                            LPAD('-', 9, '-') || '|');
-
-        FOR rec_detail IN (
-            SELECT id,
-                   parent_id,
-                   depth,
-                   position,
-                   operation,
-                   options,
-                   object_owner,
-                   object_name,
-                   object_type,
-                   optimizer,
-                   cost,
-                   cardinality,
-                   bytes,
-                   cpu_cost,
-                   io_cost,
-                   access_predicates,
-                   filter_predicates,
-                   partition_start,
-                   partition_stop,
-                   other_tag,
-                   other,
-                   time AS plan_time
-              FROM v$sql_plan
-             WHERE sql_id = v_sql_id
-               AND plan_hash_value = rec_plan.ph
-               AND id IS NOT NULL
-               AND operation IS NOT NULL
-             ORDER BY id
-        ) LOOP
-            v_indent := get_indent(rec_detail.depth);
-            v_operation := v_indent || rec_detail.operation;
-            IF rec_detail.options IS NOT NULL THEN
-                v_operation := v_operation || ' ' || rec_detail.options;
-            END IF;
-
-            IF rec_detail.object_name IS NOT NULL THEN
-                v_object_info := rec_detail.object_owner || '.' || rec_detail.object_name;
-                IF rec_detail.object_type IS NOT NULL THEN
-                    v_object_info := v_object_info || ' [' || rec_detail.object_type || ']';
-                END IF;
-            ELSE
-                v_object_info := '';
-            END IF;
-
-            v_id_str := LPAD(TO_CHAR(rec_detail.id), 4);
-            v_display_pid := g_disp_parent(rec_detail.id);
-            IF v_display_pid IS NULL THEN
-                v_pid_str := LPAD(' ', 4);
-            ELSE
-                v_pid_str := LPAD(TO_CHAR(v_display_pid), 4);
-            END IF;
-            v_ord_str := LPAD(TO_CHAR(g_ord(rec_detail.id)), 4);
-            v_operation_str := RPAD(SUBSTR(NVL(v_operation, ' '), 1, 39), 39);
-            v_name_str := RPAD(SUBSTR(NVL(v_object_info, ' '), 1, 29), 29);
-            v_rows_str := RPAD(NVL(TO_CHAR(rec_detail.cardinality), ' '), 11);
-            v_cost_str := RPAD(NVL(TO_CHAR(rec_detail.cost), ' '), 9);
-            v_time_str := RPAD(NVL(TO_CHAR(rec_detail.plan_time), ' '), 9);
-
-            DBMS_OUTPUT.PUT_LINE(
-                '|' || v_id_str || '|' ||
-                v_pid_str || '|' ||
-                v_ord_str || '|' ||
-                v_operation_str || '|' ||
-                v_name_str || '|' ||
-                v_rows_str || '|' ||
-                v_cost_str || '|' ||
-                v_time_str || '|'
-            );
-
-            IF LENGTH(TRIM(NVL(rec_detail.access_predicates, ''))) > 0 THEN
-                DBMS_OUTPUT.PUT_LINE(
-                    '|' || LPAD(' ', 4) || '|' ||
-                    LPAD(' ', 4) || '|' ||
-                    LPAD(' ', 4) || '|' ||
-                    RPAD('  -> Access: ' || SUBSTR(rec_detail.access_predicates, 1, 26), 39) || '|' ||
-                    RPAD(' ', 29) || '|' ||
-                    RPAD(' ', 11) || '|' ||
-                    RPAD(' ', 9) || '|' ||
-                    RPAD(' ', 9) || '|'
-                );
-            END IF;
-
-            IF LENGTH(TRIM(NVL(rec_detail.filter_predicates, ''))) > 0 THEN
-                DBMS_OUTPUT.PUT_LINE(
-                    '|' || LPAD(' ', 4) || '|' ||
-                    LPAD(' ', 4) || '|' ||
-                    LPAD(' ', 4) || '|' ||
-                    RPAD('  -> Filter: ' || SUBSTR(rec_detail.filter_predicates, 1, 26), 39) || '|' ||
-                    RPAD(' ', 29) || '|' ||
-                    RPAD(' ', 11) || '|' ||
-                    RPAD(' ', 9) || '|' ||
-                    RPAD(' ', 9) || '|'
-                );
-            END IF;
-
-            IF NVL(rec_detail.partition_start, 0) <> 0
-               OR NVL(rec_detail.partition_stop, 0) <> 0 THEN
-                DBMS_OUTPUT.PUT_LINE(
-                    '|' || LPAD(' ', 4) || '|' ||
-                    LPAD(' ', 4) || '|' ||
-                    LPAD(' ', 4) || '|' ||
-                    RPAD('  -> Partition: ' ||
-                         NVL(TO_CHAR(rec_detail.partition_start), '?') || '..' ||
-                         NVL(TO_CHAR(rec_detail.partition_stop), '?'), 39) || '|' ||
-                    RPAD(' ', 29) || '|' ||
-                    RPAD(' ', 11) || '|' ||
-                    RPAD(' ', 9) || '|' ||
-                    RPAD(' ', 9) || '|'
-                );
-            END IF;
-        END LOOP;
-
-        DBMS_OUTPUT.PUT_LINE('============================================================================');
-    END LOOP;
-
-    IF v_plan_count = 0 THEN
-        DBMS_OUTPUT.PUT_LINE('No plan found in V$SQL_PLAN for sql_id=' || v_sql_id);
-    END IF;
-END;
+-- One row per (plan_hash_value, id): collapse multi-child / multi-address
+-- copies in v$sql_plan so each PHV prints a single plan tree.
+WITH ranked AS (
+  SELECT p.plan_hash_value AS phv,
+         p.id,
+         p.parent_id,
+         p.depth,
+         p.operation,
+         p.options,
+         p.object_owner,
+         p.object_name,
+         p.object_type,
+         p.object_alias,
+         p.cost,
+         p.cardinality,
+         p.bytes,
+         p.time AS plan_time,
+         p.cpu_cost,
+         p.io_cost,
+         p.search_columns,
+         p.access_predicates,
+         p.filter_predicates,
+         p.projection,
+         p.partition_info,
+         p.partition_start,
+         p.partition_stop,
+         p.other_tag,
+         p.temp_space,
+         LPAD(' ', NVL(p.depth, 0) * 2) || p.operation || NVL(' ' || p.options, '') AS op_txt,
+         CASE
+           WHEN p.object_name IS NOT NULL THEN
+             p.object_owner || '.' || p.object_name ||
+             CASE
+               WHEN p.object_type IS NOT NULL THEN ' [' || p.object_type || ']'
+               ELSE ''
+             END ||
+             CASE
+               WHEN LENGTH(TRIM(NVL(p.object_alias, ''))) > 0
+               THEN ' (' || TRIM(p.object_alias) || ')'
+               ELSE ''
+             END
+           WHEN LENGTH(TRIM(NVL(p.object_alias, ''))) > 0 THEN
+             TRIM(p.object_alias)
+           ELSE NULL
+         END AS name_txt,
+         CASE
+           WHEN LENGTH(TRIM(NVL(p.access_predicates, ''))) > 0
+           THEN '  -> Access: ' || p.access_predicates
+         END AS access_txt,
+         CASE
+           WHEN LENGTH(TRIM(NVL(p.filter_predicates, ''))) > 0
+           THEN '  -> Filter: ' || p.filter_predicates
+         END AS filter_txt,
+         -- Prefer PARTITION_INFO; append PARTITION_START..STOP when non-zero
+         CASE
+           WHEN LENGTH(TRIM(NVL(p.partition_info, ''))) > 0 THEN
+             '  -> Partition: ' || TRIM(p.partition_info) ||
+             CASE
+               WHEN NVL(p.partition_start, 0) <> 0 OR NVL(p.partition_stop, 0) <> 0
+               THEN ' (' || NVL(TO_CHAR(p.partition_start), '?') || '..' ||
+                    NVL(TO_CHAR(p.partition_stop), '?') || ')'
+               ELSE ''
+             END
+           WHEN NVL(p.partition_start, 0) <> 0 OR NVL(p.partition_stop, 0) <> 0 THEN
+             '  -> Partition: ' ||
+             NVL(TO_CHAR(p.partition_start), '?') || '..' ||
+             NVL(TO_CHAR(p.partition_stop), '?')
+         END AS part_txt,
+         CASE
+           WHEN LENGTH(TRIM(NVL(p.other_tag, ''))) > 0
+           THEN '  -> Other: ' || TRIM(p.other_tag)
+         END AS other_txt,
+         CASE
+           WHEN NVL(p.temp_space, 0) <> 0
+           THEN '  -> Temp: ' || TO_CHAR(p.temp_space)
+         END AS temp_txt,
+         CASE
+           WHEN NVL(p.search_columns, 0) <> 0
+           THEN '  -> SearchCols: ' || TO_CHAR(p.search_columns)
+         END AS search_txt,
+         CASE
+           WHEN NVL(p.cpu_cost, 0) <> 0 OR NVL(p.io_cost, 0) <> 0
+           THEN '  -> CpuIo: cpu=' || NVL(TO_CHAR(p.cpu_cost), '0') ||
+                ' io=' || NVL(TO_CHAR(p.io_cost), '0')
+         END AS cpuio_txt,
+         CASE
+           WHEN LENGTH(TRIM(NVL(p.projection, ''))) > 0
+           THEN '  -> Projection: ' || p.projection
+         END AS proj_txt,
+         ROW_NUMBER() OVER (
+           PARTITION BY p.plan_hash_value, p.id
+           ORDER BY p.child_number NULLS LAST, p.child_address, p.address
+         ) AS rn
+    FROM v$sql_plan p
+   WHERE p.sql_id = '&&sqlid'
+     AND p.id IS NOT NULL
+     AND p.operation IS NOT NULL
+),
+base AS (
+  SELECT phv, id, parent_id, depth, operation, options,
+         object_owner, object_name, object_type, object_alias,
+         cost, cardinality, bytes, plan_time, cpu_cost, io_cost,
+         search_columns, access_predicates, filter_predicates, projection,
+         partition_info, partition_start, partition_stop, other_tag, temp_space,
+         op_txt, name_txt, access_txt, filter_txt, part_txt, other_txt,
+         temp_txt, search_txt, cpuio_txt, proj_txt
+    FROM ranked
+   WHERE rn = 1
+),
+w AS (
+  SELECT phv,
+         GREATEST(LENGTH('Id'), NVL(MAX(LENGTH(TO_CHAR(id))), 0)) AS w_id,
+         GREATEST(LENGTH('Pid'), NVL(MAX(LENGTH(TO_CHAR(parent_id))), 0)) AS w_pid,
+         GREATEST(LENGTH('Ord'), NVL(MAX(LENGTH(TO_CHAR(id))), 0)) AS w_ord,
+         LEAST(
+           120,
+           GREATEST(
+             LENGTH('Operation'),
+             NVL(MAX(LENGTH(op_txt)), 0),
+             NVL(MAX(LENGTH(access_txt)), 0),
+             NVL(MAX(LENGTH(filter_txt)), 0),
+             NVL(MAX(LENGTH(part_txt)), 0),
+             NVL(MAX(LENGTH(other_txt)), 0),
+             NVL(MAX(LENGTH(temp_txt)), 0),
+             NVL(MAX(LENGTH(search_txt)), 0),
+             NVL(MAX(LENGTH(cpuio_txt)), 0),
+             NVL(MAX(LENGTH(proj_txt)), 0)
+           )
+         ) AS w_op,
+         LEAST(120, GREATEST(LENGTH('Name'), NVL(MAX(LENGTH(name_txt)), 0))) AS w_name,
+         GREATEST(LENGTH('Rows'), NVL(MAX(LENGTH(TO_CHAR(cardinality))), 0)) AS w_rows,
+         GREATEST(LENGTH('Bytes'), NVL(MAX(LENGTH(TO_CHAR(bytes))), 0)) AS w_bytes,
+         GREATEST(LENGTH('Cost'), NVL(MAX(LENGTH(TO_CHAR(cost))), 0)) AS w_cost,
+         GREATEST(LENGTH('Time'), NVL(MAX(LENGTH(TO_CHAR(plan_time))), 0)) AS w_time
+    FROM base
+   GROUP BY phv
+),
+phvs AS (
+  SELECT DISTINCT phv FROM base
+),
+lines AS (
+  SELECT p.phv,
+         0 AS sek,
+         0 AS sid,
+         '============================================================================' AS plan_line
+    FROM phvs p
+  UNION ALL
+  SELECT p.phv, 1, 0,
+         'Plan Hash Value: ' || TO_CHAR(p.phv)
+    FROM phvs p
+  UNION ALL
+  SELECT p.phv, 2, 0,
+         '============================================================================'
+    FROM phvs p
+  UNION ALL
+  SELECT p.phv, 4, 0,
+         '|' || LPAD('Id', w.w_id) || '|' ||
+         LPAD('Pid', w.w_pid) || '|' ||
+         LPAD('Ord', w.w_ord) || '|' ||
+         RPAD('Operation', w.w_op) || '|' ||
+         RPAD('Name', w.w_name) || '|' ||
+         RPAD('Rows', w.w_rows) || '|' ||
+         RPAD('Bytes', w.w_bytes) || '|' ||
+         RPAD('Cost', w.w_cost) || '|' ||
+         RPAD('Time', w.w_time) || '|'
+    FROM phvs p
+    JOIN w ON w.phv = p.phv
+  UNION ALL
+  SELECT p.phv, 5, 0,
+         '|' || LPAD('-', w.w_id, '-') || '|' ||
+         LPAD('-', w.w_pid, '-') || '|' ||
+         LPAD('-', w.w_ord, '-') || '|' ||
+         RPAD('-', w.w_op, '-') || '|' ||
+         RPAD('-', w.w_name, '-') || '|' ||
+         RPAD('-', w.w_rows, '-') || '|' ||
+         RPAD('-', w.w_bytes, '-') || '|' ||
+         RPAD('-', w.w_cost, '-') || '|' ||
+         RPAD('-', w.w_time, '-') || '|'
+    FROM phvs p
+    JOIN w ON w.phv = p.phv
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20,
+         '|' || LPAD(TO_CHAR(b.id), w.w_id) || '|' ||
+         LPAD(NVL(TO_CHAR(b.parent_id), ' '), w.w_pid) || '|' ||
+         LPAD(TO_CHAR(b.id), w.w_ord) || '|' ||
+         RPAD(SUBSTR(NVL(b.op_txt, ' '), 1, w.w_op), w.w_op) || '|' ||
+         RPAD(SUBSTR(NVL(b.name_txt, ' '), 1, w.w_name), w.w_name) || '|' ||
+         RPAD(SUBSTR(NVL(TO_CHAR(b.cardinality), ' '), 1, w.w_rows), w.w_rows) || '|' ||
+         RPAD(SUBSTR(NVL(TO_CHAR(b.bytes), ' '), 1, w.w_bytes), w.w_bytes) || '|' ||
+         RPAD(SUBSTR(NVL(TO_CHAR(b.cost), ' '), 1, w.w_cost), w.w_cost) || '|' ||
+         RPAD(SUBSTR(NVL(TO_CHAR(b.plan_time), ' '), 1, w.w_time), w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 1,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.access_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.access_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 2,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.filter_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.filter_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 3,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.part_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.part_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 4,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.other_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.other_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 5,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.temp_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.temp_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 6,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.search_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.search_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 7,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.cpuio_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.cpuio_txt IS NOT NULL
+  UNION ALL
+  SELECT b.phv, 6, b.id * 20 + 8,
+         '|' || LPAD(' ', w.w_id) || '|' ||
+         LPAD(' ', w.w_pid) || '|' ||
+         LPAD(' ', w.w_ord) || '|' ||
+         RPAD(SUBSTR(b.proj_txt, 1, w.w_op), w.w_op) || '|' ||
+         RPAD(' ', w.w_name) || '|' ||
+         RPAD(' ', w.w_rows) || '|' ||
+         RPAD(' ', w.w_bytes) || '|' ||
+         RPAD(' ', w.w_cost) || '|' ||
+         RPAD(' ', w.w_time) || '|'
+    FROM base b
+    JOIN w ON w.phv = b.phv
+   WHERE b.proj_txt IS NOT NULL
+  UNION ALL
+  SELECT p.phv, 7, 0,
+         '============================================================================'
+    FROM phvs p
+),
+empty_msg AS (
+  SELECT CAST(NULL AS NUMBER) AS phv,
+         0 AS sek,
+         0 AS sid,
+         'No plan found in V$SQL_PLAN for sql_id=&&sqlid' AS plan_line
+    FROM dual
+   WHERE NOT EXISTS (SELECT 1 FROM base)
+)
+SELECT plan_line
+  FROM (
+        SELECT phv, sek, sid, plan_line FROM lines
+        UNION ALL
+        SELECT phv, sek, sid, plan_line FROM empty_msg
+       )
+ ORDER BY phv NULLS LAST, sek, sid
 /

@@ -1,0 +1,183 @@
+-- File Name: ddl_user.sql
+-- Purpose: Generate CREATE USER DDL; empty name means all non-system users
+-- Created: 20260802 by huangtingzhong
+--
+-- Notes:
+--   1) DBMS_METADATA.GET_DDL('USER') is NOT supported on YashanDB 23.5
+--      (YAS-05319); DDL is reconstructed from dictionary views.
+--   2) Empty username => DATABASE_MAINTAINED = 'N' (non-system users).
+--   3) Explicit username => that user only (including system ones).
+--   4) Password preserve: CREATE USER ... IDENTIFIED BY VALUES "<hash>"
+--      Hash from SYS.USER$.PASSWORD (S: + 84 hex, total 86 bytes).
+--      Must use double quotes around the hash (single quotes => YAS-04225).
+--      Verified 23.5.2.101: hash round-trip MATCH; original plaintext still works.
+--
+-- Usage: ytop -f ddl_user.sql
+-- Example: username=HTZ_PRIV   or leave empty for all non-system
+
+SET SERVEROUTPUT ON
+
+UNDEFINE username
+
+PROMPT
+PROMPT +------------------------------------------------------------------------+
+PROMPT | Generate USER DDL (dictionary reconstruct, keep password hash)         |
+PROMPT +------------------------------------------------------------------------+
+PROMPT
+
+ACCEPT username PROMPT 'Enter username (empty=all non-system users): '
+
+DECLARE
+  v_filter VARCHAR2(128) := NULLIF(UPPER(TRIM('&&username')), '');
+  v_cnt    PLS_INTEGER := 0;
+  c_pwd_fb CONSTANT VARCHAR2(64) := 'ChangeMe_ResetAfterImport';
+
+  PROCEDURE put(p_line VARCHAR2) IS
+  BEGIN
+    DBMS_OUTPUT.PUT_LINE(p_line);
+  END;
+
+  FUNCTION fmt_quota(p_max_bytes NUMBER) RETURN VARCHAR2 IS
+  BEGIN
+    IF p_max_bytes IS NULL OR p_max_bytes < 0 THEN
+      RETURN 'UNLIMITED';
+    ELSIF p_max_bytes = 0 THEN
+      RETURN '0';
+    ELSIF MOD(p_max_bytes, 1024 * 1024 * 1024) = 0 THEN
+      RETURN TO_CHAR(p_max_bytes / (1024 * 1024 * 1024)) || 'G';
+    ELSIF MOD(p_max_bytes, 1024 * 1024) = 0 THEN
+      RETURN TO_CHAR(p_max_bytes / (1024 * 1024)) || 'M';
+    ELSIF MOD(p_max_bytes, 1024) = 0 THEN
+      RETURN TO_CHAR(p_max_bytes / 1024) || 'K';
+    ELSE
+      RETURN TO_CHAR(p_max_bytes);
+    END IF;
+  END;
+
+  FUNCTION is_valid_pwd_hash(p_hash VARCHAR2) RETURN BOOLEAN IS
+  BEGIN
+    RETURN p_hash IS NOT NULL
+       AND LENGTH(p_hash) = 86
+       AND SUBSTR(p_hash, 1, 2) = 'S:';
+  END;
+
+  PROCEDURE emit_user(p_user VARCHAR2) IS
+    v_status      VARCHAR2(64);
+    v_def_ts      VARCHAR2(128);
+    v_tmp_ts      VARCHAR2(128);
+    v_profile     VARCHAR2(128);
+    v_hash        VARCHAR2(200);
+    v_sql         VARCHAR2(4000);
+  BEGIN
+    SELECT account_status,
+           default_tablespace,
+           temporary_tablespace,
+           profile
+      INTO v_status, v_def_ts, v_tmp_ts, v_profile
+      FROM dba_users
+     WHERE username = p_user;
+
+    BEGIN
+      SELECT password INTO v_hash FROM sys.user$ WHERE name = p_user;
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        v_hash := NULL;
+    END;
+
+    IF is_valid_pwd_hash(v_hash) THEN
+      -- 密文须用双引号; 单引号会报 YAS-04225
+      v_sql := 'CREATE USER ' || p_user
+            || ' IDENTIFIED BY VALUES "' || v_hash || '"';
+    ELSE
+      put('-- WARN: no valid S: hash in SYS.USER$; using plaintext placeholder, reset after import');
+      v_sql := 'CREATE USER ' || p_user
+            || ' IDENTIFIED BY "' || c_pwd_fb || '"';
+    END IF;
+    put(v_sql);
+    IF v_def_ts IS NOT NULL THEN
+      put('  DEFAULT TABLESPACE ' || v_def_ts);
+    END IF;
+    IF v_tmp_ts IS NOT NULL THEN
+      put('  TEMPORARY TABLESPACE ' || v_tmp_ts);
+    END IF;
+    IF v_profile IS NOT NULL THEN
+      put('  PROFILE ' || v_profile);
+    END IF;
+    IF UPPER(v_status) LIKE '%LOCK%' THEN
+      put('  ACCOUNT LOCK');
+    END IF;
+    put(';');
+
+    IF UPPER(v_status) LIKE '%EXPIRED%' THEN
+      put('ALTER USER ' || p_user || ' PASSWORD EXPIRE;');
+    END IF;
+
+    FOR q IN (
+      SELECT tablespace_name, max_bytes
+        FROM dba_ts_quotas
+       WHERE username = p_user
+       ORDER BY tablespace_name
+    ) LOOP
+      put('ALTER USER ' || p_user
+          || ' QUOTA ' || fmt_quota(q.max_bytes)
+          || ' ON ' || q.tablespace_name || ';');
+    END LOOP;
+
+    FOR r IN (
+      SELECT granted_role, admin_option
+        FROM dba_role_privs
+       WHERE grantee = p_user
+       ORDER BY granted_role
+    ) LOOP
+      IF UPPER(NVL(r.admin_option, 'N')) IN ('YES', 'Y') THEN
+        put('GRANT ' || r.granted_role || ' TO ' || p_user || ' WITH ADMIN OPTION;');
+      ELSE
+        put('GRANT ' || r.granted_role || ' TO ' || p_user || ';');
+      END IF;
+    END LOOP;
+
+    FOR p IN (
+      SELECT privilege, admin_option
+        FROM dba_sys_privs
+       WHERE grantee = p_user
+       ORDER BY privilege
+    ) LOOP
+      IF UPPER(NVL(p.admin_option, 'N')) IN ('YES', 'Y') THEN
+        put('GRANT ' || p.privilege || ' TO ' || p_user || ' WITH ADMIN OPTION;');
+      ELSE
+        put('GRANT ' || p.privilege || ' TO ' || p_user || ';');
+      END IF;
+    END LOOP;
+
+    put('');
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      put('-- ERROR: user not found: ' || p_user);
+      put('');
+  END;
+
+BEGIN
+  put('-- Generated by ddl_user.sql');
+  put('-- filter=' || NVL(v_filter, '<all non-system DATABASE_MAINTAINED=N>'));
+  put('');
+
+  IF v_filter IS NOT NULL THEN
+    emit_user(v_filter);
+    v_cnt := 1;
+  ELSE
+    FOR r IN (
+      SELECT username
+        FROM dba_users
+       WHERE NVL(database_maintained, 'N') = 'N'
+       ORDER BY username
+    ) LOOP
+      emit_user(r.username);
+      v_cnt := v_cnt + 1;
+    END LOOP;
+  END IF;
+
+  IF v_cnt = 0 THEN
+    put('-- no matching user');
+  END IF;
+END;
+/

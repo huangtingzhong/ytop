@@ -99,44 +99,101 @@ func GetSQLScript(name string) (string, error) {
 // GetOSScript loads an OS script from embedded files or filesystem.
 // Explicit OS paths (e.g. ./foo.sh, d:\foo.sh) are read from the filesystem first; otherwise embedded/scripts dir.
 func GetOSScript(name string) (string, error) {
+	content, err := GetOSBytes(name)
+	if err != nil {
+		return "", err
+	}
+	return string(content), nil
+}
+
+// GetOSBytes loads an OS asset (script or binary companion such as .jar) as raw bytes.
+func GetOSBytes(name string) ([]byte, error) {
 	if isExplicitPath(name) {
-		// Explicit path: read from OS filesystem
 		content, err := os.ReadFile(name)
 		if err != nil {
-			return "", fmt.Errorf("failed to read OS script from filesystem %s: %w", name, err)
+			return nil, fmt.Errorf("failed to read OS asset from filesystem %s: %w", name, err)
 		}
-		return string(content), nil
+		return content, nil
 	}
 
-	// First try to read from filesystem
 	scriptsDir, err := getScriptDir()
 	if err == nil && scriptsDir != "" {
 		scriptPath := filepath.Join(scriptsDir, "os", name)
 		content, err := os.ReadFile(scriptPath)
 		if err == nil {
-			return string(content), nil
+			return content, nil
 		}
 	}
 
-	// Try default embedded FS (root scripts copied to internal/scripts at build)
 	{
 		path := "os/" + name
 		content, err := fs.ReadFile(defaultEmbeddedFS, path)
 		if err == nil {
-			return string(content), nil
+			return content, nil
 		}
 	}
 
-	// Try external embedded filesystem (legacy)
 	if ExternalEmbeddedFS != nil {
 		scriptPath := filepath.Join("scripts", "os", name)
 		content, err := fs.ReadFile(ExternalEmbeddedFS, scriptPath)
 		if err == nil {
-			return string(content), nil
+			return content, nil
 		}
 	}
 
-	return "", fmt.Errorf("failed to read OS script %s", name)
+	return nil, fmt.Errorf("failed to read OS asset %s", name)
+}
+
+// ListOSCompanions returns companion filenames staged next to an OS script when present.
+// Convention: same basename stem + ".jar" (e.g. sql_collect.sh -> sql_collect.jar).
+// Explicit script paths resolve companions from the same directory on the filesystem.
+func ListOSCompanions(scriptName string) []string {
+	base := filepath.Base(scriptName)
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+	if stem == "" {
+		return nil
+	}
+	candidates := []string{stem + ".jar"}
+	var out []string
+	if isExplicitPath(scriptName) {
+		dir := filepath.Dir(scriptName)
+		for _, c := range candidates {
+			if _, err := os.Stat(filepath.Join(dir, c)); err == nil {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	for _, c := range candidates {
+		if _, err := GetOSBytes(c); err == nil {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// LoadOSCompanionBytes loads companion bytes for an OS script.
+// For explicit script paths, companions are read from the script's directory.
+func LoadOSCompanionBytes(scriptName, companionName string) ([]byte, error) {
+	if isExplicitPath(scriptName) {
+		path := filepath.Join(filepath.Dir(scriptName), companionName)
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read OS companion %s: %w", path, err)
+		}
+		return content, nil
+	}
+	return GetOSBytes(companionName)
+}
+
+// isListableOSScript reports whether filename should appear in ytop -S (os).
+func isListableOSScript(filename string) bool {
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".sh", ".bash", ".zsh", ".ksh", ".py", ".c", ".ps1", ".bat", ".cmd":
+		return true
+	default:
+		return false
+	}
 }
 
 // isExplicitPath checks if path is an explicit OS filesystem path (not an embedded script name).
@@ -267,6 +324,9 @@ func searchInDirectory(dir, scriptType string, matcher func(string) bool, result
 		}
 
 		filename := entry.Name()
+		if scriptType == "os" && !isListableOSScript(filename) {
+			continue
+		}
 		if !matcher(filename) {
 			continue
 		}
@@ -300,6 +360,9 @@ func searchInEmbeddedFS(embeddedFS fs.FS, basePath string, matcher func(string) 
 			scriptType = parts[1] // "sql" or "os"
 		}
 
+		if scriptType == "os" && !isListableOSScript(filename) {
+			return nil
+		}
 		if !matcher(filename) {
 			return nil
 		}

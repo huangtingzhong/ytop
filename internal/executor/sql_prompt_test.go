@@ -127,6 +127,13 @@ DECLARE
 	if infos["&&confirm"].Hint != "Confirm (1=on): " {
 		t.Fatalf("hint=%q", infos["&&confirm"].Hint)
 	}
+	if !infos["&&confirm"].FromAccept {
+		t.Fatalf("FromAccept=false, want true")
+	}
+	got := formatInputPrompt("&&confirm", infos["&&confirm"])
+	if got != "\r\nConfirm (1=on): " {
+		t.Fatalf("input prompt=%q", got)
+	}
 	displayed := map[int]bool{}
 	out := formatYashanDBPromptBlocks(script, 0, firstVariableLineIndex(splitScriptLines(script), "confirm"), displayed)
 	if !strings.Contains(out, "+---+") || !strings.Contains(out, "| warn |") {
@@ -272,3 +279,24 @@ var errNotFound = errTest("script not found")
 type errTest string
 
 func (e errTest) Error() string { return string(e) }
+
+func TestFormatInputPrompt_sqlmapAccept(t *testing.T) {
+	script, err := readTestScript("sqlmap.sql")
+	if err != nil {
+		script, err = scripts.GetSQLScript("sqlmap.sql")
+		if err != nil {
+			t.Skip(err)
+		}
+	}
+	order := resolveVariablePromptOrder(script)
+	infos := resolveVariablePromptInfos(script, order.Ordered, nil, order.PreludeHints)
+	info := infos["&&sqlid"]
+	if !info.FromAccept {
+		t.Fatalf("FromAccept=false infos=%+v ordered=%v", infos, order.Ordered)
+	}
+	got := formatInputPrompt("&&sqlid", info)
+	want := "\r\nEnter sqlid (blank=list all; or sqlmap name / sql_id): "
+	if got != want {
+		t.Fatalf("got=%q want=%q", got, want)
+	}
+}
