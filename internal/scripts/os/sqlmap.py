@@ -4,7 +4,10 @@
 # Purpose: One-click YashanDB SQLMAP creation tool (create / genexec / export / genbind / lit2bind / perf)
 # Created: 20260802 by huangtingzhong
 #
-# Quick start:
+# Also available (JDBC, no yasql): sql_collect.sh sqlmap — see docs/sql_collect_java_sqlmap使用手册.md
+# Both entries stay: Python/yasql and Java/JDBC coexist; neither is deprecated.
+#
+# Quick start (Python + yasql):
 #   python3 sqlmap.py create -s <src_sqlid> -t <tgt_sqlid> --run
 #   python3 sqlmap.py create -s <src_sqlid> -f target.sql --run
 #   python3 sqlmap.py create --src-file source.sql -f target.sql --run

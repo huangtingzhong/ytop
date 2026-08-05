@@ -2,6 +2,7 @@
 
 # Build script for ytop - Multi-platform build with anti-decompilation
 # Supports: Linux (amd64, arm64), Windows (amd64, arm64), macOS (amd64, arm64)
+# Also builds tool/sql-collect → internal/scripts/os/sql_collect.jar (before Go embed).
 
 set -e
 
@@ -16,6 +17,8 @@ NC='\033[0m' # No Color
 BINARY_NAME="ytop"
 BUILD_DIR="build"
 CMD_PATH="./cmd/ytop"
+SQL_COLLECT_DIR="tool/sql-collect"
+SQL_COLLECT_JAR="internal/scripts/os/sql_collect.jar"
 
 # Version information (China timezone)
 TZ_CN="Asia/Shanghai"
@@ -216,7 +219,47 @@ clean_build() {
     print_msg "$YELLOW" "Cleaning build directory..."
     rm -rf "$BUILD_DIR"
     mkdir -p "$BUILD_DIR"
+    if [ -d "$SQL_COLLECT_DIR/build" ]; then
+        print_msg "$YELLOW" "Cleaning ${SQL_COLLECT_DIR}/build..."
+        rm -rf "$SQL_COLLECT_DIR/build"
+    fi
     print_msg "$GREEN" "✓ Clean complete"
+}
+
+# Build sql_collect.jar and install into internal/scripts/os/ (before go:embed)
+build_sql_collect() {
+    print_header "Building sql_collect.jar (Java → OS companion)"
+
+    if [ ! -f "$SQL_COLLECT_DIR/build.sh" ]; then
+        print_msg "$YELLOW" "⚠ ${SQL_COLLECT_DIR}/build.sh not found; skip sql_collect"
+        return 0
+    fi
+
+    if ! command -v javac &> /dev/null; then
+        print_msg "$YELLOW" "⚠ javac not found on PATH; skip sql_collect.jar rebuild"
+        print_msg "$YELLOW" "  Install JDK 8+ or run: (cd ${SQL_COLLECT_DIR} && ./build.sh)"
+        if [ -f "$SQL_COLLECT_JAR" ]; then
+            print_msg "$BLUE" "  Keeping existing: ${SQL_COLLECT_JAR}"
+        else
+            print_msg "$RED" "  Missing ${SQL_COLLECT_JAR}; ytop -f sql_collect.sh will fail until jar is built"
+        fi
+        return 0
+    fi
+
+    print_msg "$YELLOW" "Running ${SQL_COLLECT_DIR}/build.sh ..."
+    if (cd "$SQL_COLLECT_DIR" && bash ./build.sh); then
+        if [ -f "$SQL_COLLECT_JAR" ]; then
+            local jar_sz
+            jar_sz=$(du -h "$SQL_COLLECT_JAR" | cut -f1)
+            print_msg "$GREEN" "✓ sql_collect.jar installed (${jar_sz}): ${SQL_COLLECT_JAR}"
+        else
+            print_msg "$RED" "✗ sql_collect build finished but jar missing: ${SQL_COLLECT_JAR}"
+            return 1
+        fi
+    else
+        print_msg "$RED" "✗ sql_collect build failed"
+        return 1
+    fi
 }
 
 # Show help
@@ -225,25 +268,31 @@ show_help() {
 Usage: $0 [OPTIONS]
 
 Build ytop for multiple platforms with anti-decompilation protection.
+Also rebuilds sql_collect.jar (tool/sql-collect) into ${SQL_COLLECT_JAR}
+before Go compile so go:embed picks up the latest companion jar.
 
 OPTIONS:
-    -h, --help          Show this help message
-    -c, --clean         Clean build directory before building
-    -l, --linux         Build for Linux only
-    -w, --windows       Build for Windows only
-    -m, --macos         Build for macOS only
-    -a, --all           Build for all platforms (default)
-    --current           Build for current platform only
+    -h, --help              Show this help message
+    -c, --clean             Clean build directories before building
+    -l, --linux             Build for Linux only
+    -w, --windows           Build for Windows only
+    -m, --macos             Build for macOS only
+    -a, --all               Build for all platforms (default)
+    --current               Build for current platform only
+    --skip-sql-collect      Do not rebuild sql_collect.jar
+    --sql-collect-only      Only rebuild sql_collect.jar (no Go binaries)
 
 EXAMPLES:
-    $0                  # Build all platforms
-    $0 --clean          # Clean and build all platforms
-    $0 --linux          # Build Linux versions only
-    $0 --current        # Build for current platform only
+    $0                      # sql_collect.jar + all platform ytop binaries
+    $0 --clean              # Clean and build all
+    $0 --linux              # sql_collect.jar + Linux ytop only
+    $0 --current            # sql_collect.jar + current platform ytop
+    $0 --sql-collect-only   # Only Java companion jar
+    $0 --skip-sql-collect   # Go binaries only (keep existing jar)
 
 OUTPUT:
-    All binaries will be placed in: ${BUILD_DIR}/
-    Naming format: ${BINARY_NAME}_<os>_<arch>[.exe]
+    Go binaries:     ${BUILD_DIR}/${BINARY_NAME}_<os>_<arch>[.exe]
+    Companion jar:   ${SQL_COLLECT_JAR}
 
 PLATFORMS:
     Linux:   amd64, arm64
@@ -266,7 +315,9 @@ COMPRESSION:
       * Windows ARM64: No compression (UPX not supported)
 
 REQUIREMENTS:
-    - Go 1.19+ (required)
+    - Go 1.19+ (required for ytop)
+    - JDK 8+ with javac/jar (optional but recommended for sql_collect.jar)
+    - JDBC_JAR env for sql-collect compile classpath (optional; warns if missing)
     - upx (optional, for UPX compression)
     - gzip (optional, for macOS ARM64 compression)
     - codesign (macOS only, for signing compressed binaries)
@@ -351,6 +402,11 @@ show_summary() {
         print_msg "$RED" "No build directory found"
     fi
 
+    if [ -f "$SQL_COLLECT_JAR" ]; then
+        echo ""
+        print_msg "$GREEN" "sql_collect companion: ${SQL_COLLECT_JAR} ($(du -h "$SQL_COLLECT_JAR" | cut -f1))"
+    fi
+
     echo ""
 }
 
@@ -383,15 +439,11 @@ EOF
 
 # Main script
 main() {
-    # Check if go is installed
-    if ! command -v go &> /dev/null; then
-        print_msg "$RED" "Error: Go is not installed"
-        exit 1
-    fi
-
-    # Parse arguments
+    # Parse arguments first (help / sql-collect-only do not require go)
     local do_clean=false
     local build_target="all"
+    local skip_sql_collect=false
+    local sql_collect_only=false
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -423,6 +475,14 @@ main() {
                 build_target="current"
                 shift
                 ;;
+            --skip-sql-collect)
+                skip_sql_collect=true
+                shift
+                ;;
+            --sql-collect-only)
+                sql_collect_only=true
+                shift
+                ;;
             *)
                 print_msg "$RED" "Unknown option: $1"
                 show_help
@@ -438,19 +498,43 @@ main() {
     print_msg "$BLUE" "Git Commit: ${GIT_COMMIT}"
     echo ""
 
+    # Clean if requested (before sql_collect so its build/ is cleared too)
+    if [ "$do_clean" = true ]; then
+        clean_build
+    else
+        mkdir -p "$BUILD_DIR"
+    fi
+
+    # sql_collect.jar first so go:embed sees the updated companion
+    if [ "$skip_sql_collect" = true ]; then
+        print_msg "$YELLOW" "Skipping sql_collect.jar rebuild (--skip-sql-collect)"
+        if [ -f "$SQL_COLLECT_JAR" ]; then
+            print_msg "$BLUE" "  Using existing: ${SQL_COLLECT_JAR}"
+        fi
+        echo ""
+    else
+        build_sql_collect
+        echo ""
+    fi
+
+    if [ "$sql_collect_only" = true ]; then
+        show_summary
+        print_msg "$GREEN" "✓ sql_collect-only build complete!"
+        exit 0
+    fi
+
+    # Check if go is installed
+    if ! command -v go &> /dev/null; then
+        print_msg "$RED" "Error: Go is not installed"
+        exit 1
+    fi
+
     # Update version.go file
     update_version_file
     echo ""
 
     # Note: scripts are now located in internal/scripts/sql and internal/scripts/os
     # No need to copy them for embedding as they're already in the correct location
-
-    # Clean if requested
-    if [ "$do_clean" = true ]; then
-        clean_build
-    else
-        mkdir -p "$BUILD_DIR"
-    fi
 
     # Build based on target
     case $build_target in

@@ -64,6 +64,53 @@ public final class HtzTables {
         }
     }
 
+    public static boolean indexExists(Connection c, String owner, String indexName) throws SQLException {
+        String o = normalizeOwner(owner);
+        String idx = indexName == null ? "" : indexName.trim().toUpperCase(Locale.ROOT);
+        String who = currentUser(c);
+        if (who.equalsIgnoreCase(o)) {
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT COUNT(*) FROM user_indexes WHERE index_name = ?")) {
+                ps.setString(1, idx);
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    if (rs.getInt(1) > 0) {
+                        return true;
+                    }
+                }
+            }
+        }
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT COUNT(*) FROM all_indexes WHERE owner = ? AND index_name = ?")) {
+            ps.setString(1, o);
+            ps.setString(2, idx);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getInt(1) > 0;
+            }
+        }
+    }
+
+    /**
+     * 索引不存在则创建. ddl 须为完整 CREATE INDEX ... 语句.
+     */
+    public static void ensureIndex(Connection c, DualLogger log, String owner, String indexName, String ddl)
+            throws SQLException {
+        if (indexExists(c, owner, indexName)) {
+            if (log != null) {
+                log.logDbg("index exists " + qname(owner, indexName));
+            }
+            return;
+        }
+        if (log != null) {
+            log.logInfo("index creating " + normalizeOwner(owner) + "." + indexName.toUpperCase(Locale.ROOT));
+        }
+        exec(c, log, "create_index_" + indexName, ddl);
+        if (log != null) {
+            log.logInfo("index created " + normalizeOwner(owner) + "." + indexName.toUpperCase(Locale.ROOT));
+        }
+    }
+
     public static String currentUser(Connection c) throws SQLException {
         try (Statement st = c.createStatement();
              ResultSet rs = st.executeQuery("SELECT USER FROM dual")) {

@@ -13,18 +13,21 @@ import java.util.List;
 
 /**
  * 纯 JDBC 报告构建.
- * P0: ORIGINAL + LITERAL (Java, 不跑 sql.sql PL/SQL).
- * P1: PLAN / sqlarea / v$sql / objects 等 SELECT (复用嵌入 sql.sql).
- * P2: AWR SELECT; 失败 [ERROR] AWR 后继续.
+ * ORIGINAL + LITERAL: Java; PLAN/sqlarea/AWR/objects: {@link ReportSelectScript} + JDBC SELECT.
  */
 public class JdbcReportBuilder {
 
     private final DualLogger log;
     private final SqlReportRunner selectSections;
+    private boolean explainPlan;
 
     public JdbcReportBuilder(DualLogger log) {
         this.log = log;
         this.selectSections = new SqlReportRunner(log);
+    }
+
+    public void setExplainPlan(boolean explainPlan) {
+        this.explainPlan = explainPlan;
     }
 
     public String build(JdbcSession session, String sqlId, int timeoutSec) throws SQLException {
@@ -114,6 +117,11 @@ public class JdbcReportBuilder {
             if (log != null) {
                 log.logWarn("report P1 failed sql_id=" + sqlId + ": " + e.getMessage());
             }
+        }
+
+        if (explainPlan && !timedOut(deadlineMs)) {
+            ExplainPlanSection.append(c, sqlId, row.sqlText, out, log,
+                    stmtTimeout(deadlineMs, timeoutSec));
         }
         return out.toString();
     }

@@ -8,7 +8,6 @@ import com.yashan.sqlcollect.util.JsonBinds;
 import com.yashan.sqlcollect.util.PipeEscape;
 
 import java.io.IOException;
-import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -17,15 +16,11 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.sql.Timestamp;
-import java.sql.Types;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /** JDBC replay 引擎 (file/htz/gv), 进程内调用; 连接经 {@link JdbcPool} 复用 */
 public class ReplayEngine {
@@ -44,6 +39,10 @@ public class ReplayEngine {
     private boolean shaMismatchFail = true;
     private ReplayResultCsv resultCsv;
     private final ThreadLocal<RowCtx> rowCtx = new ThreadLocal<RowCtx>();
+    /** 最近一次失败原因, 供终端 WARN 一行摘要 */
+    private final ThreadLocal<String> lastFailReason = new ThreadLocal<String>();
+    /** 最近一次成功明细 (kind/rows/update-count/ms), 供终端 INFO 一行摘要 */
+    private final ThreadLocal<String> lastOkDetail = new ThreadLocal<String>();
 
     private static final class RowCtx {
         final String sqlId;
@@ -57,10 +56,52 @@ public class ReplayEngine {
         }
     }
 
-    /** 行输出回调 */
+    /** 记录失败原因, 供终端 WARN 一行摘要 */
+    public void noteFail(String reason) {
+        lastFailReason.set(reason == null ? "" : reason);
+        lastOkDetail.remove();
+    }
+
+    /** 取出并清除最近失败原因 */
+    public String takeLastFailReason() {
+        String r = lastFailReason.get();
+        lastFailReason.remove();
+        return r == null ? "" : r;
+    }
+
+    /** 记录成功明细, 供终端 INFO 一行摘要 */
+    public void noteOkDetail(String detail) {
+        lastOkDetail.set(detail == null ? "" : detail);
+        lastFailReason.remove();
+    }
+
+    /** 取出并清除最近成功明细 */
+    public String takeLastOkDetail() {
+        String r = lastOkDetail.get();
+        lastOkDetail.remove();
+        return r == null ? "" : r;
+    }
+
+    /** 行输出回调; step/dbg 写入 debug 日志便于逐步跟踪 */
     public interface LineOut {
         void println(String line);
+
+        void step(String name, String detail);
+
+        void dbg(String msg);
     }
+
+    private static final LineOut STDOUT = new LineOut() {
+        public void println(String line) {
+            System.out.println(line);
+        }
+
+        public void step(String name, String detail) {
+        }
+
+        public void dbg(String msg) {
+        }
+    };
 
     public ReplayEngine(String jdbcUrl, String lookupUser, String lookupPass,
                         Map<String, String[]> maps, boolean schemaViaAlter, LineOut out) {
@@ -75,11 +116,7 @@ public class ReplayEngine {
         this.lookupPass = lookupPass;
         this.maps = maps == null ? new HashMap<String, String[]>() : maps;
         this.schemaViaAlter = schemaViaAlter;
-        this.out = out == null ? new LineOut() {
-            public void println(String line) {
-                System.out.println(line);
-            }
-        } : out;
+        this.out = out == null ? STDOUT : out;
         if (pool != null) {
             this.pool = pool;
             this.ownsPool = false;
@@ -177,30 +214,52 @@ public class ReplayEngine {
                                    String sqlId, int child, int instId,
                                    String expectedSqlSha256) throws Exception {
         beginRow(sqlId, child, instId);
+        out.step("replay_file", "sql_id=" + sqlId + " child=" + child + " inst_id=" + instId
+                + " mode=" + mode + " force=" + force);
+        out.dbg("schema_via_alter=" + schemaViaAlter + " lookup_user=" + lookupUser
+                + " map_entries=" + maps.size());
+        out.dbg("sql_file=" + sqlFile);
+        out.dbg("binds_file=" + bindsFile);
+        out.dbg("parsing_schema=" + (schema == null ? "" : schema));
+        out.dbg("expected_sql_sha256=" + (expectedSqlSha256 == null ? "" : expectedSqlSha256));
         try {
             String sql = readFile(sqlFile);
+            out.dbg("sql_chars=" + (sql == null ? 0 : sql.length()));
+            out.dbg("sql_text_begin");
+            out.dbg(previewText(sql, 8000));
+            out.dbg("sql_text_end");
             if (!assertSqlSha256(sql, expectedSqlSha256, "file")) {
+                noteFail("sql_sha256 mismatch");
                 ReplayResult r = new ReplayResult(0, 1);
                 out.println("replay summary ok=" + r.ok + " fail=" + r.fail);
+                out.step("replay_file_done", "fail sha mismatch");
                 return r;
             }
             List<String[]> binds = readBinds(bindsFile);
+            dumpBinds(binds);
             out.println("replay source=file");
+            out.step("resolve_creds", "schema=" + (schema == null ? "" : schema));
             String[] cred = resolveExecCreds(schema);
+            out.dbg("exec_user=" + cred[0] + (schemaViaAlter ? " (alter-session)" : " (map/fallback)"));
             out.println("replay login-user=" + cred[0] + ("dry".equalsIgnoreCase(mode) ? " (planned)" : ""));
             boolean ok;
             if ("dry".equalsIgnoreCase(mode)) {
-                ok = execSql(null, schema, sql, binds, mode, force, null);
+                out.step("exec_sql", "dry-run");
+                ok = execSql(null, schema, sql, binds, mode, force, cred[0]);
             } else {
+                out.step("jdbc_connect", cred[0]);
                 Connection c = connectAs(cred[0], cred[1]);
                 try {
+                    out.step("exec_sql", "live");
                     ok = execSql(c, schema, sql, binds, mode, force, cred[0]);
                 } finally {
                     c.close();
+                    out.dbg("jdbc_connection_closed user=" + cred[0]);
                 }
             }
             ReplayResult r = new ReplayResult(ok ? 1 : 0, ok ? 0 : 1);
             out.println("replay summary ok=" + r.ok + " fail=" + r.fail);
+            out.step("replay_file_done", ok ? "ok" : "fail");
             return r;
         } finally {
             endRow();
@@ -208,14 +267,17 @@ public class ReplayEngine {
     }
 
     public ReplayResult replayGv(String sqlId, String mode, boolean force) throws Exception {
+        out.step("replay_gv", "sql_id=" + sqlId + " mode=" + mode + " force=" + force);
         String schema = null;
         int child = 0;
         int instId = 1;
         String sql = null;
         List<String[]> binds = new ArrayList<String[]>();
+        out.step("jdbc_lookup_connect", lookupUser);
         Connection cLookup = connectAs(lookupUser, lookupPass);
         out.println("replay lookup-user=" + lookupUser);
         try {
+            out.step("lookup_gv$sql", sqlId);
             try (PreparedStatement ps = cLookup.prepareStatement(
                     "SELECT parsing_schema_name, child_number, NVL(inst_id,1), sql_fulltext FROM ("
                             + " SELECT parsing_schema_name, child_number, inst_id, sql_fulltext"
@@ -229,12 +291,16 @@ public class ReplayEngine {
                         child = rs.getInt(2);
                         instId = rs.getInt(3);
                         sql = JdbcSession.readClob(rs.getClob(4));
+                        out.dbg("gv$sql hit schema=" + schema + " child=" + child
+                                + " inst_id=" + instId);
                     }
                 }
             } catch (SQLException e) {
                 out.println("replay warn gv$sql " + e.getMessage());
+                out.dbg("gv$sql miss/error: " + e.getMessage());
             }
             if (sql == null) {
+                out.step("lookup_v$sql", sqlId);
                 try (PreparedStatement ps = cLookup.prepareStatement(
                         "SELECT parsing_schema_name, child_number, sql_fulltext FROM ("
                                 + " SELECT parsing_schema_name, child_number, sql_fulltext"
@@ -245,28 +311,40 @@ public class ReplayEngine {
                     try (ResultSet rs = ps.executeQuery()) {
                         if (!rs.next()) {
                             out.println("replay fail sql_id not found in gv$/v$sql: " + sqlId);
+                            out.step("replay_gv_done", "fail not found");
                             return new ReplayResult(0, 1);
                         }
                         schema = rs.getString(1);
                         child = rs.getInt(2);
                         instId = 1;
                         sql = JdbcSession.readClob(rs.getClob(3));
+                        out.dbg("v$sql hit schema=" + schema + " child=" + child);
                     }
                 }
             }
             out.println("replay source=gv sql_id=" + sqlId + " child=" + child + " inst_id=" + instId);
+            out.dbg("sql_chars=" + (sql == null ? 0 : sql.length()));
+            out.dbg("sql_text_begin");
+            out.dbg(previewText(sql, 8000));
+            out.dbg("sql_text_end");
             // gv 无采集快照指纹: 仅审计打印, 不做 mismatch 硬失败
             out.println("replay sql_sha256=" + ReplayPackageMeta.sha256Utf8(sql) + " (gv live; no package fingerprint)");
+            out.step("load_binds_gv", "sql_id=" + sqlId + " child=" + child);
             binds = loadGvBinds(cLookup, sqlId, child, instId);
+            dumpBinds(binds);
             String kind = classifySql(sql);
+            out.step("resolve_creds", "schema=" + (schema == null ? "" : schema));
             String[] cred = resolveExecCreds(schema);
+            out.dbg("exec_user=" + cred[0] + (schemaViaAlter ? " (alter-session)" : " (map/fallback)"));
             if ("dry".equalsIgnoreCase(mode) || (!force && !"query".equals(kind))) {
                 out.println("replay login-user=" + cred[0] + " (planned)");
                 beginRow(sqlId, child, instId);
                 try {
+                    out.step("exec_sql", "dry-or-blocked");
                     boolean okDry = execSql(null, schema, sql, binds, mode, force, null);
                     ReplayResult r = new ReplayResult(okDry ? 1 : 0, okDry ? 0 : 1);
                     out.println("replay summary ok=" + r.ok + " fail=" + r.fail);
+                    out.step("replay_gv_done", okDry ? "ok" : "fail");
                     return r;
                 } finally {
                     endRow();
@@ -274,33 +352,44 @@ public class ReplayEngine {
             }
         } finally {
             cLookup.close();
+            out.dbg("lookup_connection_closed");
         }
         String[] cred = resolveExecCreds(schema);
+        out.step("jdbc_connect", cred[0]);
         Connection cExec = connectAs(cred[0], cred[1]);
         boolean okExec;
         beginRow(sqlId, child, instId);
         try {
+            out.step("exec_sql", "live");
             okExec = execSql(cExec, schema, sql, binds, mode, force, cred[0]);
         } finally {
             endRow();
             cExec.close();
+            out.dbg("jdbc_connection_closed user=" + cred[0]);
         }
         ReplayResult r = new ReplayResult(okExec ? 1 : 0, okExec ? 0 : 1);
         out.println("replay summary ok=" + r.ok + " fail=" + r.fail);
+        out.step("replay_gv_done", okExec ? "ok" : "fail");
         return r;
     }
 
     public ReplayResult replayHtzOne(String sqlId, String mode, boolean force) throws Exception {
+        out.step("replay_htz_one", "sql_id=" + sqlId + " mode=" + mode + " force=" + force);
+        out.step("jdbc_lookup_connect", lookupUser);
         Connection cLookup = connectAs(lookupUser, lookupPass);
         out.println("replay lookup-user=" + lookupUser);
         List<Object[]> rows = new ArrayList<Object[]>();
         try {
+            out.step("load_htz_rows", sqlId);
             rows = loadHtzRows(cLookup, sqlId);
+            out.dbg("htz_rows=" + rows.size());
         } finally {
             cLookup.close();
+            out.dbg("lookup_connection_closed");
         }
         if (rows.isEmpty()) {
             out.println("replay fail sql_id not found in HTZ_SQL_REPLAY_PKG: " + sqlId);
+            out.step("replay_htz_one_done", "fail not found");
             return new ReplayResult(0, 1);
         }
         int okN = 0;
@@ -312,9 +401,11 @@ public class ReplayEngine {
             String sql = (String) row[3];
             String bj = (String) row[4];
             String sha = (String) row[5];
+            out.step("htz_row", "sql_id=" + sqlId + " child=" + child + " inst_id=" + instId);
             out.println("replay source=htz sql_id=" + sqlId + " child=" + child
                     + " inst_id=" + instId);
             if (!assertSqlSha256(sql, sha, "htz")) {
+                noteFail("sql_sha256 mismatch");
                 failN++;
                 continue;
             }
@@ -326,26 +417,34 @@ public class ReplayEngine {
                 failN += r.fail;
             } catch (Exception e) {
                 out.println("replay fail " + e.getMessage());
+                out.dbg("htz_row exception: " + e.getMessage());
                 failN++;
             } finally {
                 endRow();
             }
         }
         out.println("replay summary ok=" + okN + " fail=" + failN);
+        out.step("replay_htz_one_done", "ok=" + okN + " fail=" + failN);
         return new ReplayResult(okN, failN);
     }
 
     public ReplayResult replayHtzAll(String mode, boolean force) throws Exception {
+        out.step("replay_htz_all", "mode=" + mode + " force=" + force);
+        out.step("jdbc_lookup_connect", lookupUser);
         Connection cLookup = connectAs(lookupUser, lookupPass);
         out.println("replay lookup-user=" + lookupUser);
         List<Object[]> rows = new ArrayList<Object[]>();
         try {
+            out.step("load_htz_rows", "all");
             rows = loadHtzRows(cLookup, null);
+            out.dbg("htz_rows=" + rows.size());
         } finally {
             cLookup.close();
+            out.dbg("lookup_connection_closed");
         }
         if (rows.isEmpty()) {
             out.println("replay fail HTZ_SQL_REPLAY_PKG is empty");
+            out.step("replay_htz_all_done", "fail empty");
             return new ReplayResult(0, 1);
         }
         int okN = 0;
@@ -358,9 +457,11 @@ public class ReplayEngine {
             String sql = (String) row[4];
             String bj = (String) row[5];
             String sha = (String) row[6];
+            out.step("htz_row", "sql_id=" + sqlId + " child=" + child + " inst_id=" + instId);
             out.println("replay source=htz sql_id=" + sqlId + " child=" + child
                     + " inst_id=" + instId);
             if (!assertSqlSha256(sql, sha, "htz")) {
+                noteFail("sql_sha256 mismatch");
                 failN++;
                 continue;
             }
@@ -372,12 +473,14 @@ public class ReplayEngine {
                 failN += r.fail;
             } catch (Exception e) {
                 out.println("replay fail " + e.getMessage());
+                out.dbg("htz_row exception: " + e.getMessage());
                 failN++;
             } finally {
                 endRow();
             }
         }
         out.println("replay summary ok=" + okN + " fail=" + failN);
+        out.step("replay_htz_all_done", "ok=" + okN + " fail=" + failN);
         return new ReplayResult(okN, failN);
     }
 
@@ -479,101 +582,128 @@ public class ReplayEngine {
     /** SQL 文本指纹校验; expected 空则仅审计 (legacy).
      *  mismatch 时: shaMismatchFail=true 阻断; false 则 WARN 后仍允许回放. */
     private boolean assertSqlSha256(String sql, String expectedSha, String where) {
+        out.step("sha256_check", where);
         String actual = ReplayPackageMeta.sha256Utf8(sql);
         out.println("replay sql_sha256=" + actual + " source=" + where);
+        out.dbg("expected_sha256=" + (expectedSha == null ? "" : expectedSha.trim()));
+        out.dbg("actual_sha256=" + actual);
         String reason = ReplayPackageMeta.mismatchReason(sql, expectedSha);
         if (reason == null) {
             if (expectedSha != null && !expectedSha.trim().isEmpty()) {
                 out.println("replay sql_sha256 ok");
+                out.dbg("sha256 match");
             } else {
                 out.println("replay warn sql_sha256 missing (" + where
                         + "); skip hard check (legacy package)");
+                out.dbg("sha256 skipped (no expected)");
             }
             return true;
         }
         if (shaMismatchFail) {
             out.println("replay fail " + reason + " (" + where + "; on-sha-mismatch=fail)");
+            out.dbg("sha256 mismatch fail: " + reason);
+            noteFail("sql_sha256 mismatch");
             return false;
         }
         out.println("replay warn " + reason + " (" + where
                 + "; on-sha-mismatch=warn; continue replay)");
+        out.dbg("sha256 mismatch warn continue: " + reason);
         return true;
+    }
+
+    /** debug: 截断过长 SQL 文本 */
+    private static String previewText(String text, int maxChars) {
+        if (text == null) {
+            return "";
+        }
+        if (text.length() <= maxChars) {
+            return text;
+        }
+        return text.substring(0, maxChars) + "\n... [truncated chars=" + text.length()
+                + " shown=" + maxChars + "]";
+    }
+
+    /** debug: 逐条输出 bind 位置/类型/值预览 */
+    private void dumpBinds(List<String[]> binds) {
+        out.dbg("binds_count=" + (binds == null ? 0 : binds.size()));
+        if (binds == null || binds.isEmpty()) {
+            return;
+        }
+        out.dbg("binds_begin");
+        for (int i = 0; i < binds.size(); i++) {
+            String[] b = binds.get(i);
+            String pos = b.length > 0 ? b[0] : "";
+            String typ = b.length > 1 ? b[1] : "";
+            String val = b.length > 2 ? b[2] : "";
+            int vc = val == null ? 0 : val.length();
+            String vp = previewText(val == null ? "" : val, 500);
+            out.dbg("bind[" + i + "] pos=" + pos + " type=" + typ
+                    + " value_chars=" + vc + " value=" + vp);
+        }
+        out.dbg("binds_end");
     }
 
     private ReplayResult execOne(String schema, String sql, List<String[]> binds, String mode, boolean force)
             throws Exception {
+        out.dbg("sql_chars=" + (sql == null ? 0 : sql.length())
+                + " schema=" + (schema == null ? "" : schema));
+        out.dbg("sql_text_begin");
+        out.dbg(previewText(sql, 8000));
+        out.dbg("sql_text_end");
+        dumpBinds(binds);
         String kind = classifySql(sql);
+        out.step("resolve_creds", "schema=" + (schema == null ? "" : schema) + " kind=" + kind);
         String[] cred = resolveExecCreds(schema);
+        out.dbg("exec_user=" + cred[0] + (schemaViaAlter ? " (alter-session)" : " (map/fallback)"));
         boolean ok;
         if ("dry".equalsIgnoreCase(mode) || (!force && !"query".equals(kind))) {
             out.println("replay login-user=" + cred[0] + " (planned)");
+            out.step("exec_sql", "dry-or-blocked");
             ok = execSql(null, schema, sql, binds, mode, force, null);
         } else {
+            out.step("jdbc_connect", cred[0]);
             Connection cExec = connectAs(cred[0], cred[1]);
             try {
+                out.step("exec_sql", "live");
                 ok = execSql(cExec, schema, sql, binds, mode, force, cred[0]);
             } finally {
                 cExec.close();
+                out.dbg("jdbc_connection_closed user=" + cred[0]);
             }
         }
         return new ReplayResult(ok ? 1 : 0, ok ? 0 : 1);
     }
 
     private List<String[]> loadGvBinds(Connection c, String sqlId, int child, int instId) {
-        List<String[]> binds = new ArrayList<String[]>();
-        boolean got = false;
-        try (PreparedStatement ps = c.prepareStatement(
-                "SELECT position, datatype_string, value_string FROM gv$sql_bind_capture"
-                        + " WHERE sql_id = ? AND child_number = ? AND inst_id = ?"
-                        + " ORDER BY position, name")) {
-            ps.setString(1, sqlId);
-            ps.setInt(2, child);
-            ps.setInt(3, instId);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    got = true;
-                    String val = rs.getString(3);
-                    binds.add(new String[] {
-                        String.valueOf(rs.getInt(1)),
-                        rs.getString(2) == null ? "" : rs.getString(2),
-                        val == null ? "" : val
-                    });
-                }
-            }
-        } catch (SQLException e) {
-            out.println("replay warn gv$sql_bind_capture " + e.getMessage());
-        }
-        if (!got) {
-            try (PreparedStatement ps = c.prepareStatement(
-                    "SELECT position, datatype_string, value_string FROM v$sql_bind_capture"
-                            + " WHERE sql_id = ? AND child_number = ? ORDER BY position, name")) {
-                ps.setString(1, sqlId);
-                ps.setInt(2, child);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        String val = rs.getString(3);
-                        binds.add(new String[] {
-                            String.valueOf(rs.getInt(1)),
-                            rs.getString(2) == null ? "" : rs.getString(2),
-                            val == null ? "" : val
-                        });
-                    }
-                }
-            } catch (SQLException e) {
-                out.println("replay warn bind_capture " + e.getMessage());
-            }
-        }
-        return binds;
+        return com.yashan.sqlcollect.db.SqlLookup.toReplayRows(
+                com.yashan.sqlcollect.db.SqlLookup.loadBinds(c, sqlId, child, instId,
+                        new com.yashan.sqlcollect.db.SqlLookup.WarnOut() {
+                            public void warn(String msg) {
+                                out.println("replay warn " + msg);
+                            }
+                        }));
     }
 
     private Connection connectAs(String user, String pass) throws SQLException {
         out.println("replay login-user=" + user);
-        return pool.borrow(jdbcUrl, user, pass);
+        out.dbg("jdbc_borrow url=" + jdbcUrl + " user=" + user);
+        long t0 = System.currentTimeMillis();
+        try {
+            Connection c = pool.borrow(jdbcUrl, user, pass);
+            out.dbg("jdbc_borrow ok ms=" + (System.currentTimeMillis() - t0));
+            return c;
+        } catch (SQLException e) {
+            out.dbg("jdbc_borrow fail ms=" + (System.currentTimeMillis() - t0)
+                    + " err=" + e.getMessage());
+            throw e;
+        }
     }
 
     String[] resolveExecCreds(String schema) {
         if (schemaViaAlter) {
             out.println("replay login-mode=alter-session user=" + lookupUser);
+            out.dbg("creds via alter-session login=" + lookupUser
+                    + " target_schema=" + (schema == null ? "" : schema));
             return new String[] {lookupUser, lookupPass};
         }
         if (schema != null && !schema.isEmpty() && !"NULL".equalsIgnoreCase(schema)) {
@@ -581,12 +711,15 @@ public class ReplayEngine {
             if (maps.containsKey(key)) {
                 String[] c = maps.get(key);
                 out.println("replay map-hit schema=" + key + " user=" + c[0]);
+                out.dbg("creds map-hit schema=" + key + " user=" + c[0]);
                 return c;
             }
             out.println("replay warn no [map." + key + "] in ini; try schema user + default password");
+            out.dbg("creds fallback schema-as-user=" + schema);
             return new String[] {schema, lookupPass};
         }
         out.println("replay warn empty parsing_schema; fallback lookup user");
+        out.dbg("creds fallback lookup_user=" + lookupUser);
         return new String[] {lookupUser, lookupPass};
     }
 
@@ -598,6 +731,8 @@ public class ReplayEngine {
         out.println("replay schema=" + (schema == null ? "" : schema));
         String kind = classifySql(sql);
         out.println("replay sql-kind=" + kind);
+        out.dbg("exec mode=" + mode + " force=" + force + " loginUser="
+                + (loginUser == null ? "" : loginUser) + " has_connection=" + (c != null));
         int empty = 0;
         for (String[] b : binds) {
             if (b[2] == null || b[2].isEmpty()) {
@@ -610,16 +745,30 @@ public class ReplayEngine {
         if (!force && !"query".equals(kind)) {
             out.println("replay blocked kind=" + kind + " (query-only; pass --force to allow)");
             if ("dry".equalsIgnoreCase(mode)) {
+                if (schema != null && !schema.isEmpty() && !"NULL".equalsIgnoreCase(schema)) {
+                    out.println("replay schema-set=" + schema + " (planned alter-session)");
+                    out.dbg("planned: ALTER SESSION SET CURRENT_SCHEMA = \"" + schema + "\"");
+                }
                 out.println("replay dry-run-ok");
+                noteOkDetail("kind=" + kind + " dry blocked");
                 recordResult(schema, kind, 0, System.currentTimeMillis() - t0, "dry", "blocked_dry");
                 return true;
             }
             out.println("replay fail blocked non-query without --force");
+            noteFail("blocked kind=" + kind + " (need --force)");
             recordResult(schema, kind, 1, System.currentTimeMillis() - t0, "", "blocked");
             return false;
         }
         if ("dry".equalsIgnoreCase(mode)) {
+            if (schema != null && !schema.isEmpty() && !"NULL".equalsIgnoreCase(schema)
+                    && (loginUser == null || !loginUser.equalsIgnoreCase(schema))) {
+                out.println("replay schema-set=" + schema + " (planned alter-session)");
+                out.dbg("planned: ALTER SESSION SET CURRENT_SCHEMA = \"" + schema + "\"");
+            } else if (schema != null && loginUser != null && loginUser.equalsIgnoreCase(schema)) {
+                out.dbg("schema-skip planned same_as_login=" + schema);
+            }
             out.println("replay dry-run-ok");
+            noteOkDetail("kind=" + kind + " dry");
             recordResult(schema, kind, 0, System.currentTimeMillis() - t0, "dry", "");
             return true;
         }
@@ -633,20 +782,33 @@ public class ReplayEngine {
             }
             if (login != null && login.equalsIgnoreCase(schema)) {
                 out.println("replay schema-skip same_as_login=" + schema);
+                out.dbg("skip ALTER SESSION; login already " + login);
             } else {
+                String alterSql = "ALTER SESSION SET CURRENT_SCHEMA = \""
+                        + schema.replace("\"", "\"\"") + "\"";
+                out.step("alter_session", schema);
+                out.dbg("jdbc sql [alter_session]: " + alterSql);
+                long a0 = System.currentTimeMillis();
                 try (Statement st = c.createStatement()) {
                     applyQueryTimeout(st);
-                    String q = schema.replace("\"", "\"\"");
-                    st.execute("ALTER SESSION SET CURRENT_SCHEMA = \"" + q + "\"");
+                    st.execute(alterSql);
                     out.println("replay schema-set=" + schema);
+                    out.dbg("alter_session ok ms=" + (System.currentTimeMillis() - a0));
                 } catch (Exception e) {
                     out.println("replay warn set_schema " + e.getMessage());
                     out.println("replay fail set_schema failed for " + schema);
+                    out.dbg("alter_session fail ms=" + (System.currentTimeMillis() - a0)
+                            + " err=" + e.getMessage());
+                    noteFail("set_schema failed: " + e.getMessage());
                     recordResult(schema, kind, 1, System.currentTimeMillis() - t0, "", "set_schema");
                     return false;
                 }
             }
         }
+        out.step("jdbc_prepare_execute", kind);
+        out.dbg("jdbc prepare sql_chars=" + (sql == null ? 0 : sql.length())
+                + " binds=" + binds.size() + " query_timeout_sec=" + queryTimeoutSec);
+        long e0 = System.currentTimeMillis();
         try (PreparedStatement ps = c.prepareStatement(sql)) {
             applyQueryTimeout(ps);
             for (String[] b : binds) {
@@ -657,10 +819,16 @@ public class ReplayEngine {
                     out.println("replay warn skip bad bind position: " + b[0]);
                     continue;
                 }
+                out.dbg("jdbc bind set pos=" + pos + " type=" + b[1]
+                        + " value_chars=" + (b[2] == null ? 0 : b[2].length()));
                 bindOne(ps, pos, b[1], b[2]);
             }
             boolean hasRs = ps.execute();
+            out.dbg("jdbc execute hasResultSet=" + hasRs
+                    + " ms=" + (System.currentTimeMillis() - e0));
             String rowsOrUc;
+            String metric;
+            long elapsed = System.currentTimeMillis() - t0;
             if (hasRs) {
                 try (ResultSet rs = ps.getResultSet()) {
                     int cols = rs.getMetaData().getColumnCount();
@@ -678,16 +846,26 @@ public class ReplayEngine {
                     }
                     out.println("replay rows-shown=" + rows);
                     rowsOrUc = String.valueOf(rows);
+                    metric = "rows=" + rows;
                 }
             } else {
                 int uc = ps.getUpdateCount();
                 out.println("replay update-count=" + uc);
                 rowsOrUc = String.valueOf(uc);
+                metric = "update-count=" + uc;
             }
             out.println("replay exec-ok");
-            recordResult(schema, kind, 0, System.currentTimeMillis() - t0, rowsOrUc, "");
+            out.dbg("exec_ok kind=" + kind + " result=" + rowsOrUc
+                    + " total_ms=" + elapsed);
+            noteOkDetail("kind=" + kind + " " + metric + " ms=" + elapsed);
+            recordResult(schema, kind, 0, elapsed, rowsOrUc, "");
             return true;
         } catch (Exception e) {
+            String em = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            out.println("replay fail " + em);
+            out.dbg("jdbc_execute fail ms=" + (System.currentTimeMillis() - e0)
+                    + " err=" + em);
+            noteFail(em);
             recordResult(schema, kind, 1, System.currentTimeMillis() - t0, "",
                     e.getClass().getSimpleName());
             throw e;
@@ -721,144 +899,16 @@ public class ReplayEngine {
     }
 
     private static void bindOne(PreparedStatement ps, int idx, String dt, String val) throws SQLException {
-        String u = dt == null ? "" : dt.toUpperCase(Locale.ROOT);
-        if (val == null || val.isEmpty() || val.equals("\\N")) {
-            ps.setNull(idx, nullSqlType(dt));
-            return;
-        }
-        if (u.contains("NUMBER") || u.contains("DECIMAL") || u.contains("INT")
-                || u.contains("FLOAT") || u.contains("DOUBLE") || u.contains("BINARY_")) {
-            try {
-                ps.setBigDecimal(idx, new BigDecimal(val.trim()));
-                return;
-            } catch (Exception e) {
-                ps.setString(idx, val);
-                return;
-            }
-        }
-        if (u.contains("DATE") || u.contains("TIMESTAMP") || u.contains("TIME")) {
-            String t = val.trim();
-            String[] patterns = new String[] {
-                "yyyy-MM-dd'T'HH:mm:ss.SSS",
-                "yyyy-MM-dd'T'HH:mm:ss",
-                "yyyy-MM-dd HH:mm:ss.SSS",
-                "yyyy-MM-dd HH:mm:ss",
-                "yyyy-MM-dd HH:mm",
-                "yyyy-MM-dd",
-                "yyyy/MM/dd HH:mm:ss",
-                "yyyy/MM/dd",
-                "dd-MMM-yy",
-                "dd-MMM-yyyy"
-            };
-            for (String pattern : patterns) {
-                try {
-                    java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat(pattern, Locale.US);
-                    sdf.setLenient(false);
-                    java.util.Date d = sdf.parse(t);
-                    if (u.contains("DATE") && !u.contains("TIMESTAMP") && "yyyy-MM-dd".equals(pattern)) {
-                        ps.setDate(idx, new java.sql.Date(d.getTime()));
-                    } else {
-                        ps.setTimestamp(idx, new Timestamp(d.getTime()));
-                    }
-                    return;
-                } catch (Exception ignored) {
-                }
-            }
-            throw new SQLException("unparsed date/timestamp bind value: " + val);
-        }
-        ps.setString(idx, val);
-    }
-
-    private static int nullSqlType(String dt) {
-        String u = dt == null ? "" : dt.toUpperCase(Locale.ROOT);
-        if (u.contains("NUMBER") || u.contains("DECIMAL") || u.contains("INT")
-                || u.contains("FLOAT") || u.contains("DOUBLE") || u.contains("BINARY_")) {
-            return Types.NUMERIC;
-        }
-        if (u.contains("TIMESTAMP") || u.contains("TIME")) {
-            return Types.TIMESTAMP;
-        }
-        if (u.contains("DATE")) {
-            return Types.DATE;
-        }
-        return Types.VARCHAR;
+        SqlExecutor.bindOne(ps, idx, dt, val);
     }
 
     static String classifySql(String sql) {
-        String s = stripSqlLead(sql);
-        if (s.isEmpty()) {
-            return "empty";
-        }
-        String u = s.toUpperCase(Locale.ROOT);
-        if (u.startsWith("WITH")) {
-            Matcher m = Pattern.compile("\\b(INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE)\\b").matcher(u);
-            if (m.find()) {
-                String k = m.group(1);
-                if ("CREATE".equals(k) || "ALTER".equals(k) || "DROP".equals(k) || "TRUNCATE".equals(k)) {
-                    return "ddl";
-                }
-                return "dml";
-            }
-            return "query";
-        }
-        if (u.startsWith("SELECT") || u.startsWith("EXPLAIN")) {
-            return "query";
-        }
-        if (u.startsWith("INSERT") || u.startsWith("UPDATE") || u.startsWith("DELETE") || u.startsWith("MERGE")) {
-            return "dml";
-        }
-        if (u.startsWith("CREATE") || u.startsWith("ALTER") || u.startsWith("DROP") || u.startsWith("TRUNCATE")
-                || u.startsWith("GRANT") || u.startsWith("REVOKE") || u.startsWith("COMMENT")
-                || u.startsWith("ANALYZE") || u.startsWith("FLASHBACK") || u.startsWith("PURGE")
-                || u.startsWith("RENAME")) {
-            return "ddl";
-        }
-        if (u.startsWith("BEGIN") || u.startsWith("DECLARE") || u.startsWith("CALL") || u.startsWith("EXEC")) {
-            return "plsql";
-        }
-        return "other";
+        return SqlExecutor.classifySql(sql);
     }
 
     /** 引号感知剥离行注释; 供 classifySql 使用 (不影响实际执行文本) */
     static String stripSqlLead(String sql) {
-        if (sql == null) {
-            return "";
-        }
-        String s = sql.replaceAll("/\\*[\\s\\S]*?\\*/", " ");
-        StringBuilder sb = new StringBuilder();
-        for (String ln : s.split("\n", -1)) {
-            sb.append(stripLineComment(ln)).append('\n');
-        }
-        s = sb.toString().trim();
-        while (s.startsWith("(")) {
-            s = s.substring(1).trim();
-        }
-        return s;
-    }
-
-    private static String stripLineComment(String ln) {
-        boolean inStr = false;
-        for (int i = 0; i < ln.length(); i++) {
-            char c = ln.charAt(i);
-            if (inStr) {
-                if (c == '\'') {
-                    if (i + 1 < ln.length() && ln.charAt(i + 1) == '\'') {
-                        i++;
-                    } else {
-                        inStr = false;
-                    }
-                }
-                continue;
-            }
-            if (c == '\'') {
-                inStr = true;
-                continue;
-            }
-            if (c == '-' && i + 1 < ln.length() && ln.charAt(i + 1) == '-') {
-                return ln.substring(0, i);
-            }
-        }
-        return ln;
+        return SqlExecutor.stripSqlLead(sql);
     }
 
     private static List<String[]> readBinds(String path) throws IOException {

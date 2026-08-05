@@ -1,4 +1,4 @@
-.PHONY: all clean build-all build-linux build-windows build-darwin help
+.PHONY: all clean build-all build-linux build-windows build-darwin help sql-collect
 
 # Project information
 BINARY_NAME=ytop
@@ -17,7 +17,7 @@ LDFLAGS=-ldflags "\
 # Build flags
 BUILDFLAGS=-trimpath
 
-# Default target
+# Default target — prefer ./build.sh (includes sql_collect.jar + all platforms)
 all: clean build-all
 
 # Help target
@@ -28,9 +28,16 @@ help:
 	@echo "  make build-linux  - Build for Linux (amd64, arm64)"
 	@echo "  make build-windows- Build for Windows (amd64, arm64)"
 	@echo "  make build-darwin - Build for macOS (amd64, arm64)"
+	@echo "  make sql-collect  - Rebuild sql_collect.jar only"
 	@echo "  make clean        - Remove build directory"
 	@echo ""
+	@echo "Preferred one-shot: ./build.sh   (Go binaries + sql_collect.jar)"
 	@echo "Output directory: $(BUILD_DIR)/"
+
+# sql_collect companion jar (also invoked by ./build.sh before go build)
+sql-collect:
+	@bash tool/sql-collect/build.sh
+
 
 # Update version.go file
 update-version:

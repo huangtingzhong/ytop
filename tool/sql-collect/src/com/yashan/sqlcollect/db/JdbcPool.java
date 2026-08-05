@@ -8,7 +8,6 @@ import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.HashSet;
@@ -219,6 +218,11 @@ public final class JdbcPool implements AutoCloseable {
         all.remove(raw);
     }
 
+    /**
+     * 归还前复位事务状态. 不改 CURRENT_SCHEMA:
+     * collect 全程单用户, 不应切 schema; 以 SYS 登录时 ALTER CURRENT_SCHEMA=SYS 会触发 YAS-02012.
+     * replay 的 schema-via-alter 由执行路径按条 SQL 自行 SET.
+     */
     private void resetForReuse(Connection c, String loginUser) {
         try {
             c.clearWarnings();
@@ -233,18 +237,6 @@ public final class JdbcPool implements AutoCloseable {
                 c.setAutoCommit(true);
             }
         } catch (SQLException ignored) {
-        }
-        if (loginUser != null && !loginUser.isEmpty()) {
-            try {
-                Statement st = c.createStatement();
-                try {
-                    String q = loginUser.replace("\"", "\"\"");
-                    st.execute("ALTER SESSION SET CURRENT_SCHEMA = \"" + q + "\"");
-                } finally {
-                    st.close();
-                }
-            } catch (SQLException ignored) {
-            }
         }
     }
 

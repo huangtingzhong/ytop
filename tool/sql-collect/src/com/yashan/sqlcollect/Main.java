@@ -3,11 +3,16 @@ package com.yashan.sqlcollect;
 import com.yashan.sqlcollect.cli.Args;
 import com.yashan.sqlcollect.collect.CollectCommand;
 import com.yashan.sqlcollect.replay.ReplayCommand;
+import com.yashan.sqlcollect.sqlmap.SqlMapCommand;
 
-/** 入口: collect | replay | check | --version | -h */
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/** 入口: collect | replay | check | sqlmap | top | --version | -h */
 public class Main {
 
     public static void main(String[] argv) {
+        quietYashanJdbcJul();
         if (!Version.ensureRuntimeSupported()) {
             System.exit(1);
         }
@@ -19,6 +24,14 @@ public class Main {
             System.exit(0);
         }
         if (args.help) {
+            if ("sqlmap".equals(args.command)) {
+                SqlMapCommand.printHelp();
+                System.exit(0);
+            }
+            if ("top".equals(args.command)) {
+                com.yashan.sqlcollect.collect.TopCommand.printHelp();
+                System.exit(0);
+            }
             printHelp();
             System.exit(0);
         }
@@ -27,6 +40,10 @@ public class Main {
             rc = new ReplayCommand().run(args);
         } else if ("check".equals(args.command)) {
             rc = new CheckCommand().run(args);
+        } else if ("sqlmap".equals(args.command)) {
+            rc = new SqlMapCommand().run(args);
+        } else if ("top".equals(args.command)) {
+            rc = new com.yashan.sqlcollect.collect.TopCommand().run(args);
         } else {
             rc = new CollectCommand().run(args);
         }
@@ -34,58 +51,124 @@ public class Main {
     }
 
     private static void printHelp() {
-        System.out.println("sql-collect " + Version.VERSION + " - JDBC SQL collect + replay");
+        System.out.println("sql-collect " + Version.VERSION + " - JDBC SQL collect + replay + sqlmap");
         System.out.println("Requires Java " + Version.MIN_JAVA_MAJOR
                 + "+ (bytecode target 8; tested on 8/11/17/21).");
         System.out.println();
         System.out.println("Usage:");
         System.out.println("  sql-collect [--version|-V] [--help|-h]");
-        System.out.println("  sql-collect check [options]     health check before long collect/replay");
+        System.out.println("  sql-collect check   [options]");
         System.out.println("  sql-collect collect [options]");
-        System.out.println("  sql-collect replay [options]");
+        System.out.println("  sql-collect replay  [options]");
+        System.out.println("  sql-collect top     [options]   rank reports/*.txt by db_time");
+        System.out.println("  sql-collect sqlmap  <subcommand> [options]");
         System.out.println();
-        System.out.println("Short options: common=lowercase, uncommon=UPPERCASE; see map below.");
+        System.out.println("Commands:");
+        Args.helpOpt("check", "JDBC health check before long collect/replay");
+        Args.helpOpt("collect", "Poll gv$/v$sql, backup HTZ_GV_*, export reports/packages");
+        Args.helpOpt("replay", "Replay SQL from file / HTZ package / gv$");
+        Args.helpOpt("top", "Rank SQL from reports/*.txt (default sort: db_time)");
+        Args.helpOpt("sqlmap", "SQLMAP toolkit (see: sql-collect sqlmap -h)");
+        System.out.println();
+        System.out.println("Global options:");
+        Args.helpOpt("-h, --help", "Show this help and exit");
+        Args.helpOpt("-V, --version", "Print version and exit");
         System.out.println();
         System.out.println("Check options:");
-        System.out.println("  --jdbc-config|-j PATH  JDBC INI (default ./jdbc_replay.ini)");
-        System.out.println("  --log-dir|-l DIR       log directory (default ./logs)");
-        System.out.println("  --debug|-d BOOL        write DEBUG/STEP to debug log (default true)");
+        Args.helpOpt("-j, --jdbc-config <file>", "JDBC ini path (default: ./jdbc_replay.ini)");
+        Args.helpOpt("-l, --log-dir <dir>", "Log directory (default: ./logs)");
+        Args.helpOpt("-d, --debug [bool]", "Debug logging (default: on; -d false to disable)");
         System.out.println();
         System.out.println("Collect options:");
-        System.out.println("  --outdir|-o DIR        output directory (default ./sql_collect)");
-        System.out.println("  --log-dir|-l DIR       log directory (default ./logs)");
-        System.out.println("  --jdbc-config|-j PATH  JDBC INI (default ./jdbc_replay.ini)");
-        System.out.println("  --interval|-i SEC      poll interval seconds");
-        System.out.println("  --count|-c N           number of rounds");
-        System.out.println("  --skip-backup          skip HTZ_GV_* backup");
-        System.out.println("  --backup-only          backup only, no reports");
-        System.out.println("  --skip-replay-export   skip replay package export");
-        System.out.println("  --max-new|-m N         cap new sql_id per round");
-        System.out.println("  --sql-id|-s ID[,ID...] force export/report these sql_id(s) only");
-        System.out.println("  --report-timeout|-T SEC  report gather timeout (default 600; 0=unlimited)");
-        System.out.println("  --schema-via-alter|-A  ALTER SESSION for current_schema on connect");
-        System.out.println("  --current-schema|-C NAME  optional schema for collect session");
-        System.out.println("  --debug|-d BOOL        write DEBUG/STEP to debug log (default true)");
+        Args.helpOpt("-o, --outdir <dir>", "Base output dir (default: ./sql_collect);");
+        Args.helpOpt("", "runs under DIR/yyyyMMddHHmmss");
+        Args.helpOpt("-n, --new-run", "Create a new timestamp run dir (default: reuse latest)");
+        Args.helpOpt("-l, --log-dir <dir>", "Log directory (default: ./logs)");
+        Args.helpOpt("-j, --jdbc-config <file>", "JDBC ini path (default: ./jdbc_replay.ini)");
+        Args.helpOpt("-I, --init-config", "Write jdbc_replay.ini template");
+        Args.helpOpt("-w, --overwrite", "With -I/--init-config, replace existing file");
+        Args.helpOpt("-i, --interval <sec>", "Poll interval seconds");
+        Args.helpOpt("-c, --count <n>", "Number of collect rounds");
+        Args.helpOpt("-K, --skip-backup", "Skip HTZ_GV_* backup");
+        Args.helpOpt("-B, --backup-only", "Backup only; no reports / replay export");
+        Args.helpOpt("-X, --skip-replay-export", "Skip replay package export");
+        Args.helpOpt("-m, --max-new <n>", "Cap new sql_id per round");
+        Args.helpOpt("-s, --sql-id <id[,id...]>", "Collect ONLY these sql_id(s) (manual one-shot;");
+        Args.helpOpt("", "skips candidate scan; comma-separated OK)");
+        Args.helpOpt("-T, --report-timeout <sec>", "Report gather timeout (default: 600; 0=unlimited)");
+        Args.helpOpt("-E, --explain-plan", "Also append EXPLAIN PLAN (default off;");
+        Args.helpOpt("", "SELECT/WITH CTE only via v$sql.COMMAND_TYPE; no exec)");
+        Args.helpOpt("-A, --schema-via-alter", "ALTER SESSION for current_schema on connect");
+        Args.helpOpt("-C, --current-schema <name>", "Optional schema for collect session");
+        Args.helpOpt("-d, --debug [bool]", "Debug logging (default: on)");
+        Args.helpOpt("--no-debug", "Alias for -d false (long-only)");
         System.out.println();
         System.out.println("Replay options:");
-        System.out.println("  --jdbc-config|-j PATH  JDBC INI (default ./jdbc_replay.ini)");
-        System.out.println("  --init-config          write jdbc_replay.ini template");
-        System.out.println("  --overwrite            with --init-config, replace existing file");
-        System.out.println("  --source|-S file|htz|gv  replay source (default file)");
-        System.out.println("  --sql-id|-s ID[,ID...] target sql_id(s)");
-        System.out.println("  --outdir|-o DIR        replay package root / results dir (default ./sql_collect)");
-        System.out.println("  --dry-run              validate only (DEFAULT; no execute)");
-        System.out.println("  --exec|-e              LIVE execute (required for real replay)");
-        System.out.println("  --force|-f             allow non-query SQL (with --exec)");
-        System.out.println("  --parallel|-p N        parallel targets (default 1)");
-        System.out.println("  --sessions|-N N        concurrent sessions per SQL (default 1)");
-        System.out.println("  --timeout|-t SEC       overall replay timeout (default 600; 0=unlimited; exit 124)");
-        System.out.println("  --results-csv|-R PATH  replay_results.csv path (default OUTDIR/replay_results.csv)");
-        System.out.println("  --schema-via-alter|-A  login as jdbc user + ALTER SESSION");
-        System.out.println("  --on-sha-mismatch|-M MODE  fail=block (DEFAULT); warn=WARN then continue");
-        System.out.println("  --allow-sha-mismatch   alias for --on-sha-mismatch warn");
-        System.out.println("  --debug|-d BOOL        write DEBUG/STEP to debug log (default true)");
-        System.out.println("  --no-debug             alias for --debug false");
-        System.out.println("  --log-dir|-l DIR       log directory (default ./logs)");
+        Args.helpOpt("-j, --jdbc-config <file>", "JDBC ini path (default: ./jdbc_replay.ini)");
+        Args.helpOpt("-I, --init-config", "Write jdbc_replay.ini template");
+        Args.helpOpt("-w, --overwrite", "With -I/--init-config, replace existing file");
+        Args.helpOpt("-S, --source <mode>", "Replay source: file | htz | gv (default: file)");
+        Args.helpOpt("-s, --sql-id <id[,id...]>", "Target sql_id(s)");
+        Args.helpOpt("-o, --outdir <dir>", "Base dir (default: ./sql_collect); latest run or -n");
+        Args.helpOpt("-n, --new-run", "Create a new timestamp run dir");
+        Args.helpOpt("-D, --dry-run", "Validate only (DEFAULT; no execute)");
+        Args.helpOpt("-e, --exec", "LIVE execute (required for real replay)");
+        Args.helpOpt("-f, --force", "Allow non-query SQL (with --exec)");
+        Args.helpOpt("-a, --replay-all", "Backup replay_results.csv then replay all");
+        Args.helpOpt("", "(default: incremental skip already-ok)");
+        Args.helpOpt("-p, --parallel <n>", "Parallel targets (default: 1)");
+        Args.helpOpt("-N, --sessions <n>", "Concurrent sessions per SQL (default: 1)");
+        Args.helpOpt("-t, --timeout <sec>", "Overall replay timeout (default: 600; 0=unlimited;");
+        Args.helpOpt("", "exit 124 on timeout)");
+        Args.helpOpt("-R, --results-csv <path>", "replay_results.csv path (default: RUN_DIR/...)");
+        Args.helpOpt("-A, --schema-via-alter", "Login as jdbc user + ALTER SESSION");
+        Args.helpOpt("-M, --on-sha-mismatch <mode>", "fail=block (DEFAULT); warn=WARN then continue");
+        Args.helpOpt("--allow-sha-mismatch", "Alias for -M warn (long-only)");
+        Args.helpOpt("-d, --debug [bool]", "Debug logging (default: on)");
+        Args.helpOpt("--no-debug", "Alias for -d false (long-only)");
+        Args.helpOpt("-l, --log-dir <dir>", "Log directory (default: ./logs)");
+        System.out.println();
+        System.out.println("Notes:");
+        System.out.println("  - Short options: common=lowercase, uncommon=UPPERCASE.");
+        System.out.println("  - Long-only aliases: --no-debug, --allow-sha-mismatch.");
+        System.out.println("  - sqlmap has its own short-option map (sql-collect sqlmap -h).");
+        System.out.println("  - top is offline (scans reports/*.txt; no JDBC). See: sql-collect top -h");
+        System.out.println("  - Scope note: collect/replay -n=new-run; sqlmap -n=map-name.");
+        System.out.println();
+        System.out.println("Top options (see also: sql-collect top -h):");
+        Args.helpOpt("-o, --outdir <dir>", "Collect base or run dir (default: ./sql_collect)");
+        Args.helpOpt("--run <yyyyMMddHHmmss>", "Run subdirectory under -o");
+        Args.helpOpt("-L, --limit <n>", "Show top N (default: 50; 0=all)");
+        Args.helpOpt("--sort <col[:asc|desc]>", "Default db_time:desc");
+        Args.helpOpt("--csv <file>", "Export shown rows to CSV");
+        System.out.println();
+        System.out.println("Examples:");
+        System.out.println("  sql-collect check -j jdbc_replay.ini");
+        System.out.println("  sql-collect collect -j jdbc_replay.ini -o ./sql_collect -c 1 -n");
+        System.out.println("  sql-collect collect -s <sql_id> -j jdbc_replay.ini -o ./sql_collect -n");
+        System.out.println("  sql-collect collect -s <sql_id> -K -j jdbc_replay.ini -o ./sql_collect -n");
+        System.out.println("  sql-collect collect -s <sql_id> -E -K -n -j jdbc_replay.ini -o ./sql_collect");
+        System.out.println("  sql-collect collect -I -w -j jdbc_replay.ini");
+        System.out.println("  sql-collect collect -B -j jdbc_replay.ini -o ./sql_collect");
+        System.out.println("  sql-collect top -o ./sql_collect -L 20");
+        System.out.println("  sql-collect top -o ./sql_collect --sort cpu --csv top.csv");
+        System.out.println("  sql-collect replay -S gv -s <sql_id> -e -j jdbc_replay.ini");
+        System.out.println("  sql-collect replay -S file -a -D -j jdbc_replay.ini");
+        System.out.println("  sql-collect sqlmap create -s <src> -t <tgt> -n m1 -j jdbc_replay.ini");
+        System.out.println("  sql-collect sqlmap -h");
+    }
+
+    /**
+     * 压制 YashanDB JDBC 驱动 JUL INFO 噪音 (如 maxStringLen), 避免刷 stderr/终端.
+     * WARNING 及以上仍可见.
+     */
+    static void quietYashanJdbcJul() {
+        try {
+            Logger.getLogger("com.yashandb").setLevel(Level.WARNING);
+            Logger.getLogger("com.yashandb.log").setLevel(Level.WARNING);
+            Logger.getLogger("com.yashandb.jdbc").setLevel(Level.WARNING);
+        } catch (Exception ignored) {
+            // JUL 不可用时忽略
+        }
     }
 }

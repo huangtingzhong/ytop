@@ -40,7 +40,7 @@ public class ReplayCommand {
             Path logDir = Paths.get(args.opt("log-dir", DEFAULT_LOG_DIR));
             boolean debug = args.resolveDebug();
             log = new DualLogger(logDir, "replay", debug);
-            log.logInfo("debug=" + debug);
+            log.logDbg("debug=" + debug);
             return runBody(args, log);
         } catch (IOException e) {
             System.err.println("[ERROR] log init failed: " + e.getMessage());
@@ -58,7 +58,7 @@ public class ReplayCommand {
             try {
                 String dest = JdbcConfig.writeTemplate(cfgPath, args.flag("overwrite"));
                 log.logInfo("wrote jdbc config template: " + dest);
-                log.logInfo("edit jdbc_jar / jdbc_url / user / password / [map.*] then re-run replay");
+                log.logInfo("edit jdbc_jar / jdbc_url / user / password / [map.*] then re-run collect or replay");
                 return 0;
             } catch (IOException e) {
                 log.logError(e.getMessage());
@@ -92,6 +92,22 @@ public class ReplayCommand {
             return 2;
         }
 
+        Path baseOut = Paths.get(args.opt("outdir", CollectCommand.DEFAULT_OUTDIR))
+                .toAbsolutePath().normalize();
+        final Path outdir;
+        try {
+            com.yashan.sqlcollect.util.RunDirResolver.Result rr =
+                    com.yashan.sqlcollect.util.RunDirResolver.resolve(baseOut, args.flag("new-run"));
+            outdir = rr.runDir;
+            Files.createDirectories(outdir);
+            log.logDbg("outdir_base=" + rr.baseOutdir);
+            log.logDbg("run_dir=" + outdir + " mode=" + rr.mode
+                    + (rr.created ? " (created)" : ""));
+        } catch (IOException e) {
+            log.logError("resolve run dir failed: " + e.getMessage());
+            return 2;
+        }
+
         // 默认 dry-run; 真执行须显式 --exec (breaking vs 旧版默认 EXECUTE)
         boolean wantExec = args.flag("exec");
         boolean wantDry = args.flag("dry-run");
@@ -102,6 +118,9 @@ public class ReplayCommand {
         boolean dry = !wantExec;
         String mode = dry ? "dry" : "exec";
         boolean force = args.flag("force");
+        // 默认增量: 跳过已成功 exec; --replay-all 备份 CSV 后全量重跑
+        boolean replayAll = args.flag("replay-all");
+        boolean skipDone = !replayAll;
         Integer parallelOpt = args.optInt("parallel", null);
         Integer sessionsOpt = args.optInt("sessions", null);
         int parallel = parallelOpt == null ? 1 : parallelOpt.intValue();
@@ -131,31 +150,37 @@ public class ReplayCommand {
         for (Map.Entry<String, String[]> e : cfg.maps.entrySet()) {
             maps.put(e.getKey(), e.getValue());
         }
-
-        log.logInfo("sql-collect v" + com.yashan.sqlcollect.Version.VERSION + " replay");
-        log.logInfo("jdbc_config=" + cfg.configPath);
-        log.logInfo("source=" + source);
-        log.logInfo("jdbc_url=" + cfg.jdbcUrl);
-        if (cfg.schemaViaAlter) {
-            log.logInfo("login_mode=alter-session (jdbc user=" + cfg.user + "; CURRENT_SCHEMA per sql)");
-        } else {
-            log.logInfo("login_mode=map (jdbc lookup=" + cfg.user + "; exec via [map.SCHEMA] or fallback)");
+        // 未配置任何 [map.*] 时默认 ALTER SESSION 切 schema (与「无 map 就用 alter」预期一致)
+        if (!cfg.schemaViaAlter && maps.isEmpty()) {
+            cfg.schemaViaAlter = true;
+            log.logDbg("login_mode auto=alter-session (no [map.*] in jdbc config)");
         }
-        log.logInfo("jdbc_jar=" + cfg.jdbcJar);
-        log.logInfo("user_maps=" + maps.size());
-        log.logInfo("force=" + force + " (non-query blocked unless true)");
-        log.logInfo("parallel=" + parallel + " (distinct SQL targets)");
-        log.logInfo("sessions=" + sessions + " (concurrent sessions per SQL)");
-        log.logInfo("replay_timeout_sec=" + timeoutSec
+
+        log.logInfo("sql-collect v" + com.yashan.sqlcollect.Version.VERSION + " replay"
+                + " source=" + source
+                + " mode=" + (dry ? "dry-run" : "exec")
+                + " run_dir=" + outdir
+                + " login=" + (cfg.schemaViaAlter ? "alter-session" : "map"));
+        log.logDbg("outdir_base=" + outdir.getParent());
+        log.logDbg("jdbc_config=" + cfg.configPath);
+        log.logDbg("jdbc_url=" + cfg.jdbcUrl);
+        if (cfg.schemaViaAlter) {
+            log.logDbg("login_mode=alter-session (jdbc user=" + cfg.user + "; CURRENT_SCHEMA per sql)");
+        } else {
+            log.logDbg("login_mode=map (jdbc lookup=" + cfg.user + "; exec via [map.SCHEMA] or fallback)");
+        }
+        log.logDbg("jdbc_jar=" + cfg.jdbcJar);
+        log.logDbg("user_maps=" + maps.size());
+        log.logDbg("force=" + force + " (non-query blocked unless true)");
+        log.logDbg("parallel=" + parallel + " (distinct SQL targets)");
+        log.logDbg("sessions=" + sessions + " (concurrent sessions per SQL)");
+        log.logDbg("replay_timeout_sec=" + timeoutSec
                 + (timeoutSec <= 0 ? " (unlimited)" : ""));
-        final Path outdir = Paths.get(args.opt("outdir", CollectCommand.DEFAULT_OUTDIR));
-        log.logInfo("outdir=" + outdir.toAbsolutePath());
         if (!sqlIds.isEmpty()) {
             log.logInfo("sql_id=" + join(sqlIds));
         }
-        log.logInfo(dry
-                ? "mode=dry-run (default; pass --exec for LIVE execute)"
-                : "mode=EXECUTE (--exec)");
+        log.logDbg("skip_done=" + skipDone + (replayAll ? " (disabled by --replay-all)" : " (default incremental)"));
+        log.logDbg("replay_all=" + replayAll);
 
         final boolean shaMismatchFail;
         try {
@@ -164,7 +189,7 @@ public class ReplayCommand {
             log.logError(e.getMessage());
             return 2;
         }
-        log.logInfo("on_sha_mismatch=" + (shaMismatchFail ? "fail" : "warn")
+        log.logDbg("on_sha_mismatch=" + (shaMismatchFail ? "fail" : "warn")
                 + (shaMismatchFail ? " (block replay on fingerprint mismatch)"
                 : " (WARN then continue replay)"));
 
@@ -176,10 +201,18 @@ public class ReplayCommand {
         }
 
         final JdbcPool pool = new JdbcPool(log, JdbcPool.DEFAULT_MAX_IDLE_PER_USER);
-        log.logInfo("jdbc_pool max_idle_per_user=" + JdbcPool.DEFAULT_MAX_IDLE_PER_USER);
+        log.logDbg("jdbc_pool max_idle_per_user=" + JdbcPool.DEFAULT_MAX_IDLE_PER_USER);
         final ReplayEngine.LineOut lineOut = new ReplayEngine.LineOut() {
             public void println(String line) {
                 log.logReplayLine(line);
+            }
+
+            public void step(String name, String detail) {
+                log.logStep(name, detail);
+            }
+
+            public void dbg(String msg) {
+                log.logDbg(msg);
             }
         };
         final ReplayEngine engine = new ReplayEngine(
@@ -188,10 +221,22 @@ public class ReplayCommand {
         engine.setShaMismatchFail(shaMismatchFail);
         Path resultsPath = Paths.get(args.opt("results-csv",
                 outdir.resolve("replay_results.csv").toString()));
+        final java.util.Set<String> doneKeys = new java.util.HashSet<String>();
         try {
             ReplayResultCsv csv = new ReplayResultCsv(resultsPath);
+            if (replayAll) {
+                Path bak = csv.backupAndReset();
+                if (bak != null) {
+                    log.logInfo("replay-all: backed up results_csv to " + bak);
+                } else {
+                    log.logInfo("replay-all: no prior results_csv to backup");
+                }
+            } else if (skipDone) {
+                doneKeys.addAll(csv.loadOkExecKeys());
+                log.logDbg("skip_done keys=" + doneKeys.size() + " (rc=0 live, exclude dry-run)");
+            }
             engine.setResultCsv(csv);
-            log.logInfo("results_csv=" + csv.path());
+            log.logDbg("results_csv=" + csv.path());
         } catch (IOException e) {
             log.logError("results csv init failed: " + e.getMessage());
             return 2;
@@ -255,48 +300,119 @@ public class ReplayCommand {
                     log.logError("no replay packages under " + outdir + "/" + com.yashan.sqlcollect.collect.PackageExporter.REPLAY_DIR);
                     return 1;
                 }
-                log.logInfo("packages=" + pkgs.size());
+                if (skipDone && !doneKeys.isEmpty()) {
+                    List<Path> filtered = new ArrayList<Path>();
+                    int skipped = 0;
+                    for (Path pkg : pkgs) {
+                        String k = packageDoneKey(pkg);
+                        if (k != null && doneKeys.contains(k)) {
+                            skipped++;
+                            log.logDbg("skip already-ok " + pkg.getFileName());
+                            continue;
+                        }
+                        filtered.add(pkg);
+                    }
+                    log.logInfo("packages=" + pkgs.size() + " skipped=" + skipped
+                            + " remain=" + filtered.size());
+                    pkgs = filtered;
+                    if (pkgs.isEmpty()) {
+                        log.logInfo("all packages already ok; nothing to replay");
+                        finished.set(true);
+                        return 0;
+                    }
+                } else {
+                    log.logInfo("packages=" + pkgs.size());
+                }
+                final String modeLabel = dry ? "dry-run-ok" : "exec-ok";
                 int[] r = mapParallel(parallel, pkgs, new Worker<Path>() {
                     public boolean run(Path pkg) throws Exception {
-                        log.logInfo("----- " + pkg + " -----");
-                        return replayPackage(engine, pkg, mode, force, sessions);
+                        return replayPackage(log, engine, pkg, mode, force, sessions, modeLabel);
                     }
                 }, timeoutSec);
                 okN = r[0];
                 failN = r[1];
             } else if ("gv".equals(source)) {
-                log.logInfo("targets=" + sqlIds.size());
-                int[] r = mapParallel(parallel, sqlIds, new Worker<String>() {
+                List<String> targets = filterSqlIdsByDone(sqlIds, doneKeys, skipDone, log);
+                if (targets.isEmpty()) {
+                    log.logInfo("all gv sql_id already ok; nothing to replay");
+                    finished.set(true);
+                    return 0;
+                }
+                log.logInfo("targets=" + targets.size());
+                final String modeLabelGv = dry ? "dry-run-ok" : "exec-ok";
+                int[] r = mapParallel(parallel, targets, new Worker<String>() {
                     public boolean run(String sid) throws Exception {
-                        log.logInfo("----- gv sql_id=" + sid + " -----");
-                        return replayWithSessions(engine, new Callable<ReplayEngine.ReplayResult>() {
-                            public ReplayEngine.ReplayResult call() throws Exception {
-                                return engine.replayGv(sid, mode, force);
-                            }
-                        }, sessions, timeoutSec);
+                        boolean ok;
+                        try {
+                            ok = replayWithSessions(engine, new Callable<ReplayEngine.ReplayResult>() {
+                                public ReplayEngine.ReplayResult call() throws Exception {
+                                    return engine.replayGv(sid, mode, force);
+                                }
+                            }, sessions, timeoutSec);
+                        } catch (Exception e) {
+                            String em = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                            engine.noteFail(em);
+                            log.logDbg("replayGv exception sql_id=" + sid + " err=" + em);
+                            ok = false;
+                        }
+                        if (ok) {
+                            String detail = engine.takeLastOkDetail();
+                            log.logInfo(modeLabelGv + " source=gv sql_id=" + sid
+                                    + (detail.isEmpty() ? "" : " " + detail));
+                        } else {
+                            String reason = engine.takeLastFailReason();
+                            log.logWarn("fail source=gv sql_id=" + sid
+                                    + (reason.isEmpty() ? "" : " reason=" + reason));
+                        }
+                        return ok;
                     }
                 }, timeoutSec);
                 okN = r[0];
                 failN = r[1];
             } else {
                 if (!sqlIds.isEmpty()) {
-                    log.logInfo("targets=" + sqlIds.size());
-                    int[] r = mapParallel(parallel, sqlIds, new Worker<String>() {
+                    List<String> targets = filterSqlIdsByDone(sqlIds, doneKeys, skipDone, log);
+                    if (targets.isEmpty()) {
+                        log.logInfo("all htz sql_id already ok; nothing to replay");
+                        finished.set(true);
+                        return 0;
+                    }
+                    log.logInfo("targets=" + targets.size());
+                    final String modeLabelHtz = dry ? "dry-run-ok" : "exec-ok";
+                    int[] r = mapParallel(parallel, targets, new Worker<String>() {
                         public boolean run(String sid) throws Exception {
-                            log.logInfo("----- htz sql_id=" + sid + " -----");
-                            return replayWithSessions(engine, new Callable<ReplayEngine.ReplayResult>() {
-                                public ReplayEngine.ReplayResult call() throws Exception {
-                                    return engine.replayHtzOne(sid, mode, force);
-                                }
-                            }, sessions, timeoutSec);
+                            boolean ok;
+                            try {
+                                ok = replayWithSessions(engine, new Callable<ReplayEngine.ReplayResult>() {
+                                    public ReplayEngine.ReplayResult call() throws Exception {
+                                        return engine.replayHtzOne(sid, mode, force);
+                                    }
+                                }, sessions, timeoutSec);
+                            } catch (Exception e) {
+                                String em = e.getMessage() == null
+                                        ? e.getClass().getSimpleName() : e.getMessage();
+                                engine.noteFail(em);
+                                log.logDbg("replayHtz exception sql_id=" + sid + " err=" + em);
+                                ok = false;
+                            }
+                            if (ok) {
+                                String detail = engine.takeLastOkDetail();
+                                log.logInfo(modeLabelHtz + " source=htz sql_id=" + sid
+                                        + (detail.isEmpty() ? "" : " " + detail));
+                            } else {
+                                String reason = engine.takeLastFailReason();
+                                log.logWarn("fail source=htz sql_id=" + sid
+                                        + (reason.isEmpty() ? "" : " reason=" + reason));
+                            }
+                            return ok;
                         }
                     }, timeoutSec);
                     okN = r[0];
                     failN = r[1];
                 } else {
-                    log.logInfo("----- htz all rows -----");
+                    log.logInfo("htz_all rows");
                     if (sessions > 1) {
-                        log.logInfo("htz_all ignores --sessions=" + sessions + "; forcing sessions=1");
+                        log.logDbg("htz_all ignores --sessions=" + sessions + "; forcing sessions=1");
                     }
                     ReplayEngine.ReplayResult r = engine.replayHtzAll(mode, force);
                     okN = r.ok;
@@ -336,7 +452,8 @@ public class ReplayCommand {
         return failN > 0 ? 1 : 0;
     }
 
-    private boolean replayPackage(ReplayEngine engine, Path pkg, String mode, boolean force, int sessions)
+    private boolean replayPackage(DualLogger log, ReplayEngine engine, Path pkg, String mode, boolean force,
+                                  int sessions, String okLabel)
             throws Exception {
         Path metaPath = pkg.resolve("meta.txt");
         Map<String, String> meta = readMeta(metaPath);
@@ -374,20 +491,54 @@ public class ReplayCommand {
         }
         final int childF = child;
         final int instF = instId;
-        return replayWithSessions(engine, new Callable<ReplayEngine.ReplayResult>() {
-            public ReplayEngine.ReplayResult call() throws Exception {
-                return engine.replayFile(
-                        schema == null ? "" : schema,
-                        sqlFile.toString(),
-                        bindsFile.toString(),
-                        mode,
-                        force,
-                        sqlId,
-                        childF,
-                        instF,
-                        expectedSha);
+        boolean ok;
+        try {
+            ok = replayWithSessions(engine, new Callable<ReplayEngine.ReplayResult>() {
+                public ReplayEngine.ReplayResult call() throws Exception {
+                    return engine.replayFile(
+                            schema == null ? "" : schema,
+                            sqlFile.toString(),
+                            bindsFile.toString(),
+                            mode,
+                            force,
+                            sqlId,
+                            childF,
+                            instF,
+                            expectedSha);
+                }
+            }, sessions, 0);
+        } catch (Exception e) {
+            String em = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            engine.noteFail(em);
+            log.logDbg("replayPackage exception sql_id=" + sqlId + " err=" + em);
+            ok = false;
+        }
+        if (ok) {
+            String detail = engine.takeLastOkDetail();
+            if (detail.isEmpty()) {
+                log.logInfo(okLabel + " sql_id=" + sqlId
+                        + " schema=" + (schema == null ? "" : schema)
+                        + " pkg=" + pkg.getFileName());
+            } else {
+                log.logInfo(okLabel + " sql_id=" + sqlId
+                        + " schema=" + (schema == null ? "" : schema)
+                        + " " + detail
+                        + " pkg=" + pkg.getFileName());
             }
-        }, sessions, 0);
+        } else {
+            String reason = engine.takeLastFailReason();
+            if (reason.isEmpty()) {
+                log.logWarn("fail sql_id=" + sqlId
+                        + " schema=" + (schema == null ? "" : schema)
+                        + " pkg=" + pkg.getFileName());
+            } else {
+                log.logWarn("fail sql_id=" + sqlId
+                        + " schema=" + (schema == null ? "" : schema)
+                        + " pkg=" + pkg.getFileName()
+                        + " reason=" + reason);
+            }
+        }
+        return ok;
     }
 
     private interface Worker<T> {
@@ -511,6 +662,81 @@ public class ReplayCommand {
             }
         }
         return meta;
+    }
+
+    /** 从包目录/meta 解析增量跳过键 */
+    static String packageDoneKey(Path pkg) {
+        try {
+            Map<String, String> meta = readMeta(pkg.resolve("meta.txt"));
+            String sid = meta.get("sql_id");
+            String name = pkg.getFileName().toString();
+            if (sid == null || sid.isEmpty()) {
+                int ix = name.indexOf("__c");
+                sid = ix > 0 ? name.substring(0, ix) : name;
+            }
+            Integer childObj = null;
+            Integer instObj = null;
+            if (meta.containsKey("child_number")) {
+                childObj = Integer.valueOf(parseMetaInt(meta.get("child_number"), 0));
+            }
+            if (meta.containsKey("inst_id")) {
+                instObj = Integer.valueOf(parseMetaInt(meta.get("inst_id"), 1));
+            }
+            if (childObj == null || instObj == null) {
+                int cAt = name.indexOf("__c");
+                int iAt = name.indexOf("__i");
+                if (cAt > 0 && iAt > cAt) {
+                    try {
+                        if (childObj == null) {
+                            childObj = Integer.valueOf(name.substring(cAt + 3, iAt));
+                        }
+                        if (instObj == null) {
+                            instObj = Integer.valueOf(name.substring(iAt + 3));
+                        }
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+            }
+            int child = childObj == null ? 0 : childObj.intValue();
+            int inst = instObj == null ? 1 : instObj.intValue();
+            return ReplayResultCsv.key(sid, child, inst);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private static int parseMetaInt(String s, int def) {
+        if (s == null || s.trim().isEmpty()) {
+            return def;
+        }
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
+    private static List<String> filterSqlIdsByDone(List<String> sqlIds,
+                                                   java.util.Set<String> doneKeys,
+                                                   boolean skipDone,
+                                                   DualLogger log) {
+        if (!skipDone || doneKeys == null || doneKeys.isEmpty()) {
+            return sqlIds;
+        }
+        List<String> out = new ArrayList<String>();
+        int skipped = 0;
+        for (String sid : sqlIds) {
+            if (ReplayResultCsv.hasOkExecForSqlId(doneKeys, sid)) {
+                skipped++;
+                log.logDbg("skip already-ok sql_id=" + sid);
+                continue;
+            }
+            out.add(sid);
+        }
+        if (skipped > 0) {
+            log.logInfo("sql_id skipped=" + skipped + " remain=" + out.size());
+        }
+        return out;
     }
 
     static List<String> parseSqlIdList(String raw) {

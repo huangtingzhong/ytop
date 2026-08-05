@@ -35,15 +35,20 @@ public class PackageExporter {
         this.owner = HtzTables.normalizeOwner(jdbcUser);
     }
 
-    public boolean export(JdbcSession session, String sqlId, Path outdir, String kind) throws SQLException {
+    /**
+     * 导出 replay 包并 upsert HTZ.
+     * @return 包目录路径; sql 不在 v$/gv$sql 时返回 null
+     */
+    public Path export(JdbcSession session, String sqlId, Path outdir, String kind) throws SQLException {
         log.logStep("replay_export", sqlId + " kind=" + kind + " owner=" + owner);
         Row row = loadLatestRow(session.getConnection(), sqlId);
         if (row == null) {
             log.logWarn("replay export: sql_id not in v$/gv$sql: " + sqlId);
-            return false;
+            return null;
         }
+        Path pkg;
         try {
-            writeFiles(outdir, row);
+            pkg = writeFiles(outdir, row);
         } catch (IOException e) {
             log.logError("write replay package failed for " + sqlId + ": " + e.getMessage());
             throw new SQLException("write replay package failed for " + sqlId, e);
@@ -53,10 +58,9 @@ public class PackageExporter {
         upsertHtz(session.getConnection(), row);
 
         String tag = "REFRESH".equalsIgnoreCase(kind) ? "refresh" : "new";
-        log.logInfo(String.format("%s export sql_id=%s child=%d inst_id=%d len=%d binds=%d -> %s",
+        log.logDbg(String.format("%s export sql_id=%s child=%d inst_id=%d len=%d binds=%d -> %s",
                 tag, sqlId, row.meta.childNumber, row.meta.instId, row.meta.sqlLen, row.binds.size(),
-                outdir.resolve(REPLAY_DIR).resolve(
-                        row.meta.sqlId + "__c" + row.meta.childNumber + "__i" + row.meta.instId)));
+                pkg));
         int empty = 0;
         for (BindValue b : row.binds) {
             if (b.value == null || b.value.isEmpty() || "\\N".equals(b.value)) {
@@ -66,7 +70,7 @@ public class PackageExporter {
         if (empty > 0) {
             log.logWarn(empty + " bind(s) have empty value_string; edit binds.txt before execute");
         }
-        return true;
+        return pkg;
     }
 
     private static class Row {
@@ -281,7 +285,7 @@ public class PackageExporter {
         log.logDbg("jdbc insert " + qn + " ok");
     }
 
-    private void writeFiles(Path outdir, Row row) throws IOException {
+    private Path writeFiles(Path outdir, Row row) throws IOException {
         Path pkg = outdir.resolve(REPLAY_DIR).resolve(
                 row.meta.sqlId + "__c" + row.meta.childNumber + "__i" + row.meta.instId);
         Files.createDirectories(pkg);
@@ -317,8 +321,9 @@ public class PackageExporter {
                     .append(PipeEscape.escape(b.value)).append("\n");
         }
         Files.write(pkg.resolve("binds.txt"), bt.toString().getBytes(StandardCharsets.UTF_8));
-        log.logInfo("sql_sha256=" + sha + " sql_id=" + row.meta.sqlId);
+        log.logDbg("sql_sha256=" + sha + " sql_id=" + row.meta.sqlId);
         log.logDbg("wrote package files " + pkg);
+        return pkg;
     }
 
     private static String nvl(String s) {

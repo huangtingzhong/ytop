@@ -104,7 +104,7 @@ public class DualLogger implements AutoCloseable {
         if (!debugEnabled) {
             return;
         }
-        write("DEBUG", msg, false, false);
+        writeDebugOnly("DEBUG", msg);
     }
 
     public void logStep(String step, String detail) {
@@ -117,7 +117,7 @@ public class DualLogger implements AutoCloseable {
         } else {
             body = "=== [STEP] " + step + ": " + detail + " ===";
         }
-        write("STEP", body, false, false);
+        writeDebugOnly("STEP", body);
     }
 
     /**
@@ -143,20 +143,24 @@ public class DualLogger implements AutoCloseable {
         }
     }
 
-    /** replay JDBC 输出镜像到 session/debug */
+    /**
+     * replay 过程明细: 写入 session + debug, 不刷终端 (终端由 ReplayCommand 一行摘要).
+     */
     public synchronized void logReplayLine(String line) {
+        if (line == null) {
+            return;
+        }
         try {
-            String ts = tsFmt.format(new Date());
-            String ln = ts + "  " + line;
+            String ln = formatLine("INFO", line);
             session.write(ln);
             session.newLine();
             session.flush();
-            debug.write(formatLine("INFO", line));
-            debug.newLine();
-            debug.flush();
-            out.println(line);
-        } catch (IOException e) {
-            out.println(line);
+            if (debugEnabled) {
+                debug.write(ln);
+                debug.newLine();
+                debug.flush();
+            }
+        } catch (IOException ignored) {
         }
     }
 
@@ -166,26 +170,45 @@ public class DualLogger implements AutoCloseable {
         return ts + "  " + padded + "  " + msg;
     }
 
+    /** DEBUG/STEP 仅写 debug 文件, 避免大段 SQL/bind 撑爆 session */
+    private synchronized void writeDebugOnly(String level, String msg) {
+        try {
+            String ln = formatLine(level, msg);
+            debug.write(ln);
+            debug.newLine();
+            debug.flush();
+        } catch (IOException ignored) {
+        }
+    }
+
+    /**
+     * 终端可见日志 (INFO/WARN/ERROR): 同时写 session + debug + stdout/stderr.
+     * DEBUG/STEP: 仅 debug 文件 (见 {@link #logDbg}/{@link #logStep}).
+     */
     private synchronized void write(String level, String msg, boolean mirrorStdout, boolean toStderr) {
         try {
             String ln = formatLine(level, msg);
             session.write(ln);
             session.newLine();
             session.flush();
-            debug.write(ln);
-            debug.newLine();
-            debug.flush();
+            // 终端行始终镜像进 debug, 便于单文件完整回放跟踪
+            if (debugEnabled) {
+                debug.write(ln);
+                debug.newLine();
+                debug.flush();
+            }
             if (mirrorStdout) {
-                String plain = tsFmt.format(new Date()) + "  " + msg;
+                // 与 session 文件一致: 时间戳 + 级别 + 正文
                 if (toStderr) {
-                    err.println(plain);
+                    err.println(ln);
                 } else {
-                    out.println(plain);
+                    out.println(ln);
                 }
             }
         } catch (IOException e) {
             if (mirrorStdout) {
-                (toStderr ? err : out).println(msg);
+                String fallback = formatLine(level, msg);
+                (toStderr ? err : out).println(fallback);
             }
         }
     }

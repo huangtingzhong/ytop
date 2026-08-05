@@ -4,19 +4,17 @@ import com.yashan.sqlcollect.db.JdbcSession;
 import com.yashan.sqlcollect.log.DualLogger;
 
 import java.io.IOException;
-import java.sql.CallableStatement;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 通过 JDBC 执行嵌入的 sql.sql ({@link SqlReportScript}),
- * 对齐 Python 版 embedded sql.sql 报告输出 (PROMPT + DBMS_OUTPUT + SELECT).
+ * JDBC 执行报告 SELECT 段 ({@link ReportSelectScript}: PLAN / sqlarea / AWR / objects).
+ * ORIGINAL/LITERAL 由 {@link JdbcReportBuilder} 纯 Java 写出.
  */
 public class SqlReportRunner {
 
@@ -26,100 +24,15 @@ public class SqlReportRunner {
         this.log = log;
     }
 
-    public static int embeddedChars() {
-        return SqlReportScript.CHAR_COUNT;
+    static String substituteSqlId(String template, String sqlId) {
+        String safe = sqlId == null ? "" : sqlId.replace("'", "''");
+        String s = template.replace("&&sqlid", safe);
+        s = s.replace("&sqlid", safe);
+        return s;
     }
 
-    public String run(JdbcSession session, String sqlId) throws SQLException, IOException {
-        return run(session, sqlId, ReportWriter.DEFAULT_REPORT_TIMEOUT_SEC);
-    }
-
-    /**
-     * @param timeoutSec 整体报告超时秒数; &lt;=0 表示不限制
-     */
-    public String run(JdbcSession session, String sqlId, int timeoutSec)
-            throws SQLException, IOException {
-        String template = loadTemplate();
-        if (template == null || template.isEmpty()) {
-            throw new IOException("embedded SqlReportScript missing or empty");
-        }
-        if (!template.contains("&&sqlid")) {
-            throw new IOException("embedded SqlReportScript missing &&sqlid");
-        }
-        String script = substituteSqlId(template, sqlId);
-        StringBuilder out = new StringBuilder();
-        Connection c = session.getConnection();
-        // 池化连接可能残留上一报告的 DBMS_OUTPUT; 启用前先排空
-        discardDbmsOutput(c);
-        enableDbmsOutput(c);
-        List<Segment> segs = parse(script);
-        long deadlineMs = timeoutSec <= 0
-                ? Long.MAX_VALUE
-                : System.currentTimeMillis() + (long) timeoutSec * 1000L;
-        if (log != null) {
-            log.logDbg("sql report segments=" + segs.size() + " sql_id=" + sqlId
-                    + " timeout_sec=" + (timeoutSec <= 0 ? "unlimited" : String.valueOf(timeoutSec))
-                    + " script_chars=" + template.length());
-        }
-        try {
-        for (Segment seg : segs) {
-            if (System.currentTimeMillis() > deadlineMs) {
-                out.append("[ERROR] report timeout after ").append(timeoutSec).append("s\n");
-                if (log != null) {
-                    log.logWarn("report timeout sql_id=" + sqlId + " after " + timeoutSec + "s");
-                }
-                break;
-            }
-            int stmtTimeout = remainingQueryTimeoutSec(deadlineMs, timeoutSec);
-            switch (seg.kind) {
-                case PROMPT:
-                    out.append(seg.text).append('\n');
-                    break;
-                case PLSQL:
-                    try {
-                        executePlsql(c, seg.text, stmtTimeout);
-                        drainDbmsOutput(c, out, stmtTimeout);
-                    } catch (SQLException e) {
-                        if (isTimeoutError(e)) {
-                            out.append("[ERROR] report timeout after ").append(timeoutSec).append("s\n");
-                            if (log != null) {
-                                log.logWarn("report timeout sql_id=" + sqlId + ": " + e.getMessage());
-                            }
-                            return out.toString();
-                        }
-                        out.append("[ERROR] PL/SQL: ").append(e.getMessage()).append('\n');
-                        if (log != null) {
-                            log.logWarn("report plsql failed: " + e.getMessage());
-                        }
-                    }
-                    break;
-                case SQL:
-                    try {
-                        executeQuery(c, seg.text, out, stmtTimeout);
-                    } catch (SQLException e) {
-                        if (isTimeoutError(e)) {
-                            out.append("[ERROR] report timeout after ").append(timeoutSec).append("s\n");
-                            if (log != null) {
-                                log.logWarn("report timeout sql_id=" + sqlId + ": " + e.getMessage());
-                            }
-                            return out.toString();
-                        }
-                        out.append("[ERROR] SQL: ").append(e.getMessage()).append('\n');
-                        if (log != null) {
-                            log.logDbg("report sql failed: " + e.getMessage());
-                        }
-                    }
-                    break;
-                case SKIP:
-                default:
-                    break;
-            }
-        }
-        return out.toString();
-        } finally {
-            // 超时/异常提前 return 也会走这里, 避免残留污染下一报告
-            discardDbmsOutput(c);
-        }
+    static String loadTemplate() {
+        return ReportSelectScript.content();
     }
 
     private static int remainingQueryTimeoutSec(long deadlineMs, int overallTimeoutSec) {
@@ -141,18 +54,6 @@ public class SqlReportRunner {
         }
         String lower = m.toLowerCase(java.util.Locale.ROOT);
         return lower.contains("timeout") || lower.contains("timed out") || lower.contains("cancel");
-    }
-
-    static String substituteSqlId(String template, String sqlId) {
-        String safe = sqlId == null ? "" : sqlId.replace("'", "''");
-        // 替换 &&sqlid / &sqlid (yasql DEFINE 风格)
-        String s = template.replace("&&sqlid", safe);
-        s = s.replace("&sqlid", safe);
-        return s;
-    }
-
-    static String loadTemplate() {
-        return SqlReportScript.content();
     }
 
     enum Kind { PROMPT, PLSQL, SQL, SKIP }
@@ -251,73 +152,17 @@ public class SqlReportRunner {
         return false;
     }
 
-    private static void enableDbmsOutput(Connection c) throws SQLException {
-        try (Statement st = c.createStatement()) {
-            st.execute("BEGIN DBMS_OUTPUT.ENABLE(NULL); END;");
-        }
-    }
-
-    /** 丢弃缓冲 (不写入报告); 失败忽略以免掩盖主流程错误 */
-    private static void discardDbmsOutput(Connection c) {
-        try {
-            drainDbmsOutput(c, null, 0);
-        } catch (SQLException ignored) {
-        }
-    }
-
-    private static void executePlsql(Connection c, String plsql, int queryTimeoutSec) throws SQLException {
-        try (Statement st = c.createStatement()) {
-            if (queryTimeoutSec > 0) {
-                st.setQueryTimeout(queryTimeoutSec);
-            }
-            st.execute(plsql);
-        }
-    }
-
-    private static void drainDbmsOutput(Connection c, StringBuilder out, int queryTimeoutSec)
-            throws SQLException {
-        try (CallableStatement cs = c.prepareCall(
-                "DECLARE "
-                        + "  l_line VARCHAR2(32767); "
-                        + "  l_done NUMBER; "
-                        + "BEGIN "
-                        + "  DBMS_OUTPUT.GET_LINE(l_line, l_done); "
-                        + "  ? := l_line; "
-                        + "  ? := l_done; "
-                        + "END;")) {
-            if (queryTimeoutSec > 0) {
-                cs.setQueryTimeout(queryTimeoutSec);
-            }
-            cs.registerOutParameter(1, Types.VARCHAR);
-            cs.registerOutParameter(2, Types.NUMERIC);
-            int guard = 0;
-            while (guard++ < 500000) {
-                cs.execute();
-                Object doneObj = cs.getObject(2);
-                int done = doneObj == null ? 1 : ((Number) doneObj).intValue();
-                if (done != 0) {
-                    break;
-                }
-                if (out != null) {
-                    String line = cs.getString(1);
-                    out.append(line == null ? "" : line).append('\n');
-                }
-            }
-        }
-    }
-
     /**
-     * 从 PLAN 起追加 PROMPT+SELECT (与 sql.sql 对齐); 跳过 PLSQL.
-     * AWR (P2): 执行 SELECT, 失败写 [ERROR] AWR 并继续后续段 (不中断整份报告).
-     * ORIGINAL/LITERAL 已由 {@link JdbcReportBuilder} 写出, 不再执行脚本前半段.
+     * 追加 PLAN 起的 PROMPT+SELECT ({@link ReportSelectScript}).
+     * AWR 失败写 [ERROR] AWR 并继续; 跳过 PLSQL.
      */
     public void appendFromPlan(JdbcSession session, String sqlId, StringBuilder out,
             long deadlineMs, int timeoutSec) throws SQLException, IOException {
         String template = loadTemplate();
         if (template == null || template.isEmpty()) {
-            out.append("[ERROR] embedded SqlReportScript missing; SELECT sections skipped\n");
+            out.append("[ERROR] ReportSelectScript missing; SELECT sections skipped\n");
             if (log != null) {
-                log.logWarn("SELECT sections skipped: SqlReportScript empty");
+                log.logWarn("SELECT sections skipped: ReportSelectScript empty");
             }
             return;
         }
@@ -333,7 +178,7 @@ public class SqlReportRunner {
             }
         }
         if (start < 0) {
-            out.append("[ERROR] PLAN section marker not found in SqlReportScript\n");
+            out.append("[ERROR] PLAN section marker not found in ReportSelectScript\n");
             return;
         }
         Connection c = session.getConnection();

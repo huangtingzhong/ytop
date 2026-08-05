@@ -7,12 +7,17 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * 简易 argv 解析 (collect/replay/check).
+ * 简易 argv 解析 (collect/replay/check/sqlmap).
  * 短选项: 常用小写 / 不常用大写; 映射为 kebab-case 长名后写入 options.
+ * sqlmap: subcommand 之后全部 token 进入 sqlmapArgv, 禁止全局 mapShortOption.
  */
 public class Args {
 
     public String command = "collect";
+    /** sqlmap 二级子命令 (create/list/...); 非 sqlmap 时为空 */
+    public String subcommand = "";
+    /** sqlmap subcommand 之后的原始 argv (本地 SqlMapArgs 解析) */
+    public final List<String> sqlmapArgv = new ArrayList<String>();
     public final Map<String, String> options = new HashMap<String, String>();
     public final List<String> positional = new ArrayList<String>();
     public boolean help;
@@ -26,9 +31,28 @@ public class Args {
         }
         int i = 0;
         if (!rest.isEmpty() && ("collect".equals(rest.get(0)) || "replay".equals(rest.get(0))
-                || "check".equals(rest.get(0)))) {
+                || "check".equals(rest.get(0)) || "sqlmap".equals(rest.get(0))
+                || "top".equals(rest.get(0)))) {
             a.command = rest.get(0);
             i = 1;
+        }
+        if ("sqlmap".equals(a.command)) {
+            // 允许 sqlmap --help (无 subcommand)
+            if (i < rest.size()) {
+                String tok = rest.get(i);
+                if ("--help".equals(tok) || "-h".equals(tok)) {
+                    a.help = true;
+                    i++;
+                } else if (!tok.startsWith("-")) {
+                    a.subcommand = tok;
+                    i++;
+                }
+            }
+            while (i < rest.size()) {
+                a.sqlmapArgv.add(rest.get(i));
+                i++;
+            }
+            return a;
         }
         while (i < rest.size()) {
             String tok = rest.get(i);
@@ -49,11 +73,16 @@ public class Args {
                     int eq = key.indexOf('=');
                     val = key.substring(eq + 1);
                     key = key.substring(0, eq);
-                } else if (i + 1 < rest.size() && isOptionValueToken(rest.get(i + 1))) {
+                } else if (longTakesValue(key) && i + 1 < rest.size()
+                        && isOptionValueToken(rest.get(i + 1))) {
                     val = rest.get(i + 1);
                     i++;
                 }
-                a.options.put(key.toLowerCase(Locale.ROOT), val);
+                String norm = key.toLowerCase(Locale.ROOT);
+                if ("sqlid".equals(norm)) {
+                    norm = "sql-id"; // 别名: --sqlid
+                }
+                a.options.put(norm, val);
                 i++;
                 continue;
             }
@@ -72,7 +101,12 @@ public class Args {
                 String mapped = mapShortOption(c);
                 String key = mapped != null ? mapped : String.valueOf(c);
                 String val = "true";
-                if (i + 1 < rest.size() && isOptionValueToken(rest.get(i + 1))) {
+                if (c == 'd' && i + 1 < rest.size() && isBoolToken(rest.get(i + 1))) {
+                    // -d false / -d true
+                    val = rest.get(i + 1);
+                    i++;
+                } else if (shortNeedsValue(c) && i + 1 < rest.size()
+                        && isOptionValueToken(rest.get(i + 1))) {
                     val = rest.get(i + 1);
                     i++;
                 }
@@ -130,9 +164,63 @@ public class Args {
                 return "current-schema";
             case 'M':
                 return "on-sha-mismatch";
+            case 'n':
+                return "new-run";
+            case 'I':
+                return "init-config";
+            case 'w':
+                return "overwrite";
+            case 'K':
+                return "skip-backup";
+            case 'B':
+                return "backup-only";
+            case 'X':
+                return "skip-replay-export";
+            case 'D':
+                return "dry-run";
+            case 'a':
+                return "replay-all";
+            case 'L':
+                return "limit";
+            case 'E':
+                return "explain-plan";
             default:
                 return null;
         }
+    }
+
+    /** 需要取值的短选项 (不含 -d: 可选 bool; 不含纯 flag). */
+    static boolean shortNeedsValue(char c) {
+        return c == 'o' || c == 'l' || c == 'j' || c == 's' || c == 'S' || c == 'i' || c == 'c'
+                || c == 't' || c == 'T' || c == 'p' || c == 'N' || c == 'm' || c == 'R' || c == 'C'
+                || c == 'M' || c == 'L';
+    }
+
+    /** 需要取值的长选项; flag 类不吞下一个位置参数. */
+    static boolean longTakesValue(String key) {
+        if (key == null) {
+            return false;
+        }
+        String k = key.toLowerCase(Locale.ROOT);
+        if ("debug".equals(k)) {
+            return true; // 允许 --debug false
+        }
+        return "jdbc-config".equals(k) || "log-dir".equals(k) || "outdir".equals(k)
+                || "interval".equals(k) || "count".equals(k) || "sql-id".equals(k)
+                || "report-timeout".equals(k) || "timeout".equals(k) || "replay-timeout".equals(k)
+                || "max-new".equals(k) || "current-schema".equals(k) || "source".equals(k)
+                || "parallel".equals(k) || "sessions".equals(k) || "results-csv".equals(k)
+                || "on-sha-mismatch".equals(k) || "limit".equals(k) || "sort".equals(k)
+                || "run".equals(k) || "csv".equals(k) || "sqlid".equals(k);
+    }
+
+    static boolean isBoolToken(String tok) {
+        if (tok == null) {
+            return false;
+        }
+        String s = tok.trim().toLowerCase(Locale.ROOT);
+        return "true".equals(s) || "false".equals(s) || "1".equals(s) || "0".equals(s)
+                || "yes".equals(s) || "no".equals(s) || "on".equals(s) || "off".equals(s);
     }
 
     public boolean flag(String name) {
@@ -237,5 +325,37 @@ public class Args {
             }
         }
         return true;
+    }
+
+    /**
+     * 对齐打印帮助行: 左列固定宽度, 右列说明.
+     * left 为空时只打印续行缩进说明 (用于折行).
+     */
+    public static void helpOpt(String left, String right) {
+        final int width = 34;
+        if (left == null) {
+            left = "";
+        }
+        if (right == null) {
+            right = "";
+        }
+        if (left.isEmpty()) {
+            System.out.println("  " + pad(width) + right);
+            return;
+        }
+        if (left.length() >= width) {
+            System.out.println("  " + left);
+            System.out.println("  " + pad(width) + right);
+            return;
+        }
+        System.out.println("  " + left + pad(width - left.length()) + right);
+    }
+
+    private static String pad(int n) {
+        StringBuilder sb = new StringBuilder(n);
+        for (int i = 0; i < n; i++) {
+            sb.append(' ');
+        }
+        return sb.toString();
     }
 }

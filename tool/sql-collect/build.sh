@@ -12,20 +12,13 @@ TARGET_RELEASE="${TARGET_RELEASE:-8}"
 TARGET_MAJOR=52
 
 mkdir -p "$OUT"
+# 清理旧 class, 避免已删除源文件残留在 jar
+rm -rf "$OUT"
+mkdir -p "$OUT"
 SRC_LIST="$ROOT/build/sources.list"
 mkdir -p "$ROOT/build"
 
-# 将 sql.sql 嵌入为 Java 源码 (不打包独立 sql_report.sql)
-UPSTREAM_SQL="$ROOT/../../internal/scripts/sql/yashandb/sql.sql"
-GEN_JAVA="$SRC/com/yashan/sqlcollect/collect/SqlReportScript.java"
-GEN_PY="$ROOT/gen_sql_report_script.py"
-if [ ! -f "$UPSTREAM_SQL" ]; then
-  echo "ERROR: upstream sql missing: $UPSTREAM_SQL" >&2
-  exit 1
-fi
-python3 "$GEN_PY" "$UPSTREAM_SQL" "$GEN_JAVA"
-
-# 不再维护/打包独立资源文件
+# 报告 SELECT 段已维护在 ReportSelectScript.java (不从 sql.sql 生成)
 rm -f "$ROOT/resources/sql_report.sql"
 rmdir "$ROOT/resources" 2>/dev/null || true
 

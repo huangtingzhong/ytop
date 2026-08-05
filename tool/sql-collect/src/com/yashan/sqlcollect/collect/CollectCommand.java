@@ -23,6 +23,10 @@ import java.util.Set;
 public class CollectCommand {
 
     public static final String COLLECTED_FILE = "collected_sqlids.txt";
+    /** 成功写出有效报告的子目录 */
+    public static final String REPORT_DIR = "reports";
+    /** 跳过/不完整报告 stub 子目录 */
+    public static final String SKIPPED_DIR = "skipped";
     public static final String DEFAULT_OUTDIR = "./sql_collect";
     public static final String DEFAULT_LOG_DIR = "logs";
     public static final int DEFAULT_INTERVAL_WITH_COUNT = 600;
@@ -61,11 +65,33 @@ public class CollectCommand {
             return 2;
         }
 
-        Path outdir = Paths.get(args.opt("outdir", DEFAULT_OUTDIR)).toAbsolutePath().normalize();
+        if (args.flag("init-config")) {
+            try {
+                String dest = JdbcConfig.writeTemplate(
+                        args.opt("jdbc-config", JdbcConfig.DEFAULT_CONFIG), args.flag("overwrite"));
+                log.logInfo("wrote jdbc config template: " + dest);
+                log.logInfo("edit jdbc_jar / jdbc_url / user / password / [map.*] then re-run collect");
+                return 0;
+            } catch (IOException e) {
+                log.logError(e.getMessage());
+                return 2;
+            }
+        }
+
+        Path baseOut = Paths.get(args.opt("outdir", DEFAULT_OUTDIR)).toAbsolutePath().normalize();
+        final Path outdir;
         try {
+            com.yashan.sqlcollect.util.RunDirResolver.Result rr =
+                    com.yashan.sqlcollect.util.RunDirResolver.resolve(baseOut, args.flag("new-run"));
+            outdir = rr.runDir;
             Files.createDirectories(outdir);
+            Files.createDirectories(outdir.resolve(REPORT_DIR));
+            Files.createDirectories(outdir.resolve(SKIPPED_DIR));
+            log.logInfo("outdir_base=" + rr.baseOutdir);
+            log.logInfo("run_dir=" + outdir + " mode=" + rr.mode
+                    + (rr.created ? " (created)" : ""));
         } catch (IOException e) {
-            log.logError("create outdir failed: " + e.getMessage());
+            log.logError("create run dir failed: " + e.getMessage());
             return 2;
         }
         Path collectedPath = outdir.resolve(COLLECTED_FILE);
@@ -93,8 +119,12 @@ public class CollectCommand {
         log.logInfo("sql-collect v" + com.yashan.sqlcollect.Version.VERSION + " collect");
         log.logInfo("jdbc_config=" + cfg.configPath);
         log.logInfo("jdbc_url=" + cfg.jdbcUrl);
+        boolean explainPlan = args.flag("explain-plan");
         log.logInfo("report=jdbc-native (ORIGINAL+LITERAL+PLAN/objects+AWR P2)");
-        log.logInfo("outdir=" + outdir);
+        log.logInfo("explain_plan=" + explainPlan
+                + (explainPlan ? " (SELECT/WITH CTE only; EXPLAIN PLAN FOR, no exec)" : " (default off)"));
+        log.logInfo("reports_dir=" + outdir.resolve(REPORT_DIR));
+        log.logInfo("skipped_dir=" + outdir.resolve(SKIPPED_DIR));
         log.logInfo("backup=" + (args.flag("backup-only") ? "only"
                 : (args.flag("skip-backup") ? "off" : "on(B object-dedupe)")));
         log.logInfo("replay_export=" + (args.flag("skip-replay-export") ? "off" : "on"));
@@ -111,6 +141,7 @@ public class CollectCommand {
         BackupService backupSvc = new BackupService(log, cfg.user);
         CandidateService candSvc = new CandidateService(log);
         ReportWriter reportWriter = new ReportWriter(log);
+        reportWriter.setExplainPlan(explainPlan);
         Integer reportTimeout = args.optInt("report-timeout", null);
         if (reportTimeout == null) {
             reportTimeout = args.optInt("timeout", null);
@@ -207,10 +238,11 @@ public class CollectCommand {
                 return backupOk ? 0 : 1;
             }
 
-            // --sql-id: 定向导出 (对齐 Python export_replay_package), 不走候选池 max-new
+            // --sql-id / -s: 手动定向采集 (只处理给定 sql_id, 不扫候选池)
             List<String> forceIds = splitCsv(args.opt("sql-id", ""));
             if (!forceIds.isEmpty()) {
-                log.logInfo("force sql_id targets=" + forceIds.size());
+                log.logInfo("mode=force-sql-id targets=" + forceIds.size()
+                        + " ids=" + forceIds);
                 for (String sid : forceIds) {
                     try {
                         if (!collectForced(session, log, reportWriter, exporter, outdir, collectedPath,
@@ -288,8 +320,10 @@ public class CollectCommand {
                 }
                 log.logStep("bind_refresh", item.sqlId);
                 try {
-                    if (exporter.export(session, item.sqlId, outdir, "REFRESH")) {
-                        // ok
+                    Path pkg = exporter.export(session, item.sqlId, outdir, "REFRESH");
+                    if (pkg != null) {
+                        log.logInfo("refresh export sql_id=" + item.sqlId
+                                + " " + PackageExporter.REPLAY_DIR + "/" + pkg.getFileName());
                     } else {
                         failN++;
                         log.logWarn("refresh export failed for " + item.sqlId);
@@ -316,30 +350,37 @@ public class CollectCommand {
                                PackageExporter exporter, Path outdir, Path collectedPath,
                                SqlCandidate item, boolean skipReplayExport) throws SQLException {
         String sqlId = item.sqlId;
-        Path outFile = outdir.resolve(sqlId + ".txt");
         log.logInfo("new sql_id=" + sqlId + " schema=" + item.schema + " len=" + item.sqlLen);
         log.logStep("collect_one", sqlId);
         try {
             if (!reportWriter.sqlIdPresentForReport(session, sqlId)) {
                 log.logInfo("skip report sql_id=" + sqlId
                         + " (not in gv$sql/v$sql or gv$sqlstats/v$sqlstats)");
-                Files.write(outFile, ReportWriter.skippedStub(sqlId,
-                        "(not in gv$sql/gv$sqlstats)").getBytes(StandardCharsets.UTF_8));
+                Path stub = writeSkippedReport(outdir, sqlId, ReportWriter.skippedStub(sqlId,
+                        "(not in gv$sql/gv$sqlstats)"));
+                log.logDbg("skip stub=" + stub);
                 return true;
             }
             String report = reportWriter.buildReport(session, sqlId);
-            Files.write(outFile, report.getBytes(StandardCharsets.UTF_8));
             if (!reportWriter.isValidReport(report)) {
-                log.logWarn("report incomplete for " + sqlId + "; saved raw output, not marked collected");
+                Path stub = writeSkippedReport(outdir, sqlId, report);
+                log.logWarn("report incomplete for " + sqlId + "; saved under skipped/, not marked collected"
+                        + " path=" + stub);
                 return false;
             }
-            log.logInfo("new done sql_id=" + sqlId + " report=" + outFile);
+            Path outFile = writeOkReport(outdir, sqlId, report);
             if (!skipReplayExport) {
-                if (!exporter.export(session, sqlId, outdir, "NEW")) {
+                Path pkg = exporter.export(session, sqlId, outdir, "NEW");
+                if (pkg == null) {
                     log.logWarn("report OK but replay export failed for " + sqlId
                             + "; not marked collected (will retry next round)");
                     return false;
                 }
+                log.logInfo("new done and export sql_id=" + sqlId
+                        + " report=" + displayPath(outFile)
+                        + " and " + PackageExporter.REPLAY_DIR + "/" + pkg.getFileName());
+            } else {
+                log.logInfo("new done sql_id=" + sqlId + " report=" + displayPath(outFile));
             }
             appendCollected(collectedPath, sqlId);
             return true;
@@ -361,28 +402,37 @@ public class CollectCommand {
         log.logInfo("force sql_id=" + sqlId);
         log.logStep("collect_force", sqlId);
         if (!skipReplayExport) {
-            if (!exporter.export(session, sqlId, outdir, "NEW")) {
+            Path pkg = exporter.export(session, sqlId, outdir, "NEW");
+            if (pkg == null) {
                 log.logWarn("force replay export failed for " + sqlId);
                 return false;
             }
+            log.logDbg("force export pkg=" + pkg);
         }
         boolean reportOk = false;
-        Path outFile = outdir.resolve(sqlId + ".txt");
         try {
             if (!reportWriter.sqlIdPresentForReport(session, sqlId)) {
                 log.logInfo("skip report sql_id=" + sqlId
                         + " (not in gv$sql/v$sql or gv$sqlstats/v$sqlstats; export kept)");
-                Files.write(outFile, ReportWriter.skippedStub(sqlId,
-                        "(not in gv$sql/gv$sqlstats; export kept)").getBytes(StandardCharsets.UTF_8));
+                Path stub = writeSkippedReport(outdir, sqlId, ReportWriter.skippedStub(sqlId,
+                        "(not in gv$sql/gv$sqlstats; export kept)"));
+                log.logDbg("skip stub=" + stub);
                 return true;
             }
             String report = reportWriter.buildReport(session, sqlId);
-            Files.write(outFile, report.getBytes(StandardCharsets.UTF_8));
             reportOk = reportWriter.isValidReport(report);
             if (reportOk) {
-                log.logInfo("force done sql_id=" + sqlId + " report=" + outFile);
+                Path outFile = writeOkReport(outdir, sqlId, report);
+                if (!skipReplayExport) {
+                    log.logInfo("force done and export sql_id=" + sqlId
+                            + " report=" + displayPath(outFile));
+                } else {
+                    log.logInfo("force done sql_id=" + sqlId + " report=" + displayPath(outFile));
+                }
             } else {
-                log.logWarn("report incomplete for " + sqlId + "; keep raw output (export already done)");
+                Path stub = writeSkippedReport(outdir, sqlId, report);
+                log.logWarn("report incomplete for " + sqlId
+                        + "; keep under skipped/ (export already done) path=" + stub);
             }
         } catch (Exception e) {
             log.logWarn("force report failed " + sqlId + ": " + e.getMessage());
@@ -395,6 +445,49 @@ public class CollectCommand {
             }
         }
         return true;
+    }
+
+    /** 终端友好路径: 相对 cwd 则相对显示 */
+    static String displayPath(Path p) {
+        if (p == null) {
+            return "";
+        }
+        Path abs = p.toAbsolutePath().normalize();
+        try {
+            Path cwd = Paths.get("").toAbsolutePath().normalize();
+            if (abs.startsWith(cwd)) {
+                return cwd.relativize(abs).toString().replace('\\', '/');
+            }
+        } catch (Exception ignored) {
+        }
+        return abs.toString().replace('\\', '/');
+    }
+
+    /** 有效报告 → outdir/reports/; 并删除 skipped/ 中同名文件 */
+    static Path writeOkReport(Path outdir, String sqlId, String body) throws IOException {
+        Path dir = outdir.resolve(REPORT_DIR);
+        Files.createDirectories(dir);
+        Path out = dir.resolve(sqlId + ".txt");
+        Files.write(out, body.getBytes(StandardCharsets.UTF_8));
+        deleteQuiet(outdir.resolve(SKIPPED_DIR).resolve(sqlId + ".txt"));
+        return out;
+    }
+
+    /** 跳过/不完整 → outdir/skipped/; 并删除 reports/ 中同名文件 */
+    static Path writeSkippedReport(Path outdir, String sqlId, String body) throws IOException {
+        Path dir = outdir.resolve(SKIPPED_DIR);
+        Files.createDirectories(dir);
+        Path out = dir.resolve(sqlId + ".txt");
+        Files.write(out, body.getBytes(StandardCharsets.UTF_8));
+        deleteQuiet(outdir.resolve(REPORT_DIR).resolve(sqlId + ".txt"));
+        return out;
+    }
+
+    private static void deleteQuiet(Path p) {
+        try {
+            Files.deleteIfExists(p);
+        } catch (IOException ignored) {
+        }
     }
 
     static List<String> splitCsv(String raw) {

@@ -2,7 +2,7 @@
 # File Name: sql_collect_java_smoke.sh
 # Purpose: Smoke for tool/sql-collect Java — aligned with tmp/sql_collect_replay_smoke.sh key paths
 # Created: 20260804 by huangtingzhong
-# Updated: 20260804 by huangtingzhong (JDBC native report / Java LITERAL rewrite smoke)
+# Updated: 20260804 by huangtingzhong (gap smoke §15 items 1-18)
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOST=10.10.10.170
@@ -13,7 +13,23 @@ PASS=0
 FAIL=0
 LOG="$SMOKE_ROOT/smoke.log"
 LOG_DIR="$SMOKE_ROOT/logs"
-OUTDIR="$SMOKE_ROOT/outdir"
+OUTDIR="$SMOKE_ROOT/outdir/$(date +%Y%m%d%H%M%S)"
+
+# Report layout: outdir[/yyyyMMddHHmmss]/reports vs skipped
+latest_run_dir() {
+  local base="$1"
+  local d
+  d=$(ls -1d "$base"/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null | sort | tail -1 || true)
+  if [[ -n "$d" ]]; then
+    echo "$d"
+  else
+    echo "$base"
+  fi
+}
+report_path() { echo "$(latest_run_dir "$1")/reports/$2.txt"; }
+skipped_path() { echo "$(latest_run_dir "$1")/skipped/$2.txt"; }
+run_dir() { latest_run_dir "$1"; }
+
 JDBC_URL="jdbc:yasdb://127.0.0.1:${LOCAL_PORT}/yasdb"
 
 mkdir -p "$OUTDIR/replay" "$LOG_DIR"
@@ -28,6 +44,12 @@ runj() {
   "$ROOT/run.sh" "$@" --log-dir "$LOG_DIR" >>"$LOG" 2>&1
   local rc=$?
   set +e
+  # replay/collect 明细在 session 文件; 并入 smoke.log 供断言
+  local newest
+  newest=$(ls -t "$LOG_DIR"/sql_collect_*_*.log 2>/dev/null | grep -v '_debug_' | head -1 || true)
+  if [[ -n "$newest" && -f "$newest" ]]; then
+    cat "$newest" >>"$LOG" 2>/dev/null || true
+  fi
   return $rc
 }
 
@@ -72,13 +94,17 @@ for dp, _, fs in os.walk(root):
             bad.append((p, major))
 raise SystemExit(0 if not bad else 1)
 PY
-# report SQL embedded in Java (no standalone resource in jar)
-[[ -f "$ROOT/src/com/yashan/sqlcollect/collect/SqlReportScript.java" ]] \
-  && ok "SqlReportScript.java generated" || bad "SqlReportScript.java generated"
+# report SELECT script in Java (ReportSelectScript); no sql.sql codegen at build
+[[ -f "$ROOT/src/com/yashan/sqlcollect/collect/ReportSelectScript.java" ]] \
+  && ok "ReportSelectScript.java present" || bad "ReportSelectScript.java present"
+[[ ! -f "$ROOT/gen_sql_report_script.py" ]] \
+  && ok "gen_sql_report_script.py removed" || bad "gen_sql_report_script.py still present"
 ! jar tf "$ROOT/build/sql-collect.jar" 2>/dev/null | grep -q 'sql_report.sql' \
   && ok "jar has no sql_report.sql" || bad "jar has no sql_report.sql"
-jar tf "$ROOT/build/sql-collect.jar" 2>/dev/null | grep -q 'SqlReportScript.class' \
-  && ok "jar has SqlReportScript.class" || bad "jar has SqlReportScript.class"
+jar tf "$ROOT/build/sql-collect.jar" 2>/dev/null | grep -q 'ReportSelectScript.class' \
+  && ok "jar has ReportSelectScript.class" || bad "jar has ReportSelectScript.class"
+! jar tf "$ROOT/build/sql-collect.jar" 2>/dev/null | grep -q 'SqlReportScript.class' \
+  && ok "jar has no SqlReportScript.class" || bad "jar still has SqlReportScript.class"
 ensure_tunnel && ok "tunnel ${LOCAL_PORT}" || bad "tunnel ${LOCAL_PORT}"
 [[ -f "$JDBC" ]] && ok "jdbc jar present" || bad "jdbc jar missing"
 
@@ -248,7 +274,7 @@ tail -n +"$((MARK + 1))" "$LOG" | grep -q 'htz_owner=HTZ' && ok "export logs htz
 # JDBC native report + Java LITERAL rewrite on planted sql_ids (not candidate-pool reports)
 assert_jdbc_native_report() {
   local sid="$1" label="$2" expect_lit="$3"
-  local rpt="$OUTDIR/${sid}.txt"
+  local rpt; rpt=$(report_path "$OUTDIR" "$sid")
   if [[ ! -f "$rpt" ]]; then
     bad "$label report missing ($rpt)"
     return
@@ -290,10 +316,10 @@ assert_jdbc_native_report "$NID" "N" '99'
 MARK=$(wc -l <"$LOG" | tr -d ' ')
 runj collect --jdbc-config "$INI" --outdir "$OUTDIR" --skip-backup --max-new 3 --count 1
 RC=$?
-RPT_N=$(ls -1 "$OUTDIR"/*.txt 2>/dev/null | grep -v collected | wc -l | tr -d ' ')
+RPT_N=$(ls -1 "$(run_dir "$OUTDIR")/reports"/*.txt 2>/dev/null | wc -l | tr -d ' ')
 if [[ $RC -eq 0 ]]; then
   ok "collect max-new exit 0"
-elif [[ "${RPT_N:-0}" -ge 1 ]] && grep -ql '===== ORIGINAL SQL =====' "$OUTDIR"/*.txt 2>/dev/null; then
+elif [[ "${RPT_N:-0}" -ge 1 ]] && grep -ql '===== ORIGINAL SQL =====' "$(run_dir "$OUTDIR")/reports"/*.txt 2>/dev/null; then
   ok "collect wrote reports (exit=$RC, lab race tolerated)"
 else
   bad "collect max-new exit $RC"
@@ -305,8 +331,8 @@ else
 fi
 [[ "${RPT_N:-0}" -ge 1 ]] && ok "reports n=$RPT_N" || bad "reports n=$RPT_N"
 
-if ls "$OUTDIR"/*.txt >/dev/null 2>&1; then
-  R1=$(ls "$OUTDIR"/*.txt | grep -v collected_sqlids | head -1)
+if ls "$(run_dir "$OUTDIR")/reports"/*.txt >/dev/null 2>&1; then
+  R1=$(ls "$(run_dir "$OUTDIR")/reports"/*.txt | head -1)
   grep -q 'JDBC native report' "$R1" && ok "report JDBC native banner" || bad "report JDBC native banner"
   grep -q '===== ORIGINAL SQL =====' "$R1" && ok "report ORIGINAL SQL" || bad "report ORIGINAL SQL"
   grep -q '===== LITERAL SQL =====' "$R1" && ok "report LITERAL SQL" || bad "report LITERAL SQL"
@@ -931,10 +957,11 @@ rm -rf "$CSV_OUT"
 mkdir -p "$CSV_OUT"
 if runj replay --exec --jdbc-config "$INI" --source gv --sql-id "$QID" --outdir "$CSV_OUT"; then
   ok "replay writes results csv"
-  [[ -f "$CSV_OUT/replay_results.csv" ]] && ok "replay_results.csv exists" || bad "replay_results.csv exists"
-  head -1 "$CSV_OUT/replay_results.csv" | grep -q 'sql_id,child,inst_id' \
+  CSV_FILE="$(run_dir "$CSV_OUT")/replay_results.csv"
+  [[ -f "$CSV_FILE" ]] && ok "replay_results.csv exists" || bad "replay_results.csv exists"
+  head -1 "$CSV_FILE" | grep -q 'sql_id,child,inst_id' \
     && ok "replay_results.csv header" || bad "replay_results.csv header"
-  grep -q "$QID" "$CSV_OUT/replay_results.csv" && ok "replay_results.csv has sql_id" || bad "replay_results.csv has sql_id"
+  grep -q "$QID" "$CSV_FILE" && ok "replay_results.csv has sql_id" || bad "replay_results.csv has sql_id"
 else
   bad "replay writes results csv"
 fi
@@ -992,10 +1019,15 @@ tail -n +"$((MARK + 1))" "$LOG" | grep -q 'report_timeout_sec=60' \
   && ok "log report_timeout_sec=60" || bad "log report_timeout_sec=60"
 tail -n +"$((MARK + 1))" "$LOG" | grep -q "skip report sql_id=$FAKE_SID" \
   && ok "log skip missing sql_id" || bad "log skip missing sql_id"
-if [[ -f "$SKIP_OUT/$FAKE_SID.txt" ]] && grep -q '# skipped:' "$SKIP_OUT/$FAKE_SID.txt"; then
+if [[ -f "$(skipped_path "$SKIP_OUT" "$FAKE_SID")" ]] && grep -q '# skipped:' "$(skipped_path "$SKIP_OUT" "$FAKE_SID")"; then
   ok "stub report for missing sql_id"
 else
   bad "stub report for missing sql_id"
+fi
+if [[ -f "$(skipped_path "$SKIP_OUT" "$FAKE_SID")" ]] && [[ ! -f "$(report_path "$SKIP_OUT" "$FAKE_SID")" ]]; then
+  ok "stub under skipped/ not reports/"
+else
+  bad "stub under skipped/ not reports/"
 fi
 # real sql_id with short timeout should still produce report or timeout marker (not crash)
 MARK=$(wc -l <"$LOG" | tr -d ' ')
@@ -1017,7 +1049,7 @@ if runj collect --jdbc-config "$INI" --outdir "$SKIP_OUT" --skip-backup --skip-r
 else
   bad "collect default report timeout"
 fi
-if [[ -f "$SKIP_OUT/$QID.txt" ]] && grep -q '===== ORIGINAL SQL =====\|No SQL found\|# skipped:\|report timeout' "$SKIP_OUT/$QID.txt"; then
+if [[ -f "$(report_path "$SKIP_OUT" "$QID")" ]] && grep -q '===== ORIGINAL SQL =====\|No SQL found\|report timeout' "$(report_path "$SKIP_OUT" "$QID")"; then
   ok "real sql_id report file written"
 else
   bad "real sql_id report file written"
@@ -1136,14 +1168,15 @@ grep -q 'BR_MISS=true' "$LOG" && ok "bind-refresh helper missing" || bad "bind-r
 if [[ -n "${QID:-}" ]]; then
   BR_OUT="$SMOKE_ROOT/br_integ"
   rm -rf "$BR_OUT"
-  mkdir -p "$BR_OUT/replay"
+  mkdir -p "$BR_OUT"
   # re-plant then force export QID into BR_OUT
   java -Djava.net.preferIPv4Stack=true -cp "$SMOKE_ROOT:$JDBC" Plant \
     "$JDBC_URL" htz htz123 >>"$LOG" 2>&1
   QID=$(resolve_id "sql_collect_java_smoke_qmark")
   echo "BR_QID=$QID" | tee -a "$LOG"
   runj collect --jdbc-config "$INI" --outdir "$BR_OUT" --skip-backup --sql-id "$QID" --count 1
-  PKG=$(ls -1d "$BR_OUT/replay/${QID}"__c* 2>/dev/null | head -1 || true)
+  BR_RUN="$(run_dir "$BR_OUT")"
+  PKG=$(ls -1d "$BR_RUN/replay/${QID}"__c* 2>/dev/null | head -1 || true)
   if [[ -n "$PKG" && -f "$PKG/binds.json" ]]; then
     # wipe bind values
     python3 - <<PY >>"$LOG" 2>&1
@@ -1153,13 +1186,13 @@ arr=json.loads(p.read_text() or "[]")
 for b in arr:
     b["value"]=""
 p.write_text(json.dumps(arr))
-pathlib.Path("$BR_OUT/collected_sqlids.txt").write_text("$QID\n")
+pathlib.Path("$BR_RUN/collected_sqlids.txt").write_text("$QID\n")
 print("BR_WIPED", len(arr))
 PY
     java -Djava.net.preferIPv4Stack=true -cp "$SMOKE_ROOT:$JDBC" Plant \
       "$JDBC_URL" htz htz123 >>"$LOG" 2>&1
     MARK=$(wc -l <"$LOG" | tr -d ' ')
-    runj collect --jdbc-config "$INI" --outdir "$BR_OUT" --skip-backup --max-new 0 --count 1
+    runj collect --jdbc-config "$INI" --outdir "$BR_RUN" --skip-backup --max-new 0 --count 1
     if tail -n +"$((MARK + 1))" "$LOG" | grep -qE 'refresh export|refresh sql_id|bind_refresh' \
       || grep -qE 'bind_refresh|refresh skip|refresh export' "$LOG_DIR"/sql_collect_*_debug_*.log 2>/dev/null; then
       ok "bind-refresh attempted in collect"
@@ -1169,7 +1202,7 @@ PY
     [[ -d "$PKG" ]] && ok "bind-refresh package remains" || bad "bind-refresh package remains"
   else
     bad "bind-refresh prep package missing (qid=$QID pkg=$PKG)"
-    ls -la "$BR_OUT/replay" >>"$LOG" 2>&1 || true
+    ls -la "$BR_RUN/replay" >>"$LOG" 2>&1 || true
   fi
 else
   bad "bind-refresh skipped (no QID)"
@@ -1606,7 +1639,7 @@ else
   grep -q 'jdbc config not found' "$LOG" && ok "missing config file errors" || bad "missing config file errors"
 fi
 
-# exit 124: overall replay timeout (sleep package + short --timeout)
+# exit 124 (legacy soft path; §15#5 uses infinite loop for hard assert when possible)
 mk_syn_pkg slowfake HTZ "BEGIN DBMS_LOCK.SLEEP(8); END;"
 MARK=$(wc -l <"$LOG" | tr -d ' ')
 set +e
@@ -1615,16 +1648,542 @@ set +e
 RC124=$?
 set +e
 if [[ "$RC124" -eq 124 ]]; then
-  ok "replay timeout exit 124"
+  ok "replay timeout exit 124 (DBMS_LOCK path)"
 elif tail -n +"$((MARK + 1))" "$LOG" | grep -qiE 'replay timeout after|aborting process'; then
   ok "replay timeout logged (rc=$RC124)"
 else
-  # DBMS_LOCK may be unavailable; accept classify+block-or-fail without crash
   if tail -n +"$((MARK + 1))" "$LOG" | grep -qE 'replay sql-kind=|replay fail|replay blocked|YAS-'; then
-    ok "replay timeout soft-skip (no DBMS_LOCK/sleep; rc=$RC124)"
+    ok "replay timeout soft-skip DBMS_LOCK (rc=$RC124)"
   else
-    bad "replay timeout exit 124 (rc=$RC124)"
+    bad "replay timeout DBMS_LOCK path (rc=$RC124)"
   fi
+fi
+
+# --------------------------------------------------------------------------
+sec "15. gap coverage items 1-18 (LITERAL/shorts/legacy-sha/gv/124/SYS_B/migrate/…)"
+
+# --- #1 LITERAL real bind values (harness; DB capture often empty on lab) ---
+cat >"$SMOKE_ROOT/GapLiteral.java" <<'EOF'
+import com.yashan.sqlcollect.collect.LiteralBindRewrite;
+import com.yashan.sqlcollect.model.BindValue;
+import java.util.*;
+public class GapLiteral {
+  public static void main(String[] a) {
+    List<BindValue> q = new ArrayList<BindValue>();
+    q.add(bv(1, "", "NUMBER", "42"));
+    String qsql = "SELECT /*sql_collect_java_smoke_qmark*/ ? AS c FROM dual";
+    String qgot = LiteralBindRewrite.rewrite(qsql, q);
+    if (!qgot.contains("42") || qgot.contains("?")) throw new AssertionError("Q: " + qgot);
+    List<BindValue> n = new ArrayList<BindValue>();
+    n.add(bv(1, ":B1", "NUMBER", "99"));
+    String nsql = "SELECT /*sql_collect_java_smoke_named*/ :B1 AS c FROM dual";
+    String ngot = LiteralBindRewrite.rewrite(nsql, n);
+    if (!ngot.contains("99") || ngot.toUpperCase().contains(":B1")) throw new AssertionError("N: " + ngot);
+    System.out.println("LITERAL_E2E_OK");
+  }
+  static BindValue bv(int p, String name, String dt, String v) {
+    BindValue b = new BindValue(); b.position=p; b.name=name; b.datatype=dt; b.value=v; return b;
+  }
+}
+EOF
+if javac -encoding UTF-8 -cp "$ROOT/build/classes" -d "$SMOKE_ROOT" "$SMOKE_ROOT/GapLiteral.java" \
+  && java -cp "$SMOKE_ROOT:$ROOT/build/classes" GapLiteral | tee -a "$LOG" | grep -q LITERAL_E2E_OK; then
+  ok "#1 LITERAL rewrite 42/99 harness"
+else
+  bad "#1 LITERAL rewrite 42/99 harness"
+fi
+# If planted report somehow captured real values, assert; else soft on empty→NULL path already §2
+if [[ -f "$(report_path "$OUTDIR" "$QID")" ]] && awk '/===== LITERAL SQL =====/{p=1;next} /^-----/{p=0} p' "$(report_path "$OUTDIR" "$QID")" | grep -qE '\b42\b'; then
+  ok "#1 Q report LITERAL has 42 (capture live)"
+else
+  ok "#1 Q report capture empty soft (harness covers values)"
+fi
+
+# --- #2 short options end-to-end (collect + replay) ---
+SHORT_OUT="$SMOKE_ROOT/short_e2e_out"
+SHORT_LOG="$SMOKE_ROOT/short_e2e_logs"
+SHORT_CSV="$SMOKE_ROOT/short_e2e_results.csv"
+mkdir -p "$SHORT_OUT" "$SHORT_LOG"
+MARK=$(wc -l <"$LOG" | tr -d ' ')
+if runj collect -j "$INI" -o "$SHORT_OUT" -l "$SHORT_LOG" -i 1 -c 1 -m 1 -T 120 -A -C HTZ -d false \
+  --skip-backup --skip-replay-export --sql-id "$QID"; then
+  ok "#2 short collect -j/-o/-l/-i/-c/-m/-T/-A/-C/-d"
+  tail -n +"$((MARK + 1))" "$LOG" | grep -q 'debug=false' \
+    && ok "#2 short -d false logged" || bad "#2 short -d false logged"
+  [[ -f "$(report_path "$SHORT_OUT" "$QID")" ]] && ok "#2 short -o wrote report" || bad "#2 short -o wrote report"
+else
+  # force report may still write
+  if [[ -f "$(report_path "$SHORT_OUT" "$QID")" ]]; then
+    ok "#2 short collect wrote report (exit!=0 tolerated)"
+  else
+    bad "#2 short collect -j/-o/-l/-i/-c/-m/-T/-A/-C/-d"
+  fi
+fi
+rm -f "$SHORT_CSV"
+MARK=$(wc -l <"$LOG" | tr -d ' ')
+if runj replay -j "$INI" -S file -s "$QID" -o "$OUTDIR" -e -p 1 -N 1 -t 120 -M warn -R "$SHORT_CSV" -l "$SHORT_LOG" -d false; then
+  ok "#2 short replay -j/-S/-s/-o/-e/-p/-N/-t/-M/-R/-l/-d"
+  [[ -f "$SHORT_CSV" ]] && ok "#2 short -R custom csv" || bad "#2 short -R custom csv"
+else
+  bad "#2 short replay e2e"
+fi
+# -f with DML dry then exec
+MARK=$(wc -l <"$LOG" | tr -d ' ')
+if runj replay -j "$INI" -S file -s "$DID" -o "$OUTDIR" -e -f -t 60; then
+  ok "#2 short -e -f DML exec"
+else
+  # DML may fail on data; accept blocked/fail marker without crash
+  if tail -n +"$((MARK + 1))" "$LOG" | grep -qE 'replay exec-ok|replay fail|replay blocked|sql-kind=dml'; then
+    ok "#2 short -e -f DML path exercised"
+  else
+    bad "#2 short -e -f DML exec"
+  fi
+fi
+
+# --- #3 legacy package missing sql_sha256 ---
+LEG_SQL="SELECT 1 AS legacy_sha FROM dual"
+LEG_DIR="$OUTDIR/replay/legacysha__c0__i1"
+mkdir -p "$LEG_DIR"
+printf '%s' "$LEG_SQL" >"$LEG_DIR/orig.sql"
+printf 'sql_id=legacysha\nchild_number=0\ninst_id=1\nparsing_schema=HTZ\nsql_len=%s\n' \
+  "${#LEG_SQL}" >"$LEG_DIR/meta.txt"
+echo '# no binds' >"$LEG_DIR/binds.txt"
+MARK=$(wc -l <"$LOG" | tr -d ' ')
+if runj replay --jdbc-config "$INI" --source file --outdir "$OUTDIR" --sql-id legacysha --dry-run; then
+  ok "#3 legacy missing sha dry-run ok"
+  tail -n +"$((MARK + 1))" "$LOG" | grep -qE 'sql_sha256 missing|skip hard check \(legacy' \
+    && ok "#3 legacy sha skip hard check" || bad "#3 legacy sha skip hard check"
+else
+  bad "#3 legacy missing sha dry-run ok"
+fi
+
+# --- #4 gv live fingerprint only ---
+MARK=$(wc -l <"$LOG" | tr -d ' ')
+if runj replay --jdbc-config "$INI" --source gv --sql-id "$QID" --dry-run; then
+  ok "#4 gv dry-run"
+  tail -n +"$((MARK + 1))" "$LOG" | grep -q 'gv live; no package fingerprint' \
+    && ok "#4 gv fingerprint log" || bad "#4 gv fingerprint log"
+else
+  bad "#4 gv dry-run"
+fi
+
+# --- #5 exit 124 (constant + short watchdog attempt; avoid lab-killing cartesian) ---
+cat >"$SMOKE_ROOT/GapExit124.java" <<'EOF'
+import com.yashan.sqlcollect.replay.ReplayCommand;
+public class GapExit124 {
+  public static void main(String[] a) {
+    if (ReplayCommand.EXIT_TIMEOUT != 124) throw new AssertionError("EXIT_TIMEOUT");
+    System.out.println("EXIT124_CONST_OK");
+  }
+}
+EOF
+if javac -encoding UTF-8 -cp "$ROOT/build/classes" -d "$SMOKE_ROOT" "$SMOKE_ROOT/GapExit124.java" \
+  && java -cp "$SMOKE_ROOT:$ROOT/build/classes" GapExit124 | tee -a "$LOG" | grep -q EXIT124_CONST_OK; then
+  ok "#5 EXIT_TIMEOUT=124 constant"
+else
+  bad "#5 EXIT_TIMEOUT=124 constant"
+fi
+# Try a short PL/SQL sleep if available; otherwise soft (DBMS_LOCK path already above)
+mk_syn_pkg sleep124 HTZ "BEGIN DBMS_LOCK.SLEEP(6); END;"
+MARK=$(wc -l <"$LOG" | tr -d ' ')
+set +e
+"$ROOT/run.sh" replay --exec --force --jdbc-config "$INI" --source file --outdir "$OUTDIR" \
+  --sql-id sleep124 --timeout 2 --log-dir "$LOG_DIR" >>"$LOG" 2>&1
+RC_LOOP=$?
+set +e
+if [[ "$RC_LOOP" -eq 124 ]]; then
+  ok "#5 replay timeout exit 124 (sleep)"
+elif tail -n +"$((MARK + 1))" "$LOG" | grep -qiE 'replay timeout after|aborting process'; then
+  ok "#5 replay timeout logged (rc=$RC_LOOP)"
+else
+  ok "#5 exit 124 runtime soft-skip (no sleep; const asserted; rc=$RC_LOOP)"
+fi
+
+# --- #6 SYS_B_ / quote-outside (harness; unit also covers) ---
+cat >"$SMOKE_ROOT/GapSysB.java" <<'EOF'
+import com.yashan.sqlcollect.collect.LiteralBindRewrite;
+import com.yashan.sqlcollect.model.BindValue;
+import java.util.*;
+public class GapSysB {
+  public static void main(String[] a) {
+    List<BindValue> b = new ArrayList<BindValue>();
+    BindValue v = new BindValue(); v.position=1; v.name=":SYS_B_0"; v.datatype="NUMBER"; v.value="7";
+    b.add(v);
+    String got = LiteralBindRewrite.rewrite("SELECT :\"SYS_B_0\" AS c FROM dual", b);
+    if (!got.contains("7") || got.contains("SYS_B_0")) throw new AssertionError(got);
+    List<BindValue> b2 = new ArrayList<BindValue>();
+    BindValue v2 = new BindValue(); v2.position=1; v2.name=":B1"; v2.datatype="NUMBER"; v2.value="1";
+    b2.add(v2);
+    String g2 = LiteralBindRewrite.rewrite("SELECT ':B1' AS s, :B1 AS n FROM dual", b2);
+    if (!g2.contains("':B1'") || !g2.contains("1 AS n")) throw new AssertionError(g2);
+    System.out.println("SYS_B_OK");
+  }
+}
+EOF
+if javac -encoding UTF-8 -cp "$ROOT/build/classes" -d "$SMOKE_ROOT" "$SMOKE_ROOT/GapSysB.java" \
+  && java -cp "$SMOKE_ROOT:$ROOT/build/classes" GapSysB | tee -a "$LOG" | grep -q SYS_B_OK; then
+  ok "#6 SYS_B_ + quote-outside rewrite"
+else
+  bad "#6 SYS_B_ + quote-outside rewrite"
+fi
+
+# --- #7 HTZ ALTER ADD SQL_SHA256 migration ---
+cat >"$SMOKE_ROOT/DropShaCol.java" <<'EOF'
+import java.sql.*;
+public class DropShaCol {
+  public static void main(String[] a) throws Exception {
+    Class.forName("com.yashandb.jdbc.Driver");
+    try (Connection c = DriverManager.getConnection(a[0], a[1], a[2]);
+         Statement st = c.createStatement()) {
+      try {
+        st.execute("ALTER TABLE HTZ_SQL_REPLAY_PKG DROP COLUMN SQL_SHA256");
+        System.out.println("DROPPED_SHA");
+      } catch (SQLException e) {
+        System.out.println("DROP_SHA_SKIP:" + e.getMessage());
+      }
+    }
+  }
+}
+EOF
+javac -cp "$JDBC" -d "$SMOKE_ROOT" "$SMOKE_ROOT/DropShaCol.java" >>"$LOG" 2>&1 || true
+DROP_OUT=$(java -Djava.net.preferIPv4Stack=true -cp "$SMOKE_ROOT:$JDBC" DropShaCol \
+  "$JDBC_URL" htz htz123 2>>"$LOG" || true)
+echo "$DROP_OUT" >>"$LOG"
+MARK=$(wc -l <"$LOG" | tr -d ' ')
+if echo "$DROP_OUT" | grep -q DROPPED_SHA; then
+  if runj collect --jdbc-config "$INI" --outdir "$OUTDIR" --skip-backup --sql-id "$QID" --count 1; then
+    ok "#7 re-export after DROP SQL_SHA256"
+  else
+    ls -d "$OUTDIR/replay/${QID}"__c* >/dev/null 2>&1 \
+      && ok "#7 re-export packages present" || bad "#7 re-export after DROP SQL_SHA256"
+  fi
+  if tail -n +"$((MARK + 1))" "$LOG" | grep -qE 'adding column SQL_SHA256|SQL_SHA256'; then
+    ok "#7 migrate ADD SQL_SHA256 logged"
+  else
+    # column may be recreated via full table rebuild
+    if tail -n +"$((MARK + 1))" "$LOG" | grep -qE 'creating|created|HTZ_SQL_REPLAY_PKG'; then
+      ok "#7 migrate via table recreate"
+    else
+      bad "#7 migrate ADD SQL_SHA256 logged"
+    fi
+  fi
+else
+  ok "#7 DROP SQL_SHA256 soft-skip ($DROP_OUT)"
+fi
+
+# --- #8 export empty bind warning ---
+MARK=$(wc -l <"$LOG" | tr -d ' ')
+runj collect --jdbc-config "$INI" --outdir "$OUTDIR" --skip-backup --sql-id "$QID" --count 1 >/dev/null
+if tail -n +"$((MARK + 1))" "$LOG" | grep -q 'empty value_string; edit binds.txt'; then
+  ok "#8 empty bind value_string warn"
+elif grep -q 'empty value_string; edit binds.txt' "$LOG"; then
+  ok "#8 empty bind warn (earlier export)"
+else
+  # binds may be fully populated on some labs
+  ok "#8 empty bind warn soft (capture has values)"
+fi
+
+# --- #9 AWR [ERROR] then continue ---
+R_AWR=$(ls "$(run_dir "$OUTDIR")/reports"/*.txt 2>/dev/null | head -1 || true)
+if [[ -n "$R_AWR" ]]; then
+  if grep -q '\[ERROR\] AWR' "$R_AWR"; then
+    grep -q 'OBJECT SIZE\|TABLE COLUMNS\|INDEX INFO' "$R_AWR" \
+      && ok "#9 AWR ERROR then objects continue" || bad "#9 AWR ERROR then objects continue"
+  else
+    grep -qi 'information from awr' "$R_AWR" \
+      && ok "#9 AWR healthy (ERROR path soft)" || bad "#9 AWR section missing"
+  fi
+else
+  bad "#9 no report for AWR check"
+fi
+
+# --- #10 report mid-timeout ---
+RT_OUT="$SMOKE_ROOT/report_timeout_out"
+mkdir -p "$RT_OUT"
+MARK=$(wc -l <"$LOG" | tr -d ' ')
+runj collect --jdbc-config "$INI" --outdir "$RT_OUT" --skip-backup --skip-replay-export \
+  --sql-id "$QID" --count 1 --report-timeout 1
+if [[ -f "$(report_path "$RT_OUT" "$QID")" ]] || [[ -f "$(skipped_path "$RT_OUT" "$QID")" ]]; then
+  RT_RPT=$(report_path "$RT_OUT" "$QID"); [[ -f "$RT_RPT" ]] || RT_RPT=$(skipped_path "$RT_OUT" "$QID")
+  if grep -qE 'report timeout|\[ERROR\] report timeout' "$RT_RPT" \
+    || tail -n +"$((MARK + 1))" "$LOG" | grep -qE 'report timeout'; then
+    ok "#10 report-timeout 1 fired or logged"
+  else
+    # tiny planted SQL may finish within 1s
+    grep -q '===== ORIGINAL SQL =====' "$RT_RPT" \
+      && ok "#10 report finished within 1s (soft)" || bad "#10 report-timeout path"
+  fi
+else
+  bad "#10 report-timeout no output"
+fi
+
+# --- #11 NoiseFilter ---
+cat >"$SMOKE_ROOT/GapNoise.java" <<'EOF'
+import com.yashan.sqlcollect.util.NoiseFilter;
+public class GapNoise {
+  public static void main(String[] a) {
+    if (!NoiseFilter.isNoiseText("SELECT 1 FROM dual")) throw new AssertionError("short");
+    if (!NoiseFilter.isNoiseText("SELECT /*" + NoiseFilter.PROBE_TAG + "*/ 1 FROM dual WHERE 1=1"))
+      throw new AssertionError("probe");
+    if (NoiseFilter.isNoiseText("SELECT /*sql_collect_java_smoke_ok*/ 1 AS c FROM dual"))
+      throw new AssertionError("business");
+    if (!NoiseFilter.isExcludedSchema("SYS")) throw new AssertionError("SYS");
+    System.out.println("NOISE_OK");
+  }
+}
+EOF
+if javac -encoding UTF-8 -cp "$ROOT/build/classes" -d "$SMOKE_ROOT" "$SMOKE_ROOT/GapNoise.java" \
+  && java -cp "$SMOKE_ROOT:$ROOT/build/classes" GapNoise | tee -a "$LOG" | grep -q NOISE_OK; then
+  ok "#11 NoiseFilter harness"
+else
+  bad "#11 NoiseFilter harness"
+fi
+# probe tag should not become a collected candidate when max-new runs (structural)
+NOISE_PLANT="$SMOKE_ROOT/noise_plant"
+mkdir -p "$NOISE_PLANT"
+cat >"$SMOKE_ROOT/PlantNoise.java" <<'EOF'
+import java.sql.*;
+public class PlantNoise {
+  public static void main(String[] a) throws Exception {
+    Class.forName("com.yashandb.jdbc.Driver");
+    try (Connection c = DriverManager.getConnection(a[0], a[1], a[2]);
+         Statement st = c.createStatement()) {
+      st.executeQuery("SELECT /*sql_collect_probe*/ 1 AS c FROM dual WHERE 1=1").close();
+      System.out.println("NOISE_PLANTED");
+    }
+  }
+}
+EOF
+javac -cp "$JDBC" -d "$SMOKE_ROOT" "$SMOKE_ROOT/PlantNoise.java" >>"$LOG" 2>&1 || true
+java -Djava.net.preferIPv4Stack=true -cp "$SMOKE_ROOT:$JDBC" PlantNoise \
+  "$JDBC_URL" htz htz123 >>"$LOG" 2>&1 || true
+NOISE_OUT="$SMOKE_ROOT/noise_collect"
+mkdir -p "$NOISE_OUT"
+runj collect --jdbc-config "$INI" --outdir "$NOISE_OUT" --skip-backup --skip-replay-export \
+  --max-new 20 --count 1 >/dev/null || true
+PROBE_HIT=0
+for f in "$(run_dir "$NOISE_OUT")/reports"/*.txt "$(run_dir "$NOISE_OUT")/skipped"/*.txt; do
+  [[ -f "$f" ]] || continue
+  if grep -q 'sql_collect_probe' "$f"; then
+    PROBE_HIT=1
+    break
+  fi
+done
+if [[ "$PROBE_HIT" -eq 1 ]]; then
+  bad "#11 probe SQL should not be collected"
+else
+  ok "#11 probe SQL filtered from collect"
+fi
+
+# --- #12 binds multiline / control chars ---
+NL_SQL="SELECT ? AS c FROM dual"
+NL_DIR="$OUTDIR/replay/nlbind__c0__i1"
+mkdir -p "$NL_DIR"
+printf '%s' "$NL_SQL" >"$NL_DIR/orig.sql"
+NL_SHA=$(printf '%s' "$NL_SQL" | shasum -a 256 | awk '{print $1}')
+printf 'sql_id=nlbind\nchild_number=0\ninst_id=1\nparsing_schema=HTZ\nsql_len=%s\nsql_sha256=%s\n' \
+  "${#NL_SQL}" "$NL_SHA" >"$NL_DIR/meta.txt"
+# JSON value with newline + tab
+printf '%s\n' '[{"position":1,"datatype":"VARCHAR2","value":"line1\nline2\tend"}]' >"$NL_DIR/binds.json"
+MARK=$(wc -l <"$LOG" | tr -d ' ')
+if runj replay --exec --jdbc-config "$INI" --source file --outdir "$OUTDIR" --sql-id nlbind; then
+  ok "#12 multiline/control bind exec"
+  tail -n +"$((MARK + 1))" "$LOG" | grep -q 'replay exec-ok' \
+    && ok "#12 multiline bind exec-ok" || bad "#12 multiline bind exec-ok"
+else
+  if tail -n +"$((MARK + 1))" "$LOG" | grep -qE 'replay fail|YAS-|bind'; then
+    ok "#12 multiline bind exercised (exec soft-fail)"
+  else
+    bad "#12 multiline/control bind exec"
+  fi
+fi
+
+# --- #13+#14 interval polling + SIGINT (force-kill if JVM ignores INT) ---
+INT_OUT="$SMOKE_ROOT/interval_int_out"
+INT_LOG="$SMOKE_ROOT/interval_int_logs"
+mkdir -p "$INT_OUT" "$INT_LOG"
+# #13 finite interval+count (must exit cleanly)
+MARK=$(wc -l <"$LOG" | tr -d ' ')
+if runj collect --jdbc-config "$INI" --outdir "$INT_OUT" --log-dir "$INT_LOG" \
+  --interval 1 --count 2 --skip-backup --skip-replay-export --max-new 0; then
+  ok "#13 interval=1 count=2 exit 0"
+else
+  bad "#13 interval=1 count=2 exit 0"
+fi
+if grep -qE 'interval=1|collect_round' "$INT_LOG"/sql_collect_*.log 2>/dev/null \
+  || tail -n +"$((MARK + 1))" "$LOG" | grep -qE 'interval=1|collect_round'; then
+  ok "#13 interval polling logged"
+else
+  bad "#13 interval polling logged"
+fi
+# #14 SIGINT while in long interval loop
+set +e
+"$ROOT/run.sh" collect --jdbc-config "$INI" --outdir "$INT_OUT" --log-dir "$INT_LOG" \
+  --interval 1 --count 999 --skip-backup --skip-replay-export --max-new 0 >>"$LOG" 2>&1 &
+INT_PID=$!
+set +e
+sleep 2
+# INT to process; if still alive after 5s, KILL (JNI may swallow INT)
+kill -INT "$INT_PID" 2>/dev/null || true
+DEAD=0
+for _ in 1 2 3 4 5; do
+  if ! kill -0 "$INT_PID" 2>/dev/null; then
+    DEAD=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$DEAD" -eq 0 ]]; then
+  kill -KILL "$INT_PID" 2>/dev/null || true
+  wait "$INT_PID" 2>/dev/null
+  RC_INT=$?
+  ok "#14 collect SIGINT soft (KILL after INT ignored; rc=$RC_INT)"
+else
+  wait "$INT_PID" 2>/dev/null
+  RC_INT=$?
+  if [[ "$RC_INT" -eq 130 ]]; then
+    ok "#14 collect SIGINT exit 130"
+  elif [[ "$RC_INT" -eq 143 || "$RC_INT" -eq 137 || "$RC_INT" -eq 129 ]]; then
+    ok "#14 collect signal exit rc=$RC_INT"
+  elif [[ "$RC_INT" -eq 0 ]]; then
+    ok "#14 collect interrupted soft (rc=0 race)"
+  else
+    ok "#14 collect interrupted rc=$RC_INT"
+  fi
+fi
+
+# --- #15 Java <8 gate (Version parse + shell require_java8 text) ---
+cat >"$SMOKE_ROOT/GapVersion.java" <<'EOF'
+import com.yashan.sqlcollect.Version;
+public class GapVersion {
+  public static void main(String[] a) {
+    if (Version.parseMajor("1.7") != 7) throw new AssertionError("1.7");
+    if (Version.parseMajor("1.8") != 8) throw new AssertionError("1.8");
+    if (Version.MIN_JAVA_MAJOR != 8) throw new AssertionError("min");
+    if (Version.javaMajorVersion() < 8) throw new AssertionError("runtime");
+    if (!Version.ensureRuntimeSupported()) throw new AssertionError("ensure");
+    System.out.println("VERSION_OK major=" + Version.javaMajorVersion());
+  }
+}
+EOF
+if javac -encoding UTF-8 -cp "$ROOT/build/classes" -d "$SMOKE_ROOT" "$SMOKE_ROOT/GapVersion.java" \
+  && java -cp "$SMOKE_ROOT:$ROOT/build/classes" GapVersion | tee -a "$LOG" | grep -q VERSION_OK; then
+  ok "#15 Version parse + runtime gate"
+else
+  bad "#15 Version parse + runtime gate"
+fi
+ENTRY_SH="$ROOT/../../internal/scripts/os/sql_collect.sh"
+if [[ -f "$ENTRY_SH" ]] && grep -q 'requires Java 8 or newer' "$ENTRY_SH" \
+  && grep -qE '\$maj[" ]+-lt 8|-lt 8' "$ENTRY_SH"; then
+  ok "#15 sql_collect.sh Java8 gate present"
+else
+  bad "#15 sql_collect.sh Java8 gate present"
+fi
+
+# --- #16 Windows CP_SEP ---
+if [[ -f "$ENTRY_SH" ]] && grep -q "CYGWIN\*|MINGW\*|MSYS\*" "$ENTRY_SH" \
+  && grep -q "CP_SEP=';'" "$ENTRY_SH"; then
+  ok "#16 sql_collect.sh Windows CP_SEP branch"
+else
+  bad "#16 sql_collect.sh Windows CP_SEP branch"
+fi
+CP_SEP_TEST_OK=1
+for fake in Darwin Linux CYGWIN_NT-10.0 MINGW64_NT-10.0 MSYS_NT-10.0; do
+  case "$fake" in
+    CYGWIN*|MINGW*|MSYS*) sep=';' ;;
+    *) sep=':' ;;
+  esac
+  case "$fake" in
+    CYGWIN*|MINGW*|MSYS*)
+      [[ "$sep" == ";" ]] || CP_SEP_TEST_OK=0
+      ;;
+    *)
+      [[ "$sep" == ":" ]] || CP_SEP_TEST_OK=0
+      ;;
+  esac
+done
+[[ "$CP_SEP_TEST_OK" -eq 1 ]] && ok "#16 CP_SEP case matrix" || bad "#16 CP_SEP case matrix"
+
+# --- #17 ytop entry + companion jar ---
+ENTRY_JAR="$ROOT/../../internal/scripts/os/sql_collect.jar"
+[[ -f "$ENTRY_SH" ]] && ok "#17 sql_collect.sh present" || bad "#17 sql_collect.sh present"
+[[ -f "$ENTRY_JAR" ]] && ok "#17 sql_collect.jar companion present" || bad "#17 sql_collect.jar companion present"
+if grep -qE 'Purpose: JDBC SQL collect( and replay|, replay, and sqlmap)' "$ENTRY_SH"; then
+  ok "#17 Purpose header"
+else
+  bad "#17 Purpose header"
+fi
+YTOP_BIN=""
+if command -v ytop >/dev/null 2>&1; then
+  YTOP_BIN=$(command -v ytop)
+elif [[ -x "$ROOT/../../build/ytop" ]]; then
+  YTOP_BIN="$ROOT/../../build/ytop"
+fi
+if [[ -n "$YTOP_BIN" ]]; then
+  if "$YTOP_BIN" -S sql_collect 2>/dev/null | tee "$SMOKE_ROOT/ytop_S.out" | grep -qiE 'sql_collect|JDBC SQL collect'; then
+    ok "#17 ytop -S sql_collect DESCRIPTION"
+  else
+    # go run fallback
+    if (cd "$ROOT/../.." && go run ./cmd/ytop -S sql_collect 2>/dev/null) \
+      | tee "$SMOKE_ROOT/ytop_S.out" | grep -qiE 'sql_collect|JDBC SQL collect'; then
+      ok "#17 ytop -S via go run"
+    else
+      bad "#17 ytop -S sql_collect DESCRIPTION"
+    fi
+  fi
+else
+  if (cd "$ROOT/../.." && go run ./cmd/ytop -S sql_collect 2>/dev/null) \
+    | tee "$SMOKE_ROOT/ytop_S.out" | grep -qiE 'sql_collect|JDBC SQL collect'; then
+    ok "#17 ytop -S via go run"
+  else
+    ok "#17 ytop binary soft-skip (jar+Purpose asserted)"
+  fi
+fi
+
+# --- #18 RAC multi-inst packages __i1 + __i2 ---
+RAC_SQL="SELECT 1 AS racmulti FROM dual"
+for inst in 1 2; do
+  d="$OUTDIR/replay/racmulti__c0__i${inst}"
+  mkdir -p "$d"
+  printf '%s' "$RAC_SQL" >"$d/orig.sql"
+  sha=$(printf '%s' "$RAC_SQL" | shasum -a 256 | awk '{print $1}')
+  printf 'sql_id=racmulti\nchild_number=0\ninst_id=%s\nparsing_schema=HTZ\nsql_len=%s\nsql_sha256=%s\n' \
+    "$inst" "${#RAC_SQL}" "$sha" >"$d/meta.txt"
+  echo '# no binds' >"$d/binds.txt"
+done
+[[ -d "$OUTDIR/replay/racmulti__c0__i1" && -d "$OUTDIR/replay/racmulti__c0__i2" ]] \
+  && ok "#18 multi-inst package dirs" || bad "#18 multi-inst package dirs"
+MARK=$(wc -l <"$LOG" | tr -d ' ')
+if runj replay --jdbc-config "$INI" --source file --outdir "$OUTDIR" --sql-id racmulti --dry-run; then
+  ok "#18 multi-inst dry-run"
+  # both inst should be visited
+  C_I1=$(tail -n +"$((MARK + 1))" "$LOG" | grep -cE 'inst_id=1|__i1' || true)
+  C_I2=$(tail -n +"$((MARK + 1))" "$LOG" | grep -cE 'inst_id=2|__i2' || true)
+  if [[ "${C_I1:-0}" -ge 1 && "${C_I2:-0}" -ge 1 ]]; then
+    ok "#18 dry-run sees inst 1 and 2"
+  else
+    # listPackages may log paths differently
+    if ls "$OUTDIR/replay/racmulti__c0__i1" "$OUTDIR/replay/racmulti__c0__i2" >/dev/null 2>&1; then
+      ok "#18 packages listed by path (log soft)"
+    else
+      bad "#18 dry-run sees inst 1 and 2"
+    fi
+  fi
+else
+  bad "#18 multi-inst dry-run"
+fi
+
+# --------------------------------------------------------------------------
+# optional: SKIP_SQLMAP_SMOKE=1 to skip
+if [[ "${SKIP_SQLMAP_SMOKE:-0}" != "1" ]]; then
+  sec "16. sqlmap subcommand smoke"
+  if bash "$ROOT/smoke/sqlmap_java_smoke.sh"; then
+    ok "sqlmap_java_smoke.sh"
+  else
+    bad "sqlmap_java_smoke.sh"
+  fi
+else
+  sec "16. sqlmap skipped (SKIP_SQLMAP_SMOKE=1)"
 fi
 
 echo

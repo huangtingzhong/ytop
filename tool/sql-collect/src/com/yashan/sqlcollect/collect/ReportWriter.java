@@ -10,9 +10,8 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 
 /**
- * 写入 outdir/&lt;sql_id&gt;.txt: 纯 JDBC 报告.
- * ORIGINAL/LITERAL 为 Java 改写; PLAN/objects/AWR 等为嵌入 sql.sql 的 SELECT (跳过 PL/SQL;
- * AWR 失败不中断后续段).
+ * 报告正文由 {@link JdbcReportBuilder} 生成; 落盘路径由 CollectCommand 分流:
+ * 有效报告 → outdir/reports/; 跳过/不完整 → outdir/skipped/.
  */
 public class ReportWriter {
 
@@ -38,6 +37,11 @@ public class ReportWriter {
 
     public int getReportTimeoutSec() {
         return reportTimeoutSec;
+    }
+
+    /** 是否追加 EXPLAIN PLAN 段 (默认 false; 仅 SELECT/WITH CTE). */
+    public void setExplainPlan(boolean on) {
+        builder.setExplainPlan(on);
     }
 
     /**

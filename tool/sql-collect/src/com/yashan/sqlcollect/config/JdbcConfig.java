@@ -49,7 +49,8 @@ public class JdbcConfig {
         Path p = resolvePath(path);
         if (!Files.isRegularFile(p)) {
             throw new IOException("jdbc config not found: " + p
-                    + "\n  generate: sql-collect replay --init-config");
+                    + "\n  generate: sql-collect collect --init-config"
+                    + "\n        or: sql-collect replay --init-config");
         }
         String content = new String(Files.readAllBytes(p), StandardCharsets.UTF_8).trim();
         if (content.isEmpty()) {
