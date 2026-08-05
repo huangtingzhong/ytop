@@ -384,19 +384,59 @@ func (d *Display) renderSessionMetrics(out *strings.Builder, metrics []models.Se
 	out.WriteString("\n")
 }
 
+// termCols 返回终端列数; 非 TTY 或取失败时回退 120.
+func (d *Display) termCols() int {
+	const fallback = 120
+	if d == nil || !d.isTerminal {
+		return fallback
+	}
+	w, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || w < 40 {
+		return fallback
+	}
+	return w
+}
+
+// sessionDetailWidths 按终端宽度收缩各列, 保证整行不超过 termCols.
+// 优先保留 Event (等待事件名较长), 先压缩 Program/Client/SID.
+func sessionDetailWidths(termCols int) (inst, sid, event, user, sqlID, exec, prog, client, line int) {
+	inst = 2
+	exec = 10
+	const gaps = 7 // 8 列之间 7 个空格
+
+	sid, event, user, sqlID, prog, client = 28, 24, 12, 18, 16, 16
+	minSid, minEvent, minUser, minSQL, minProg, minClient := 12, 14, 8, 13, 8, 8
+
+	line = inst + sid + event + user + sqlID + exec + prog + client + gaps
+	if termCols > 0 && line > termCols {
+		excess := line - termCols
+		widths := []*int{&prog, &client, &sid, &event, &user, &sqlID}
+		mins := []int{minProg, minClient, minSid, minEvent, minUser, minSQL}
+		for excess > 0 {
+			shrunk := false
+			for i := range widths {
+				if *widths[i] > mins[i] {
+					*widths[i]--
+					excess--
+					shrunk = true
+					if excess == 0 {
+						break
+					}
+				}
+			}
+			if !shrunk {
+				break
+			}
+		}
+		line = inst + sid + event + user + sqlID + exec + prog + client + gaps
+	}
+	return
+}
+
 // renderSessionDetails renders session details
 func (d *Display) renderSessionDetails(out *strings.Builder, details []models.SessionDetail) {
-	// Column widths
-	instWidth := 2
-	sidWidth := 30
-	eventWidth := 20
-	usernameWidth := 15
-	sqlIDWidth := 20
-	execTimeWidth := 10
-	programWidth := 20
-	clientWidth := 20
-
-	detailLineWidth := instWidth + 1 + sidWidth + 1 + eventWidth + 1 + usernameWidth + 1 + sqlIDWidth + 1 + execTimeWidth + 1 + programWidth + 1 + clientWidth
+	instWidth, sidWidth, eventWidth, usernameWidth, sqlIDWidth, execTimeWidth, programWidth, clientWidth, detailLineWidth :=
+		sessionDetailWidths(d.termCols())
 	detailSep := strings.Repeat("-", detailLineWidth)
 
 	out.WriteString(d.colorize(fmt.Sprintf("Active Sessions TOP %d (By Execution Time)\n", d.cfg.SessionDetailTopN), "yellow"))
@@ -408,27 +448,27 @@ func (d *Display) renderSessionDetails(out *strings.Builder, details []models.Se
 		return
 	}
 
-	// Header
-	out.WriteString(d.colorize(fmt.Sprintf("%*s", instWidth, "I"), "bold"))
+	// Header (与数据行同宽, 强制截断)
+	out.WriteString(d.colorize(fmt.Sprintf("%*s", instWidth, d.truncate("I", instWidth)), "bold"))
 	out.WriteString(" ")
-	out.WriteString(d.colorize(fmt.Sprintf("%-*s", sidWidth, "SID_TID"), "bold"))
+	out.WriteString(d.colorize(fmt.Sprintf("%-*s", sidWidth, d.truncate("SID_TID", sidWidth)), "bold"))
 	out.WriteString(" ")
-	out.WriteString(d.colorize(fmt.Sprintf("%-*s", eventWidth, "Event"), "bold"))
+	out.WriteString(d.colorize(fmt.Sprintf("%-*s", eventWidth, d.truncate("Event", eventWidth)), "bold"))
 	out.WriteString(" ")
-	out.WriteString(d.colorize(fmt.Sprintf("%-*s", usernameWidth, "Username"), "bold"))
+	out.WriteString(d.colorize(fmt.Sprintf("%-*s", usernameWidth, d.truncate("Username", usernameWidth)), "bold"))
 	out.WriteString(" ")
-	out.WriteString(d.colorize(fmt.Sprintf("%-*s", sqlIDWidth, "SQL ID"), "bold"))
+	out.WriteString(d.colorize(fmt.Sprintf("%-*s", sqlIDWidth, d.truncate("SQL ID", sqlIDWidth)), "bold"))
 	out.WriteString(" ")
-	out.WriteString(d.colorize(fmt.Sprintf("%-*s", execTimeWidth, "Exec Time"), "bold"))
+	out.WriteString(d.colorize(fmt.Sprintf("%-*s", execTimeWidth, d.truncate("Exec Time", execTimeWidth)), "bold"))
 	out.WriteString(" ")
-	out.WriteString(d.colorize(fmt.Sprintf("%-*s", programWidth, "Program"), "bold"))
+	out.WriteString(d.colorize(fmt.Sprintf("%-*s", programWidth, d.truncate("Program", programWidth)), "bold"))
 	out.WriteString(" ")
-	out.WriteString(d.colorize(fmt.Sprintf("%-*s", clientWidth, "Client"), "bold"))
+	out.WriteString(d.colorize(fmt.Sprintf("%-*s", clientWidth, d.truncate("Client", clientWidth)), "bold"))
 	out.WriteString("\n")
 	out.WriteString(detailSep)
 	out.WriteString("\n")
 
-	// Data rows
+	// Data rows: 所有列强制截断到列宽, 避免撑破折行
 	for _, s := range details {
 		out.WriteString(fmt.Sprintf("%*d", instWidth, s.InstID))
 		out.WriteString(" ")
@@ -440,7 +480,7 @@ func (d *Display) renderSessionDetails(out *strings.Builder, details []models.Se
 		out.WriteString(" ")
 		out.WriteString(fmt.Sprintf("%-*s", sqlIDWidth, d.truncate(s.SqlID, sqlIDWidth)))
 		out.WriteString(" ")
-		out.WriteString(fmt.Sprintf("%-*s", execTimeWidth, s.ExecTime))
+		out.WriteString(fmt.Sprintf("%-*s", execTimeWidth, d.truncate(s.ExecTime, execTimeWidth)))
 		out.WriteString(" ")
 		out.WriteString(fmt.Sprintf("%-*s", programWidth, d.truncate(s.Program, programWidth)))
 		out.WriteString(" ")
@@ -506,12 +546,20 @@ func (d *Display) center(text string, width int) string {
 	return strings.Repeat(" ", padding) + text
 }
 
-// truncate truncates text to specified length
+// truncate 按 rune 截断到不超过 length; 超长时末尾加 "...".
+// 保证返回值 rune 数 <= length, 配合 %-*s 后视觉宽度不超过列宽.
 func (d *Display) truncate(text string, length int) string {
-	if len(text) <= length {
-		return text
+	if length <= 0 {
+		return ""
 	}
-	return text[:length-3] + "..."
+	r := []rune(text)
+	if len(r) <= length {
+		return string(r)
+	}
+	if length <= 3 {
+		return string(r[:length])
+	}
+	return string(r[:length-3]) + "..."
 }
 
 // formatNumber formats a number with K/M/G suffixes

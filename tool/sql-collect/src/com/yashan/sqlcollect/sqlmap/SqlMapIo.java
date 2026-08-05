@@ -52,6 +52,7 @@ public final class SqlMapIo {
             try {
                 List<BindValue> binds = SqlLookup.loadBindsBySqlId(sess.getConnection(), sqlId,
                         warn(log));
+                int filled = 0;
                 StringBuilder sb = new StringBuilder();
                 for (BindValue b : binds) {
                     String v = b.value;
@@ -59,13 +60,27 @@ public final class SqlMapIo {
                         sb.append("NULL");
                     } else {
                         sb.append(v);
+                        filled++;
                     }
                     sb.append('\n');
                 }
                 Files.write(Paths.get(out), sb.toString().getBytes(StandardCharsets.UTF_8));
-                log.logInfo("genbind sql_id=" + sqlId + " n=" + binds.size() + " out=" + out);
-                System.out.println("[OK] genbind " + out + " n=" + binds.size());
-                return 0;
+                log.logInfo("genbind sql_id=" + sqlId + " n=" + binds.size()
+                        + " filled=" + filled + " out=" + out);
+                if (binds.isEmpty()) {
+                    log.logWarn("genbind: no captured binds (last_captured empty for all children);"
+                            + " check v$sql_bind_capture / deploy latest sql_collect.jar");
+                    System.out.println("[WARN] genbind empty; no last_captured values for " + sqlId);
+                } else if (filled == 0) {
+                    log.logWarn("genbind: " + binds.size()
+                            + " slot(s) but all NULL; likely stale jar or wrong child");
+                    System.out.println("[WARN] genbind all NULL n=" + binds.size()
+                            + "; redeploy ytop/sql_collect.jar");
+                } else {
+                    System.out.println("[OK] genbind " + out + " n=" + binds.size()
+                            + " filled=" + filled);
+                }
+                return filled > 0 || binds.isEmpty() ? 0 : 1;
             } finally {
                 sess.close();
             }

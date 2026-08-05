@@ -281,12 +281,6 @@ public class CollectCommand {
                     }
                 }
             }
-            Integer maxNew = args.optInt("max-new", null);
-            if (maxNew != null && newItems.size() > maxNew) {
-                newItems = newItems.subList(0, maxNew);
-                log.logDbg("max-new cap -> " + newItems.size());
-            }
-
             log.logDbg("round collected=" + collected.size() + " candidates=" + items.size()
                     + " backup_new=" + backupNew.size() + " collect_new=" + newItems.size()
                     + " refresh=" + refreshItems.size());

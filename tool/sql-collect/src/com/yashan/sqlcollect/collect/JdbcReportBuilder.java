@@ -1,6 +1,7 @@
 package com.yashan.sqlcollect.collect;
 
 import com.yashan.sqlcollect.db.JdbcSession;
+import com.yashan.sqlcollect.db.SqlLookup;
 import com.yashan.sqlcollect.log.DualLogger;
 import com.yashan.sqlcollect.model.BindValue;
 
@@ -134,16 +135,23 @@ public class JdbcReportBuilder {
     }
 
     private CursorRow loadCursor(Connection c, String sqlId, int qTimeout) throws SQLException {
+        SqlLookup.CapturedChild prefer = SqlLookup.pickBestCapturedChild(c, sqlId);
+        if (prefer != null) {
+            CursorRow byChild = loadCursorByChild(c, sqlId, prefer.childNumber, prefer.instId, qTimeout);
+            if (byChild != null) {
+                return byChild;
+            }
+        }
         String[] queries = new String[] {
             "SELECT parsing_schema_name, child_number, NVL(inst_id,1), sql_fulltext FROM ("
-                    + " SELECT parsing_schema_name, child_number, inst_id, sql_fulltext"
-                    + "   FROM gv$sql WHERE sql_id = ?"
-                    + "  ORDER BY last_active_time DESC NULLS LAST, executions DESC NULLS LAST, child_number"
+                    + " SELECT s.parsing_schema_name, s.child_number, s.inst_id, s.sql_fulltext"
+                    + "   FROM gv$sql s WHERE s.sql_id = ?"
+                    + "  ORDER BY " + SqlLookup.ORDER_GV_PREFER_CAPTURED
                     + ") WHERE ROWNUM = 1",
             "SELECT parsing_schema_name, child_number, 1, sql_fulltext FROM ("
-                    + " SELECT parsing_schema_name, child_number, sql_fulltext"
-                    + "   FROM v$sql WHERE sql_id = ?"
-                    + "  ORDER BY last_active_time DESC NULLS LAST, executions DESC NULLS LAST, child_number"
+                    + " SELECT s.parsing_schema_name, s.child_number, s.sql_fulltext"
+                    + "   FROM v$sql s WHERE s.sql_id = ?"
+                    + "  ORDER BY " + SqlLookup.ORDER_V_PREFER_CAPTURED
                     + ") WHERE ROWNUM = 1"
         };
         for (String q : queries) {
@@ -172,60 +180,56 @@ public class JdbcReportBuilder {
         return null;
     }
 
-    private List<BindValue> loadBinds(Connection c, String sqlId, int child, int instId, int qTimeout)
+    private CursorRow loadCursorByChild(Connection c, String sqlId, int child, int instId, int qTimeout)
             throws SQLException {
-        List<BindValue> binds = new ArrayList<BindValue>();
-        String qGv = "SELECT position, name, datatype_string, value_string, was_captured "
-                + "FROM gv$sql_bind_capture WHERE sql_id = ? AND child_number = ? AND inst_id = ? "
-                + "ORDER BY position, name";
-        String qV = "SELECT position, name, datatype_string, value_string, was_captured "
-                + "FROM v$sql_bind_capture WHERE sql_id = ? AND child_number = ? "
-                + "ORDER BY position, name";
-        try {
-            try (PreparedStatement ps = c.prepareStatement(qGv)) {
+        String[] queries = new String[] {
+            "SELECT parsing_schema_name, child_number, NVL(inst_id,1), sql_fulltext FROM gv$sql "
+                    + "WHERE sql_id = ? AND child_number = ? AND NVL(inst_id,1) = ? AND ROWNUM = 1",
+            "SELECT parsing_schema_name, child_number, 1, sql_fulltext FROM v$sql "
+                    + "WHERE sql_id = ? AND child_number = ? AND ROWNUM = 1",
+            "SELECT parsing_schema_name, child_number, NVL(inst_id,1), sql_fulltext FROM gv$sql "
+                    + "WHERE sql_id = ? AND child_number = ? AND ROWNUM = 1"
+        };
+        for (int qi = 0; qi < queries.length; qi++) {
+            try (PreparedStatement ps = c.prepareStatement(queries[qi])) {
                 if (qTimeout > 0) {
                     ps.setQueryTimeout(qTimeout);
                 }
                 ps.setString(1, sqlId);
                 ps.setInt(2, child);
-                ps.setInt(3, instId);
+                if (qi == 0) {
+                    ps.setInt(3, instId);
+                }
                 try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        binds.add(readBind(rs));
+                    if (!rs.next()) {
+                        continue;
                     }
+                    CursorRow row = new CursorRow();
+                    row.schema = rs.getString(1);
+                    row.child = rs.getInt(2);
+                    row.instId = rs.getInt(3);
+                    row.sqlText = JdbcSession.readClob(rs.getClob(4));
+                    return row;
                 }
-            }
-        } catch (SQLException e) {
-            if (log != null) {
-                log.logDbg("report binds gv$ failed: " + e.getMessage());
-            }
-        }
-        if (!binds.isEmpty()) {
-            return binds;
-        }
-        try (PreparedStatement ps = c.prepareStatement(qV)) {
-            if (qTimeout > 0) {
-                ps.setQueryTimeout(qTimeout);
-            }
-            ps.setString(1, sqlId);
-            ps.setInt(2, child);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    binds.add(readBind(rs));
+            } catch (SQLException e) {
+                if (log != null) {
+                    log.logDbg("report cursor by child failed: " + e.getMessage());
                 }
             }
         }
-        return binds;
+        return null;
     }
 
-    private static BindValue readBind(ResultSet rs) throws SQLException {
-        BindValue b = new BindValue();
-        b.position = rs.getInt(1);
-        b.name = nvl(rs.getString(2));
-        b.datatype = nvl(rs.getString(3));
-        b.value = nvl(rs.getString(4));
-        b.wasCaptured = nvl(rs.getString(5));
-        return b;
+    private List<BindValue> loadBinds(Connection c, String sqlId, int child, int instId, int qTimeout)
+            throws SQLException {
+        // qTimeout 暂不透传; 与 export/genbind 同源: gv$/v$/HTZ 择优 filled
+        return SqlLookup.loadBinds(c, sqlId, child, instId, new SqlLookup.WarnOut() {
+            public void warn(String msg) {
+                if (log != null) {
+                    log.logDbg("report binds: " + msg);
+                }
+            }
+        });
     }
 
     private static String nvl(String s) {

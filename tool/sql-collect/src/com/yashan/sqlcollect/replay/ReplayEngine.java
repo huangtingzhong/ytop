@@ -277,14 +277,30 @@ public class ReplayEngine {
         Connection cLookup = connectAs(lookupUser, lookupPass);
         out.println("replay lookup-user=" + lookupUser);
         try {
+            // 与 collect/sqlmap 一致: 先按 last_captured 非空选 child, 再取该 child 文本与绑定
+            com.yashan.sqlcollect.db.SqlLookup.CapturedChild prefer =
+                    com.yashan.sqlcollect.db.SqlLookup.pickBestCapturedChild(cLookup, sqlId);
+            if (prefer != null) {
+                child = prefer.childNumber;
+                instId = prefer.instId;
+                out.dbg("prefer capture child=" + child + " inst_id=" + instId
+                        + " filled=" + prefer.filled + " src=" + prefer.source);
+            }
             out.step("lookup_gv$sql", sqlId);
             try (PreparedStatement ps = cLookup.prepareStatement(
-                    "SELECT parsing_schema_name, child_number, NVL(inst_id,1), sql_fulltext FROM ("
-                            + " SELECT parsing_schema_name, child_number, inst_id, sql_fulltext"
-                            + "   FROM gv$sql WHERE sql_id = ?"
-                            + "  ORDER BY last_active_time DESC NULLS LAST, executions DESC NULLS LAST, child_number"
-                            + ") WHERE ROWNUM = 1")) {
+                    prefer != null
+                            ? ("SELECT parsing_schema_name, child_number, NVL(inst_id,1), sql_fulltext FROM gv$sql "
+                            + "WHERE sql_id = ? AND child_number = ? AND NVL(inst_id,1) = ? AND ROWNUM = 1")
+                            : ("SELECT parsing_schema_name, child_number, NVL(inst_id,1), sql_fulltext FROM ("
+                            + " SELECT s.parsing_schema_name, s.child_number, s.inst_id, s.sql_fulltext"
+                            + "   FROM gv$sql s WHERE s.sql_id = ?"
+                            + "  ORDER BY " + com.yashan.sqlcollect.db.SqlLookup.ORDER_GV_PREFER_CAPTURED
+                            + ") WHERE ROWNUM = 1"))) {
                 ps.setString(1, sqlId);
+                if (prefer != null) {
+                    ps.setInt(2, child);
+                    ps.setInt(3, instId);
+                }
                 try (ResultSet rs = ps.executeQuery()) {
                     if (rs.next()) {
                         schema = rs.getString(1);
@@ -299,15 +315,42 @@ public class ReplayEngine {
                 out.println("replay warn gv$sql " + e.getMessage());
                 out.dbg("gv$sql miss/error: " + e.getMessage());
             }
+            if (sql == null && prefer != null) {
+                // inst 对不上时放宽: 只按 child
+                try (PreparedStatement ps = cLookup.prepareStatement(
+                        "SELECT parsing_schema_name, child_number, NVL(inst_id,1), sql_fulltext FROM gv$sql "
+                                + "WHERE sql_id = ? AND child_number = ? AND ROWNUM = 1")) {
+                    ps.setString(1, sqlId);
+                    ps.setInt(2, prefer.childNumber);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            schema = rs.getString(1);
+                            child = rs.getInt(2);
+                            instId = rs.getInt(3);
+                            sql = JdbcSession.readClob(rs.getClob(4));
+                            out.dbg("gv$sql hit by child (loose inst) schema=" + schema
+                                    + " child=" + child + " inst_id=" + instId);
+                        }
+                    }
+                } catch (SQLException e) {
+                    out.dbg("gv$sql by child fail: " + e.getMessage());
+                }
+            }
             if (sql == null) {
                 out.step("lookup_v$sql", sqlId);
                 try (PreparedStatement ps = cLookup.prepareStatement(
-                        "SELECT parsing_schema_name, child_number, sql_fulltext FROM ("
-                                + " SELECT parsing_schema_name, child_number, sql_fulltext"
-                                + "   FROM v$sql WHERE sql_id = ?"
-                                + "  ORDER BY last_active_time DESC NULLS LAST, executions DESC NULLS LAST, child_number"
-                                + ") WHERE ROWNUM = 1")) {
+                        prefer != null
+                                ? ("SELECT parsing_schema_name, child_number, sql_fulltext FROM v$sql "
+                                + "WHERE sql_id = ? AND child_number = ? AND ROWNUM = 1")
+                                : ("SELECT parsing_schema_name, child_number, sql_fulltext FROM ("
+                                + " SELECT s.parsing_schema_name, s.child_number, s.sql_fulltext"
+                                + "   FROM v$sql s WHERE s.sql_id = ?"
+                                + "  ORDER BY " + com.yashan.sqlcollect.db.SqlLookup.ORDER_V_PREFER_CAPTURED
+                                + ") WHERE ROWNUM = 1"))) {
                     ps.setString(1, sqlId);
+                    if (prefer != null) {
+                        ps.setInt(2, prefer.childNumber);
+                    }
                     try (ResultSet rs = ps.executeQuery()) {
                         if (!rs.next()) {
                             out.println("replay fail sql_id not found in gv$/v$sql: " + sqlId);
@@ -316,7 +359,7 @@ public class ReplayEngine {
                         }
                         schema = rs.getString(1);
                         child = rs.getInt(2);
-                        instId = 1;
+                        instId = prefer != null ? prefer.instId : 1;
                         sql = JdbcSession.readClob(rs.getClob(3));
                         out.dbg("v$sql hit schema=" + schema + " child=" + child);
                     }
@@ -331,6 +374,20 @@ public class ReplayEngine {
             out.println("replay sql_sha256=" + ReplayPackageMeta.sha256Utf8(sql) + " (gv live; no package fingerprint)");
             out.step("load_binds_gv", "sql_id=" + sqlId + " child=" + child);
             binds = loadGvBinds(cLookup, sqlId, child, instId);
+            // 选定 child 仍无绑定 (过滤 last_captured 后为空) 时, 再按 sql_id 全局择优取一次
+            if (binds == null || binds.isEmpty()) {
+                List<String[]> byId = com.yashan.sqlcollect.db.SqlLookup.toReplayRows(
+                        com.yashan.sqlcollect.db.SqlLookup.loadBindsBySqlId(cLookup, sqlId,
+                                new com.yashan.sqlcollect.db.SqlLookup.WarnOut() {
+                                    public void warn(String msg) {
+                                        out.println("replay warn " + msg);
+                                    }
+                                }));
+                if (byId != null && !byId.isEmpty()) {
+                    binds = byId;
+                    out.println("replay binds fallback loadBindsBySqlId n=" + binds.size());
+                }
+            }
             dumpBinds(binds);
             String kind = classifySql(sql);
             out.step("resolve_creds", "schema=" + (schema == null ? "" : schema));

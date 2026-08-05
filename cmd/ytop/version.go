@@ -1,10 +1,10 @@
 package main
 
 // Version information
-// This file is automatically updated by Makefile
-// Last updated: 2026-08-05 00:50:44 UTC
+// This file is automatically updated by build.sh
+// Last updated: 2026-08-05 20:13:40 CST
 var (
-	Version   = "20260805_005044"
-	BuildTime = "2026-08-05 00:50:44 UTC"
-	GitCommit = "6593953"
+	Version   = "20260805_201339"
+	BuildTime = "2026-08-05 20:13:39 CST"
+	GitCommit = "c51f329"
 )

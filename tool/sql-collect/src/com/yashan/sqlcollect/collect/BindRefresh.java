@@ -1,6 +1,7 @@
 package com.yashan.sqlcollect.collect;
 
 import com.yashan.sqlcollect.db.JdbcSession;
+import com.yashan.sqlcollect.db.SqlLookup;
 import com.yashan.sqlcollect.model.BindValue;
 import com.yashan.sqlcollect.util.JsonBinds;
 import com.yashan.sqlcollect.util.PipeEscape;
@@ -138,9 +139,9 @@ public class BindRefresh {
     private Integer captureFilledCount(Connection c, String sqlId) {
         String[] queries = new String[] {
             "SELECT COUNT(*) FROM gv$sql_bind_capture b "
-                    + "WHERE b.sql_id = ? AND b.value_string IS NOT NULL AND TRIM(b.value_string) <> ''",
+                    + "WHERE b.sql_id = ? AND " + SqlLookup.PRED_B_FILLED,
             "SELECT COUNT(*) FROM v$sql_bind_capture b "
-                    + "WHERE b.sql_id = ? AND b.value_string IS NOT NULL AND TRIM(b.value_string) <> ''"
+                    + "WHERE b.sql_id = ? AND " + SqlLookup.PRED_B_FILLED
         };
         for (String q : queries) {
             try (PreparedStatement ps = c.prepareStatement(q)) {

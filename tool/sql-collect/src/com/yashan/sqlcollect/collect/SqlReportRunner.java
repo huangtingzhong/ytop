@@ -5,16 +5,17 @@ import com.yashan.sqlcollect.log.DualLogger;
 
 import java.io.IOException;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
  * JDBC 执行报告 SELECT 段 ({@link ReportSelectScript}: PLAN / sqlarea / AWR / objects).
  * ORIGINAL/LITERAL 由 {@link JdbcReportBuilder} 纯 Java 写出.
+ * sql_id 一律 JDBC ? 绑定, 避免字面量替换撑爆 share pool.
  */
 public class SqlReportRunner {
 
@@ -24,11 +25,85 @@ public class SqlReportRunner {
         this.log = log;
     }
 
-    static String substituteSqlId(String template, String sqlId) {
-        String safe = sqlId == null ? "" : sqlId.replace("'", "''");
-        String s = template.replace("&&sqlid", safe);
+    /**
+     * 仅用于 PROMPT 展示文案; 不再用于可执行 SQL.
+     */
+    static String substituteSqlIdForDisplay(String template, String sqlId) {
+        String safe = sqlId == null ? "" : sqlId;
+        String s = template == null ? "" : template;
+        s = s.replace("&&sqlid", safe);
         s = s.replace("&sqlid", safe);
         return s;
+    }
+
+    /** @deprecated 使用 {@link #rewriteSqlIdToBinds(String)} */
+    static String substituteSqlId(String template, String sqlId) {
+        return substituteSqlIdForDisplay(template, sqlId);
+    }
+
+    /** 改写结果: SQL 文本 + 需要 setString 的 ? 个数 (均为 sql_id). */
+    static final class Rewrite {
+        final String sql;
+        final int bindCount;
+
+        Rewrite(String sql, int bindCount) {
+            this.sql = sql == null ? "" : sql;
+            this.bindCount = bindCount < 0 ? 0 : bindCount;
+        }
+    }
+
+    /**
+     * 将模板中的 sql_id 占位改为 JDBC ?.
+     * 顺序: 先处理带引号的 '&&sqlid'/'&sqlid', 再处理残留 &&sqlid/&sqlid
+     * (如字符串内 sql_id=&&sqlid → 拼成 ...|| ? || ...).
+     */
+    static Rewrite rewriteSqlIdToBinds(String sql) {
+        if (sql == null || sql.isEmpty()) {
+            return new Rewrite("", 0);
+        }
+        int binds = 0;
+        String s = sql;
+        String[] quoted = new String[] {"'&&sqlid'", "'&sqlid'"};
+        for (int t = 0; t < quoted.length; t++) {
+            String token = quoted[t];
+            int idx;
+            while ((idx = indexOfIgnoreCase(s, token)) >= 0) {
+                s = s.substring(0, idx) + "?" + s.substring(idx + token.length());
+                binds++;
+            }
+        }
+        // 残留: 字符串内嵌入的 &&sqlid / &sqlid (须先 && 再 &)
+        String[] bare = new String[] {"&&sqlid", "&sqlid"};
+        for (int t = 0; t < bare.length; t++) {
+            String token = bare[t];
+            int idx;
+            while ((idx = indexOfIgnoreCase(s, token)) >= 0) {
+                s = s.substring(0, idx) + "' || ? || '" + s.substring(idx + token.length());
+                binds++;
+            }
+        }
+        return new Rewrite(s, binds);
+    }
+
+    /** 大小写不敏感查找 (占位符本身为小写 sqlid, 兼容 SQLID). */
+    static int indexOfIgnoreCase(String hay, String needle) {
+        if (hay == null || needle == null || needle.isEmpty()) {
+            return -1;
+        }
+        final int nlen = needle.length();
+        final int max = hay.length() - nlen;
+        outer:
+        for (int i = 0; i <= max; i++) {
+            for (int j = 0; j < nlen; j++) {
+                char a = hay.charAt(i + j);
+                char b = needle.charAt(j);
+                if (a != b && Character.toUpperCase(a) != Character.toUpperCase(b)) {
+                    continue outer;
+                }
+            }
+            return i;
+        }
+        return -1;
     }
 
     static String loadTemplate() {
@@ -155,6 +230,7 @@ public class SqlReportRunner {
     /**
      * 追加 PLAN 起的 PROMPT+SELECT ({@link ReportSelectScript}).
      * AWR 失败写 [ERROR] AWR 并继续; 跳过 PLSQL.
+     * 可执行 SQL 使用 ? 绑定 sql_id, 不把字面量嵌进 SQL 文本.
      */
     public void appendFromPlan(JdbcSession session, String sqlId, StringBuilder out,
             long deadlineMs, int timeoutSec) throws SQLException, IOException {
@@ -166,8 +242,8 @@ public class SqlReportRunner {
             }
             return;
         }
-        String script = substituteSqlId(template, sqlId);
-        List<Segment> segs = parse(script);
+        // 保留模板中的 &&sqlid, 解析后再按段绑定; 避免整脚本字面量替换
+        List<Segment> segs = parse(template);
         int start = -1;
         for (int i = 0; i < segs.size(); i++) {
             Segment seg = segs.get(i);
@@ -198,11 +274,11 @@ public class SqlReportRunner {
                     if (isAwrPrompt(seg.text)) {
                         nextSqlIsAwr = true;
                     }
-                    out.append(seg.text).append('\n');
+                    out.append(substituteSqlIdForDisplay(seg.text, sqlId)).append('\n');
                     break;
                 case SQL:
                     try {
-                        executeQuery(c, seg.text, out, stmtTimeout);
+                        executeQuery(c, seg.text, sqlId, out, stmtTimeout);
                     } catch (SQLException e) {
                         if (nextSqlIsAwr) {
                             // P2: AWR 失败不中断 OBJECT SIZE 等后续段
@@ -243,72 +319,102 @@ public class SqlReportRunner {
         return u.contains("AWR") || u.contains("WRH$_SQLSTAT");
     }
 
+    /**
+     * 执行报告 SELECT: sql_id 经 ? 绑定.
+     */
+    static void executeQuery(Connection c, String sql, String sqlId, StringBuilder out,
+                             int queryTimeoutSec) throws SQLException {
+        Rewrite rw = rewriteSqlIdToBinds(sql);
+        if (rw.bindCount <= 0) {
+            // 模板段应至少含一处 sql_id; 无占位则仍用 PreparedStatement 防误用 Statement
+            try (PreparedStatement ps = c.prepareStatement(rw.sql)) {
+                if (queryTimeoutSec > 0) {
+                    ps.setQueryTimeout(queryTimeoutSec);
+                }
+                consumeResult(ps.executeQuery(), out);
+            }
+            return;
+        }
+        try (PreparedStatement ps = c.prepareStatement(rw.sql)) {
+            if (queryTimeoutSec > 0) {
+                ps.setQueryTimeout(queryTimeoutSec);
+            }
+            String id = sqlId == null ? "" : sqlId;
+            for (int i = 1; i <= rw.bindCount; i++) {
+                ps.setString(i, id);
+            }
+            consumeResult(ps.executeQuery(), out);
+        }
+    }
+
+    /** 兼容旧签名: 无 sqlId 时不做绑定改写 (仅测试/遗留). */
     static void executeQuery(Connection c, String sql, StringBuilder out, int queryTimeoutSec)
             throws SQLException {
-        try (Statement st = c.createStatement()) {
-            if (queryTimeoutSec > 0) {
-                st.setQueryTimeout(queryTimeoutSec);
-            }
-            try (ResultSet rs = st.executeQuery(sql)) {
-                ResultSetMetaData md = rs.getMetaData();
-                int cols = md.getColumnCount();
-                if (cols == 1) {
-                    while (rs.next()) {
-                        String v = rs.getString(1);
-                        out.append(v == null ? "" : v).append('\n');
-                    }
-                    return;
-                }
-                int[] widths = new int[cols];
-                String[] headers = new String[cols];
-                for (int i = 1; i <= cols; i++) {
-                    headers[i - 1] = md.getColumnLabel(i);
-                    widths[i - 1] = Math.max(headers[i - 1].length(), 1);
-                }
-                List<String[]> rows = new ArrayList<String[]>();
+        executeQuery(c, sql, null, out, queryTimeoutSec);
+    }
+
+    private static void consumeResult(ResultSet rs, StringBuilder out) throws SQLException {
+        try {
+            ResultSetMetaData md = rs.getMetaData();
+            int cols = md.getColumnCount();
+            if (cols == 1) {
                 while (rs.next()) {
-                    String[] row = new String[cols];
-                    for (int i = 1; i <= cols; i++) {
-                        String v = rs.getString(i);
-                        if (v == null) {
-                            v = "";
-                        }
-                        v = v.replace('\n', ' ').replace('\r', ' ');
-                        row[i - 1] = v;
-                        if (v.length() > widths[i - 1]) {
-                            widths[i - 1] = Math.min(v.length(), 80);
-                        }
-                    }
-                    rows.add(row);
+                    String v = rs.getString(1);
+                    out.append(v == null ? "" : v).append('\n');
                 }
-                for (int i = 0; i < cols; i++) {
-                    out.append(pad(headers[i], widths[i]));
-                    if (i < cols - 1) {
-                        out.append(' ');
+                return;
+            }
+            int[] widths = new int[cols];
+            String[] headers = new String[cols];
+            for (int i = 1; i <= cols; i++) {
+                headers[i - 1] = md.getColumnLabel(i);
+                widths[i - 1] = Math.max(headers[i - 1].length(), 1);
+            }
+            List<String[]> rows = new ArrayList<String[]>();
+            while (rs.next()) {
+                String[] row = new String[cols];
+                for (int i = 1; i <= cols; i++) {
+                    String v = rs.getString(i);
+                    if (v == null) {
+                        v = "";
                     }
-                }
-                out.append('\n');
-                for (int i = 0; i < cols; i++) {
-                    out.append(repeat('-', widths[i]));
-                    if (i < cols - 1) {
-                        out.append(' ');
+                    v = v.replace('\n', ' ').replace('\r', ' ');
+                    row[i - 1] = v;
+                    if (v.length() > widths[i - 1]) {
+                        widths[i - 1] = Math.min(v.length(), 80);
                     }
                 }
-                out.append('\n');
-                for (String[] row : rows) {
-                    for (int i = 0; i < cols; i++) {
-                        String v = row[i];
-                        if (v.length() > widths[i]) {
-                            v = v.substring(0, widths[i]);
-                        }
-                        out.append(pad(v, widths[i]));
-                        if (i < cols - 1) {
-                            out.append(' ');
-                        }
-                    }
-                    out.append('\n');
+                rows.add(row);
+            }
+            for (int i = 0; i < cols; i++) {
+                out.append(pad(headers[i], widths[i]));
+                if (i < cols - 1) {
+                    out.append(' ');
                 }
             }
+            out.append('\n');
+            for (int i = 0; i < cols; i++) {
+                out.append(repeat('-', widths[i]));
+                if (i < cols - 1) {
+                    out.append(' ');
+                }
+            }
+            out.append('\n');
+            for (String[] row : rows) {
+                for (int i = 0; i < cols; i++) {
+                    String v = row[i];
+                    if (v.length() > widths[i]) {
+                        v = v.substring(0, widths[i]);
+                    }
+                    out.append(pad(v, widths[i]));
+                    if (i < cols - 1) {
+                        out.append(' ');
+                    }
+                }
+                out.append('\n');
+            }
+        } finally {
+            rs.close();
         }
     }
 

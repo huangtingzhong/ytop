@@ -1,7 +1,7 @@
 -- File Name: sql.sql
 -- Purpose: YashanDB SQL tuning report (ORIGINAL+LITERAL SQL, plan, objects)
 -- Created: 20251201  by  huangtingzhong
--- Updated: 20260803 by huangtingzhong (ORIGINAL=executed CLOB; >32K chunked)
+-- Updated: 20260805 by huangtingzhong (fast bind pick: last_captured filter + PL/SQL position dedupe)
 
 set heading on;
 set serveroutput on;
@@ -23,14 +23,20 @@ DECLARE
   ln_hash           NUMBER;
   ln_phv            NUMBER;
   ln_sql_len        NUMBER;
-  lvc_repl          VARCHAR2(2000);
+  lvc_repl          VARCHAR2(8000);
   lvc_bind          VARCHAR2(200);
   lvc_name          VARCHAR2(64);
+  lvc_sql_tmp       VARCHAR2(32767);
 
   ln_bind_count     NUMBER := 0;
   ln_sql_cnt        NUMBER := 0;
   ln_qpos           NUMBER;
 
+  -- 已处理的 bind position (同 child 多 ADDRESS 时去重)
+  TYPE t_pos_seen IS TABLE OF PLS_INTEGER INDEX BY PLS_INTEGER;
+  v_pos_seen        t_pos_seen;
+
+  -- 轻量游标: 只过滤 last_captured; 多 ADDRESS 在循环里按 position 去重
   CURSOR c1(p_child NUMBER) IS
     SELECT child_number,
            name,
@@ -41,7 +47,10 @@ DECLARE
       FROM v$sql_bind_capture
      WHERE sql_id = c_sqlid
        AND child_number = p_child
-     ORDER BY position;
+       AND last_captured IS NOT NULL
+     ORDER BY last_captured DESC NULLS LAST,
+              CASE WHEN name IS NOT NULL AND TRIM(name) <> '?' THEN 0 ELSE 1 END,
+              position;
 
   PROCEDURE put_clob(p_text IN CLOB) IS
     v_len NUMBER;
@@ -132,17 +141,35 @@ DECLARE
   END replace_first_outside_quotes;
 
   FUNCTION bind_pattern(p_name IN VARCHAR2) RETURN VARCHAR2 IS
+    v_bare VARCHAR2(128);
   BEGIN
-    IF p_name LIKE ':SYS_B_%' THEN
-      RETURN ':"' || SUBSTR(p_name, 2) || '"';
-    ELSIF p_name LIKE ':%' THEN
-      RETURN p_name;
-    ELSIF p_name IS NOT NULL AND LENGTH(TRIM(p_name)) > 0 THEN
-      RETURN ':' || LTRIM(p_name, ':');
-    ELSE
+    IF p_name IS NULL OR LENGTH(TRIM(p_name)) = 0 OR TRIM(p_name) = '?' THEN
       RETURN NULL;
     END IF;
+    -- SYS_B: SQL text usually :SYS_B_0 (unquoted); some tools use :"SYS_B_0"
+    IF UPPER(LTRIM(p_name, ':')) LIKE 'SYS_B_%'
+       OR UPPER(REPLACE(LTRIM(p_name, ':'), '"', '')) LIKE 'SYS_B_%' THEN
+      v_bare := REPLACE(LTRIM(p_name, ':'), '"', '');
+      RETURN ':' || v_bare;
+    ELSIF p_name LIKE ':%' THEN
+      RETURN p_name;
+    ELSE
+      RETURN ':' || LTRIM(p_name, ':');
+    END IF;
   END bind_pattern;
+
+  FUNCTION bind_pattern_alt(p_name IN VARCHAR2) RETURN VARCHAR2 IS
+    v_bare VARCHAR2(128);
+  BEGIN
+    IF p_name IS NULL OR LENGTH(TRIM(p_name)) = 0 OR TRIM(p_name) = '?' THEN
+      RETURN NULL;
+    END IF;
+    IF UPPER(REPLACE(LTRIM(p_name, ':'), '"', '')) LIKE 'SYS_B_%' THEN
+      v_bare := REPLACE(LTRIM(p_name, ':'), '"', '');
+      RETURN ':"' || v_bare || '"';
+    END IF;
+    RETURN NULL;
+  END bind_pattern_alt;
 
   FUNCTION uses_question_bind(p_text IN VARCHAR2) RETURN BOOLEAN IS
     v_pos      PLS_INTEGER := 1;
@@ -181,32 +208,74 @@ BEGIN
     RETURN;
   END IF;
 
-  -- ORIGINAL = executed cursor text in library cache (most recently active)
-  SELECT sql_fulltext,
-         parsing_schema_name,
-         child_number,
-         hash_value,
-         plan_hash_value,
-         NVL(DBMS_LOB.GETLENGTH(sql_fulltext), 0)
-    INTO lvc_orig_sql_text,
-         lvc_name,
-         ln_exec_child,
-         ln_hash,
-         ln_phv,
-         ln_sql_len
-    FROM (
-           SELECT sql_fulltext,
-                  parsing_schema_name,
-                  child_number,
-                  hash_value,
-                  plan_hash_value
-             FROM v$sql
-            WHERE sql_id = c_sqlid
-            ORDER BY last_active_time DESC NULLS LAST,
-                     executions DESC NULLS LAST,
-                     child_number
-         )
-   WHERE ROWNUM = 1;
+  -- 选 child: 有 last_captured 的最新一条所在 child (单次轻量扫描, 无相关子查询)
+  BEGIN
+    SELECT child_number
+      INTO ln_exec_child
+      FROM (
+             SELECT child_number
+               FROM v$sql_bind_capture
+              WHERE sql_id = c_sqlid
+                AND last_captured IS NOT NULL
+              ORDER BY last_captured DESC NULLS LAST, child_number
+           )
+     WHERE ROWNUM = 1;
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      ln_exec_child := NULL;
+  END;
+
+  IF ln_exec_child IS NOT NULL THEN
+    BEGIN
+      SELECT sql_fulltext,
+             parsing_schema_name,
+             child_number,
+             hash_value,
+             plan_hash_value,
+             NVL(DBMS_LOB.GETLENGTH(sql_fulltext), 0)
+        INTO lvc_orig_sql_text,
+             lvc_name,
+             ln_exec_child,
+             ln_hash,
+             ln_phv,
+             ln_sql_len
+        FROM v$sql
+       WHERE sql_id = c_sqlid
+         AND child_number = ln_exec_child
+         AND ROWNUM = 1;
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        ln_exec_child := NULL;
+    END;
+  END IF;
+
+  IF ln_exec_child IS NULL THEN
+    SELECT sql_fulltext,
+           parsing_schema_name,
+           child_number,
+           hash_value,
+           plan_hash_value,
+           NVL(DBMS_LOB.GETLENGTH(sql_fulltext), 0)
+      INTO lvc_orig_sql_text,
+           lvc_name,
+           ln_exec_child,
+           ln_hash,
+           ln_phv,
+           ln_sql_len
+      FROM (
+             SELECT s.sql_fulltext,
+                    s.parsing_schema_name,
+                    s.child_number,
+                    s.hash_value,
+                    s.plan_hash_value
+               FROM v$sql s
+              WHERE s.sql_id = c_sqlid
+              ORDER BY s.last_active_time DESC NULLS LAST,
+                       s.executions DESC NULLS LAST,
+                       s.child_number
+           )
+     WHERE ROWNUM = 1;
+  END IF;
 
   DBMS_OUTPUT.PUT_LINE('===== ORIGINAL SQL =====');
   DBMS_OUTPUT.PUT_LINE(
@@ -224,7 +293,9 @@ BEGIN
     INTO ln_bind_count
     FROM v$sql_bind_capture
    WHERE sql_id = c_sqlid
-     AND child_number = ln_exec_child;
+     AND child_number = ln_exec_child
+     AND last_captured IS NOT NULL
+     AND ROWNUM = 1;
 
   IF ln_bind_count = 0 THEN
     DBMS_OUTPUT.PUT_LINE('===== LITERAL SQL =====');
@@ -250,8 +321,13 @@ BEGIN
 
   -- short SQL: bind rewrite on VARCHAR2 copy of executed text
   lvc_sql_text := DBMS_LOB.SUBSTR(lvc_orig_sql_text, ln_sql_len, 1);
+  v_pos_seen.DELETE;
 
   FOR r1 IN c1(ln_exec_child) LOOP
+    -- 同 position 多 ADDRESS: 已按 last_captured DESC 排序, 只处理第一次
+    IF NOT v_pos_seen.EXISTS(r1.position) THEN
+    v_pos_seen(r1.position) := 1;
+
     IF (r1.child_number <> ln_child) THEN
       IF ln_child <> 10000 THEN
         DBMS_OUTPUT.PUT_LINE('===== LITERAL SQL =====');
@@ -278,19 +354,48 @@ BEGIN
     IF r1.value_string IS NULL THEN
       lvc_repl := 'NULL';
     ELSIF r1.datatype_string = 'NUMBER' THEN
-      lvc_repl := r1.value_string;
+      IF LENGTH(r1.value_string) > 7900 THEN
+        lvc_repl := SUBSTR(r1.value_string, 1, 7900);
+      ELSE
+        lvc_repl := r1.value_string;
+      END IF;
     ELSIF r1.datatype_string = 'DATE' THEN
-      lvc_repl := 'to_date(''' || r1.value_string || ''')';
+      lvc_repl := 'to_date(''' || REPLACE(SUBSTR(NVL(r1.value_string, ''), 1, 7800), '''', '''''') || ''')';
     ELSIF r1.datatype_string LIKE 'TIMESTAMP%' THEN
-      lvc_repl := 'to_timestamp(''' || r1.value_string || ''')';
+      lvc_repl := 'to_timestamp(''' || REPLACE(SUBSTR(NVL(r1.value_string, ''), 1, 7800), '''', '''''') || ''')';
     ELSE
-      lvc_repl := '''' || REPLACE(r1.value_string, '''', '''''') || '''';
+      -- avoid YAS-04412 when value_string exceeds old VARCHAR2(2000) repl buffer
+      lvc_repl := '''' || REPLACE(SUBSTR(NVL(r1.value_string, ''), 1, 7800), '''', '''''') || '''';
+      IF LENGTH(NVL(r1.value_string, '')) > 7800 THEN
+        lvc_repl := lvc_repl || ' /*truncated*/';
+      END IF;
     END IF;
 
     lvc_bind := bind_pattern(r1.name);
 
-    IF lvc_bind IS NOT NULL AND NOT uses_question_bind(lvc_sql_text) THEN
-      lvc_sql_text := replace_first_outside_quotes(lvc_sql_text, lvc_bind, lvc_repl);
+    -- 命名占位优先; 失败再回退第一个 ?
+    IF lvc_bind IS NOT NULL THEN
+      lvc_sql_tmp := replace_first_outside_quotes(lvc_sql_text, lvc_bind, lvc_repl);
+      IF lvc_sql_tmp = lvc_sql_text AND bind_pattern_alt(r1.name) IS NOT NULL THEN
+        lvc_sql_tmp := replace_first_outside_quotes(
+          lvc_sql_text, bind_pattern_alt(r1.name), lvc_repl);
+      END IF;
+      IF lvc_sql_tmp <> lvc_sql_text THEN
+        lvc_sql_text := lvc_sql_tmp;
+      ELSE
+        ln_qpos := INSTR(lvc_sql_text, '?');
+        IF ln_qpos = 0 THEN
+          DBMS_OUTPUT.PUT_LINE(
+            'ERROR: no placeholder for bind position=' || r1.position
+            || ', name=' || NVL(r1.name, '(null)')
+          );
+          RETURN;
+        END IF;
+        lvc_sql_text :=
+          SUBSTR(lvc_sql_text, 1, ln_qpos - 1) ||
+          lvc_repl ||
+          SUBSTR(lvc_sql_text, ln_qpos + 1);
+      END IF;
     ELSE
       ln_qpos := INSTR(lvc_sql_text, '?');
       IF ln_qpos = 0 THEN
@@ -306,6 +411,7 @@ BEGIN
         lvc_repl ||
         SUBSTR(lvc_sql_text, ln_qpos + 1);
     END IF;
+    END IF; -- position dedupe
   END LOOP;
 
   DBMS_OUTPUT.PUT_LINE('===== LITERAL SQL =====');

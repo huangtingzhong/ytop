@@ -35,14 +35,13 @@ public class TopCommand {
 
             Path outArg = Paths.get(args.opt("outdir", CollectCommand.DEFAULT_OUTDIR));
             String runName = args.opt("run", null);
-            Path runDir;
+            Path reports;
             try {
-                runDir = resolveReportsRunDir(outArg, runName);
+                reports = resolveReportsDir(outArg, runName);
             } catch (IOException e) {
                 log.logError(e.getMessage());
                 return 2;
             }
-            Path reports = runDir.resolve(REPORT_DIR);
             if (!Files.isDirectory(reports)) {
                 log.logError("reports dir not found: " + reports);
                 return 2;
@@ -77,7 +76,16 @@ public class TopCommand {
             Collections.sort(rows, sort.comparator());
             int show = Math.min(limit, rows.size());
 
-            log.logInfo("run_dir=" + runDir + " reports=" + files
+            Path runDir = reports.getFileName() != null
+                    && REPORT_DIR.equals(reports.getFileName().toString())
+                    && reports.getParent() != null
+                    ? reports.getParent()
+                    : reports;
+            boolean legacyFlat = reports.getFileName() == null
+                    || !REPORT_DIR.equals(reports.getFileName().toString());
+            log.logInfo("run_dir=" + runDir + " reports_dir=" + reports
+                    + " layout=" + (legacyFlat ? "legacy-flat" : "reports/")
+                    + " reports=" + files
                     + " parse_fail=" + parseFail + " sort=" + sort.label
                     + " asc=" + sort.asc + " show=" + show);
 
@@ -107,31 +115,80 @@ public class TopCommand {
     }
 
     /**
-     * 解析 run 目录: 支持扁平 outdir/reports、时间戳子目录、--run &lt;ts&gt;.
+     * 解析报告所在目录 (含 *.txt).
+     * 支持: outdir/reports、run/reports、outdir 根下直接 *.txt (旧布局).
      */
-    static Path resolveReportsRunDir(Path outdirArg, String runName) throws IOException {
+    static Path resolveReportsDir(Path outdirArg, String runName) throws IOException {
         Path out = outdirArg.toAbsolutePath().normalize();
         if (runName != null && !runName.trim().isEmpty()) {
             Path run = out.resolve(runName.trim());
-            if (!Files.isDirectory(run.resolve(REPORT_DIR))) {
-                throw new IOException("run reports not found: " + run.resolve(REPORT_DIR));
+            Path std = run.resolve(REPORT_DIR);
+            if (Files.isDirectory(std)) {
+                return std;
             }
-            return run;
+            if (isLegacyFlatReportsDir(run)) {
+                return run;
+            }
+            throw new IOException("run reports not found: " + std
+                    + " (also checked legacy flat *.txt under " + run + ")");
         }
-        String name = out.getFileName() == null ? "" : out.getFileName().toString();
-        if (RunDirResolver.RUN_DIR_NAME.matcher(name).matches()
-                && Files.isDirectory(out.resolve(REPORT_DIR))) {
+        // -o 已直接指向 reports/ 子目录
+        if (out.getFileName() != null && REPORT_DIR.equals(out.getFileName().toString())
+                && Files.isDirectory(out)) {
             return out;
         }
-        if (Files.isDirectory(out.resolve(REPORT_DIR))) {
-            return out; // 扁平布局 (无 yyyyMMddHHmmss 子目录)
+        String name = out.getFileName() == null ? "" : out.getFileName().toString();
+        if (RunDirResolver.RUN_DIR_NAME.matcher(name).matches()) {
+            Path std = out.resolve(REPORT_DIR);
+            if (Files.isDirectory(std)) {
+                return std;
+            }
+            if (isLegacyFlatReportsDir(out)) {
+                return out;
+            }
+        }
+        Path stdOut = out.resolve(REPORT_DIR);
+        if (Files.isDirectory(stdOut)) {
+            return stdOut; // 标准: 基目录/reports 或 无时间戳的扁平
+        }
+        if (isLegacyFlatReportsDir(out)) {
+            return out; // 旧布局: 报告 txt 直接在 -o 目录下
         }
         Path latest = RunDirResolver.findLatestRunDir(out);
-        if (latest != null && Files.isDirectory(latest.resolve(REPORT_DIR))) {
-            return latest;
+        if (latest != null) {
+            Path std = latest.resolve(REPORT_DIR);
+            if (Files.isDirectory(std)) {
+                return std;
+            }
+            if (isLegacyFlatReportsDir(latest)) {
+                return latest;
+            }
         }
-        throw new IOException("no reports/ under " + out
-                + " (pass -o <collect_dir> or -o <run_dir> or --run <yyyyMMddHHmmss>)");
+        throw new IOException("no reports under " + out
+                + " (need reports/*.txt, or legacy flat *.txt, or --run <yyyyMMddHHmmss>)");
+    }
+
+    /** 旧布局: 目录下没有 reports/ 子目录, 但有至少一份 *.txt 报告. */
+    static boolean isLegacyFlatReportsDir(Path dir) throws IOException {
+        if (!Files.isDirectory(dir)) {
+            return false;
+        }
+        if (Files.isDirectory(dir.resolve(REPORT_DIR))) {
+            return false;
+        }
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir, "*.txt")) {
+            return ds.iterator().hasNext();
+        }
+    }
+
+    /** @deprecated 使用 {@link #resolveReportsDir}. */
+    static Path resolveReportsRunDir(Path outdirArg, String runName) throws IOException {
+        Path reports = resolveReportsDir(outdirArg, runName);
+        if (reports.getFileName() != null && REPORT_DIR.equals(reports.getFileName().toString())
+                && reports.getParent() != null) {
+            return reports.getParent();
+        }
+        return reports;
     }
 
     private static void printTable(List<ReportSqlareaParser.Row> rows, int show) {
@@ -406,7 +463,8 @@ public class TopCommand {
         Args.helpOpt("-h, --help", "Show this help");
         System.out.println();
         System.out.println("Notes:");
-        System.out.println("  - Scans only reports/*.txt (not skipped/ or replay/).");
+        System.out.println("  - Scans reports/*.txt; also accepts legacy flat dir with *.txt at -o root.");
+        System.out.println("  - Does not scan skipped/ or replay/.");
         System.out.println("  - db_time = exec * ela_pe (from v$sqlarea; fallback v$sql sum).");
         System.out.println("  - Offline; JDBC not required.");
         System.out.println();
@@ -414,6 +472,7 @@ public class TopCommand {
         System.out.println("  sql-collect top -o ./sql_collect");
         System.out.println("  sql-collect top -o ./sql_collect -L 20 --sort cpu");
         System.out.println("  sql-collect top -o ./sql_collect --run 20260805004136 --csv top.csv");
+        System.out.println("  sql-collect top -o ./legacy_flat_reports_dir  # *.txt directly under -o");
         System.out.println("  sql-collect top -o ./sql_collect/20260805004136 --sort exec:asc");
     }
 }

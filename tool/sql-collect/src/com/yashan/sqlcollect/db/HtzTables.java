@@ -18,6 +18,8 @@ public final class HtzTables {
     public static final String GV_SQL = "HTZ_GV_SQL";
     public static final String GV_SQLSTATS = "HTZ_GV_SQLSTATS";
     public static final String GV_BIND = "HTZ_GV_SQL_BIND_CAPTURE";
+    /** 对应 GV$SQL_PLAN; 去重键 (INST_ID, SQL_ID, CHILD_NUMBER, PLAN_HASH_VALUE, ID) */
+    public static final String GV_SQL_PLAN = "HTZ_GV_SQL_PLAN";
     public static final String REPLAY_PKG = "HTZ_SQL_REPLAY_PKG";
 
     private HtzTables() {}

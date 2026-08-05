@@ -65,7 +65,7 @@ public class Main {
         System.out.println();
         System.out.println("Commands:");
         Args.helpOpt("check", "JDBC health check before long collect/replay");
-        Args.helpOpt("collect", "Poll gv$/v$sql, backup HTZ_GV_*, export reports/packages");
+        Args.helpOpt("collect", "Poll gv$/v$sql, backup HTZ_GV_* (sql/stats/bind/plan), export packages");
         Args.helpOpt("replay", "Replay SQL from file / HTZ package / gv$");
         Args.helpOpt("top", "Rank SQL from reports/*.txt (default sort: db_time)");
         Args.helpOpt("sqlmap", "SQLMAP toolkit (see: sql-collect sqlmap -h)");
@@ -92,7 +92,6 @@ public class Main {
         Args.helpOpt("-K, --skip-backup", "Skip HTZ_GV_* backup");
         Args.helpOpt("-B, --backup-only", "Backup only; no reports / replay export");
         Args.helpOpt("-X, --skip-replay-export", "Skip replay package export");
-        Args.helpOpt("-m, --max-new <n>", "Cap new sql_id per round");
         Args.helpOpt("-s, --sql-id <id[,id...]>", "Collect ONLY these sql_id(s) (manual one-shot;");
         Args.helpOpt("", "skips candidate scan; comma-separated OK)");
         Args.helpOpt("-T, --report-timeout <sec>", "Report gather timeout (default: 600; 0=unlimited)");

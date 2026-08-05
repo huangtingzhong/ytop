@@ -84,6 +84,11 @@ public class CheckCommand {
                         log, "GV$SQL_BIND_CAPTURE")) {
                     fail++;
                 }
+                if (!probeSelect(c,
+                        "SELECT COUNT(*) FROM gv$sql_plan WHERE ROWNUM = 1",
+                        log, "GV$SQL_PLAN")) {
+                    fail++;
+                }
                 if (!probeCreateDrop(c, log)) {
                     fail++;
                 }

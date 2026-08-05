@@ -17,6 +17,7 @@ import java.util.Set;
 
 /**
  * HTZ_GV_* 增量备份 (JDBC mode B).
+ * 含 GV$SQL / SQLSTATS / BIND_CAPTURE / SQL_PLAN.
  * 表建在登录用户 schema 下; 失败直接抛错由 collect 退出.
  */
 public class BackupService {
@@ -46,6 +47,7 @@ public class BackupService {
         String tSql = HtzTables.qname(owner, HtzTables.GV_SQL);
         String tStat = HtzTables.qname(owner, HtzTables.GV_SQLSTATS);
         String tBind = HtzTables.qname(owner, HtzTables.GV_BIND);
+        String tPlan = HtzTables.qname(owner, HtzTables.GV_SQL_PLAN);
 
         if (!ddlReady) {
             ensureTable(c, HtzTables.GV_SQL,
@@ -57,7 +59,10 @@ public class BackupService {
             ensureTable(c, HtzTables.GV_BIND,
                     "CREATE TABLE " + tBind + " AS SELECT g.*, CAST(NULL AS DATE) AS COLLECT_TIME "
                             + "FROM GV$SQL_BIND_CAPTURE g WHERE 1=0");
-            ensureIndexes(c, tSql, tStat, tBind);
+            ensureTable(c, HtzTables.GV_SQL_PLAN,
+                    "CREATE TABLE " + tPlan + " AS SELECT g.*, CAST(NULL AS DATE) AS COLLECT_TIME "
+                            + "FROM GV$SQL_PLAN g WHERE 1=0");
+            ensureIndexes(c, tSql, tStat, tBind, tPlan);
             ddlReady = true;
             log.logDbg("backup ddl ready (tables/indexes checked once)");
         }
@@ -99,8 +104,27 @@ public class BackupService {
                         + "AND NVL(h.name, CHR(0)) = NVL(b.name, CHR(0)))");
         log.logDbg("backup INSERT " + HtzTables.GV_BIND + " rows=" + ins);
 
+        // 计划行: 仅备份非 SYS 游标; 去重键 inst/sql_id/child/phv/id (源视图偶发物理重复只留一份)
+        ins = HtzTables.execUpdate(c, log, "backup_insert_" + HtzTables.GV_SQL_PLAN,
+                "INSERT INTO " + tPlan + " "
+                        + "SELECT p.*, SYSDATE FROM GV$SQL_PLAN p "
+                        + "WHERE p.sql_id IS NOT NULL "
+                        + "AND p.id IS NOT NULL "
+                        + "AND EXISTS (SELECT 1 FROM GV$SQL g "
+                        + "WHERE g.inst_id = p.inst_id AND g.sql_id = p.sql_id "
+                        + "AND NVL(g.child_number, -1) = NVL(p.child_number, -1) "
+                        + "AND UPPER(NVL(g.parsing_schema_name, 'X')) NOT IN ('SYS', 'SYSDBA') "
+                        + "AND (g.sql_fulltext IS NULL OR INSTR(g.sql_fulltext, '"
+                        + NoiseFilter.PROBE_TAG + "') = 0)) "
+                        + "AND NOT EXISTS (SELECT 1 FROM " + tPlan + " h "
+                        + "WHERE h.inst_id = p.inst_id AND h.sql_id = p.sql_id "
+                        + "AND NVL(h.child_number, -1) = NVL(p.child_number, -1) "
+                        + "AND NVL(h.plan_hash_value, -1) = NVL(p.plan_hash_value, -1) "
+                        + "AND NVL(h.id, -1) = NVL(p.id, -1))");
+        log.logDbg("backup INSERT " + HtzTables.GV_SQL_PLAN + " rows=" + ins);
+
         c.commit();
-        r.newSqlIds = fetchNewSqlIds(c, t0, tSql, tStat, tBind);
+        r.newSqlIds = fetchNewSqlIds(c, t0, tSql, tStat, tBind, tPlan);
         log.logDbg("backup done BACKUP_NEW_N=" + r.newSqlIds.size());
         for (String sid : r.newSqlIds) {
             log.logDbg("backup-new sql_id=" + sid);
@@ -123,7 +147,8 @@ public class BackupService {
      * - COLLECT_TIME: backup_new_ids 增量扫描
      * - 去重键: INSERT ... NOT EXISTS 反查
      */
-    private void ensureIndexes(Connection c, String tSql, String tStat, String tBind) throws SQLException {
+    private void ensureIndexes(Connection c, String tSql, String tStat, String tBind, String tPlan)
+            throws SQLException {
         // HTZ_GV_SQL: NOT EXISTS (inst_id, sql_id, child_number); new_ids on collect_time
         HtzTables.ensureIndex(c, log, owner, "HTZ_GV_SQL_CT",
                 "CREATE INDEX HTZ_GV_SQL_CT ON " + tSql + " (COLLECT_TIME)");
@@ -140,21 +165,30 @@ public class BackupService {
         HtzTables.ensureIndex(c, log, owner, "HTZ_GV_BIND_K1",
                 "CREATE INDEX HTZ_GV_BIND_K1 ON " + tBind
                         + " (INST_ID, SQL_ID, CHILD_NUMBER, POSITION, NAME)");
+
+        HtzTables.ensureIndex(c, log, owner, "HTZ_GV_SQL_PLAN_CT",
+                "CREATE INDEX HTZ_GV_SQL_PLAN_CT ON " + tPlan + " (COLLECT_TIME)");
+        HtzTables.ensureIndex(c, log, owner, "HTZ_GV_SQL_PLAN_K1",
+                "CREATE INDEX HTZ_GV_SQL_PLAN_K1 ON " + tPlan
+                        + " (INST_ID, SQL_ID, CHILD_NUMBER, PLAN_HASH_VALUE, ID)");
     }
 
     private List<String> fetchNewSqlIds(Connection c, Timestamp t0,
-                                        String tSql, String tStat, String tBind) throws SQLException {
+                                        String tSql, String tStat, String tBind, String tPlan)
+            throws SQLException {
         Set<String> ids = new LinkedHashSet<String>();
         String q = "SELECT sql_id FROM ("
                 + "SELECT DISTINCT sql_id FROM " + tSql + " WHERE collect_time >= ? "
                 + "UNION SELECT DISTINCT sql_id FROM " + tStat + " WHERE collect_time >= ? "
-                + "UNION SELECT DISTINCT sql_id FROM " + tBind + " WHERE collect_time >= ?"
+                + "UNION SELECT DISTINCT sql_id FROM " + tBind + " WHERE collect_time >= ? "
+                + "UNION SELECT DISTINCT sql_id FROM " + tPlan + " WHERE collect_time >= ?"
                 + ") ORDER BY 1";
         log.logDbg("jdbc sql [backup_new_ids]: " + q);
         PreparedStatement ps = c.prepareStatement(q);
         ps.setTimestamp(1, t0);
         ps.setTimestamp(2, t0);
         ps.setTimestamp(3, t0);
+        ps.setTimestamp(4, t0);
         ResultSet rs = ps.executeQuery();
         while (rs.next()) {
             String sid = rs.getString(1);

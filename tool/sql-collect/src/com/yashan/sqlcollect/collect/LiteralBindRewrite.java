@@ -25,20 +25,26 @@ public final class LiteralBindRewrite {
             return sql;
         }
         String text = sql;
-        boolean useQuestion = usesQuestionBind(text);
         List<String> warnings = new ArrayList<String>();
         for (BindValue b : binds) {
             if (b == null) {
                 continue;
             }
             String repl = toLiteral(b, warnings);
-            String pattern = bindPattern(b.name);
-            if (!useQuestion && pattern != null) {
+            boolean replaced = false;
+            for (String pattern : bindPatterns(b.name)) {
+                if (pattern == null) {
+                    continue;
+                }
                 String next = replaceFirstOutsideQuotes(text, pattern, repl);
                 if (!next.equals(text)) {
                     text = next;
-                    continue;
+                    replaced = true;
+                    break;
                 }
+            }
+            if (replaced) {
+                continue;
             }
             int q = indexOfQuestionOutsideQuotes(text);
             if (q < 0) {
@@ -91,18 +97,35 @@ public final class LiteralBindRewrite {
         return lit;
     }
 
+    /** 主模式; 兼容旧调用. */
     static String bindPattern(String name) {
-        if (name == null || name.trim().isEmpty()) {
-            return null;
+        List<String> ps = bindPatterns(name);
+        return ps.isEmpty() ? null : ps.get(0);
+    }
+
+    /**
+     * 生成候选占位符模式 (先试再回退 ?).
+     * SYS_B: SQL 文本常为 :SYS_B_0; 部分库/工具为 :"SYS_B_0".
+     */
+    static List<String> bindPatterns(String name) {
+        List<String> out = new ArrayList<String>();
+        if (name == null || name.trim().isEmpty() || "?".equals(name.trim())) {
+            return out;
         }
         String n = name.trim();
-        if (n.regionMatches(true, 0, ":SYS_B_", 0, 7)) {
-            return ":\"" + n.substring(1) + "\"";
+        String bare = n.startsWith(":") ? n.substring(1) : n;
+        bare = bare.replace("\"", "");
+        if (bare.regionMatches(true, 0, "SYS_B_", 0, 6)) {
+            out.add(":" + bare);
+            out.add(":\"" + bare + "\"");
+            return out;
         }
         if (n.startsWith(":")) {
-            return n;
+            out.add(n);
+            return out;
         }
-        return ":" + n.replaceFirst("^:+", "");
+        out.add(":" + n.replaceFirst("^:+", ""));
+        return out;
     }
 
     static boolean usesQuestionBind(String text) {

@@ -1,7 +1,7 @@
 -- File Name: sql_bind_replay.sql
 -- Purpose: Business-sim replay by sql_id (orig text+binds+schema; print/explain/execute)
 -- Created: 20260802 by huangtingzhong
--- Updated: 20260803 by huangtingzhong (business-sim execute: original text+bind names)
+-- Updated: 20260805 by huangtingzhong (exclude last_captured empty; prefer filled child)
 --
 -- Mode C: generate typed variables + EXECUTE IMMEDIATE ... USING (paste).
 -- action=print|explain: print paste block only (:B001 rewrite for USING convenience).
@@ -13,7 +13,8 @@
 -- Long SQL / binds / show_rows use DBMS_SQL (bypass EXECUTE IMMEDIATE ~64K).
 -- Do NOT use paste output as SQLMAP source SQL (:B001 rewrite changes hash).
 -- Notes:
---   - Binds from V$SQL_BIND_CAPTURE; empty child => latest LAST_CAPTURED child.
+--   - Binds from V$SQL_BIND_CAPTURE; empty child => child with most captured values
+--     (last_captured IS NOT NULL or WAS_CAPTURED=YES; exclude empty slots).
 --   - Paste block still rewrites to :B001.. for USING; execute does NOT (named binds).
 --   - "?" placeholders: execute must rewrite to :Bnnn (DBMS_SQL); may miss SQLMAP.
 --   - No capture + no placeholder => direct execute of sql_fulltext.
@@ -30,7 +31,7 @@ UNDEFINE show_rows
 UNDEFINE max_rows
 
 ACCEPT sqlid PROMPT 'Enter sql_id (required): '
-ACCEPT child PROMPT 'Enter child_number (empty=latest LAST_CAPTURED): '
+ACCEPT child PROMPT 'Enter child_number (empty=prefer captured binds): '
 ACCEPT action PROMPT 'Enter action (print|explain|execute, default print): '
 ACCEPT confirm PROMPT 'Confirm execute (YES=run; other/Enter=abort; ignored unless action=execute): '
 ACCEPT schema PROMPT 'Enter CURRENT_SCHEMA override (empty=parsing_schema_name): '
@@ -88,6 +89,8 @@ DECLARE
   v_maxlen        NUMBER;
   v_warn          VARCHAR2(16);
   v_idx           PLS_INTEGER := 0;
+  TYPE t_pos_seen IS TABLE OF PLS_INTEGER INDEX BY PLS_INTEGER;
+  v_pos_seen      t_pos_seen;
   v_qpos          NUMBER;
   v_bind_pat      VARCHAR2(200);
   v_repl          VARCHAR2(16);
@@ -116,7 +119,10 @@ DECLARE
       FROM v$sql_bind_capture
      WHERE sql_id = p_sqlid
        AND child_number = p_child
-     ORDER BY position, name;
+       AND last_captured IS NOT NULL
+     ORDER BY last_captured DESC NULLS LAST,
+              CASE WHEN name IS NOT NULL AND TRIM(name) <> '?' THEN 0 ELSE 1 END,
+              position;
 
   PROCEDURE put_clob(p_text IN CLOB) IS
     v_len NUMBER;
@@ -745,10 +751,22 @@ BEGIN
   END IF;
 
   IF NULLIF(v_child_in, '') IS NULL THEN
-    SELECT MAX(child_number) KEEP (DENSE_RANK LAST ORDER BY last_captured NULLS FIRST, child_number)
-      INTO v_child
-      FROM v$sql_bind_capture
-     WHERE sql_id = v_sqlid;
+    -- Prefer child of latest last_captured bind (lightweight)
+    BEGIN
+      SELECT child_number
+        INTO v_child
+        FROM (
+               SELECT child_number
+                 FROM v$sql_bind_capture
+                WHERE sql_id = v_sqlid
+                  AND last_captured IS NOT NULL
+                ORDER BY last_captured DESC NULLS LAST, child_number
+             )
+       WHERE ROWNUM = 1;
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        v_child := NULL;
+    END;
     IF v_child IS NULL THEN
       SELECT MIN(child_number) INTO v_child FROM v$sql WHERE sql_id = v_sqlid;
     END IF;
@@ -785,7 +803,9 @@ BEGIN
     INTO v_bind_cnt
     FROM v$sql_bind_capture
    WHERE sql_id = v_sqlid
-     AND child_number = v_child;
+     AND child_number = v_child
+     AND last_captured IS NOT NULL
+     AND ROWNUM = 1;
 
   IF uses_question_bind_clob(v_sql_clob) THEN
     v_ph_type := 'question_mark';
@@ -915,7 +935,12 @@ BEGIN
   DBMS_OUTPUT.PUT_LINE('-- ----- bind list -----');
   DBMS_OUTPUT.PUT_LINE(
     '-- POS | NAME | DATATYPE | WAS_CAPTURED | VALUE | WARN');
+  v_pos_seen.DELETE;
   FOR r IN c_binds(v_sqlid, v_child) LOOP
+    IF v_pos_seen.EXISTS(r.position) THEN
+      NULL;
+    ELSE
+    v_pos_seen(r.position) := 1;
     v_warn := CASE
                 WHEN NVL(UPPER(r.was_captured), 'NO') != 'YES' THEN 'WARN'
                 WHEN r.value_string IS NULL
@@ -931,6 +956,7 @@ BEGIN
       || ' | ' || NVL(r.was_captured, '-')
       || ' | ' || NVL(SUBSTR(r.value_string, 1, 80), '(null)')
       || ' | ' || v_warn);
+    END IF;
   END LOOP;
 
   DBMS_LOB.CREATETEMPORARY(v_replay_clob, TRUE);
@@ -942,8 +968,14 @@ BEGIN
   v_assign := '';
   v_using := '';
   v_bind_tab.DELETE;
+  v_pos_seen.DELETE;
+  v_idx := 0;
 
   FOR r IN c_binds(v_sqlid, v_child) LOOP
+    IF v_pos_seen.EXISTS(r.position) THEN
+      NULL;
+    ELSE
+    v_pos_seen(r.position) := 1;
     v_idx := v_idx + 1;
     v_var := 'v' || LPAD(TO_CHAR(v_idx), 3, '0');
     v_maxlen := NVL(r.max_length, 4000);
@@ -996,6 +1028,7 @@ BEGIN
       END IF;
       clob_splice_replace(v_replay_clob, v_qpos, LENGTH(v_bind_pat), v_repl);
     END IF;
+    END IF; -- position dedupe
   END LOOP;
 
   DBMS_OUTPUT.PUT_LINE('-- ----- generated anonymous block -----');

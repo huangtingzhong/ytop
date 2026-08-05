@@ -2,6 +2,7 @@ package com.yashan.sqlcollect.collect;
 
 import com.yashan.sqlcollect.db.HtzTables;
 import com.yashan.sqlcollect.db.JdbcSession;
+import com.yashan.sqlcollect.db.SqlLookup;
 import com.yashan.sqlcollect.log.DualLogger;
 import com.yashan.sqlcollect.model.BindValue;
 import com.yashan.sqlcollect.model.ReplayPackageMeta;
@@ -68,7 +69,9 @@ public class PackageExporter {
             }
         }
         if (empty > 0) {
-            log.logWarn(empty + " bind(s) have empty value_string; edit binds.txt before execute");
+            log.logWarn(empty + " bind(s) have empty value_string; sql_id=" + sqlId
+                    + " child=" + row.meta.childNumber
+                    + " edit binds.txt before execute");
         }
         return pkg;
     }
@@ -80,21 +83,39 @@ public class PackageExporter {
     }
 
     private Row loadLatestRow(Connection c, String sqlId) throws SQLException {
+        // 1) 先从 bind_capture (gv$+v$) 选 filled 最大的 child, 再取该 child 的 sql 文本
+        SqlLookup.CapturedChild prefer = SqlLookup.pickBestCapturedChild(c, sqlId);
+        Row row = null;
+        if (prefer != null) {
+            row = loadRowByChild(c, sqlId, prefer.childNumber, prefer.instId);
+            if (row != null) {
+                row.binds = loadBindsPreferFilled(c, sqlId, row.meta.childNumber, row.meta.instId);
+                int filled = countFilled(row.binds);
+                log.logInfo("export cursor sql_id=" + sqlId + " child=" + row.meta.childNumber
+                        + " inst_id=" + row.meta.instId + " binds=" + row.binds.size()
+                        + " filled=" + filled + " pick=bind_capture:" + prefer.source
+                        + "(child=" + prefer.childNumber + " filled=" + prefer.filled + ")");
+                return row;
+            }
+            log.logWarn("export pick capture child=" + prefer.childNumber
+                    + " but sql text missing in gv$/v$sql; fallback last_active");
+        }
+
+        // 2) 回退: gv$/v$sql + GREATEST(gv$,v$ capture) 排序
         String[] queries = new String[] {
             "SELECT child_number, parsing_schema_name, NVL(inst_id,1), hash_value, "
                     + "DBMS_LOB.GETLENGTH(sql_fulltext), sql_fulltext "
-                    + "FROM (SELECT child_number, parsing_schema_name, inst_id, hash_value, sql_fulltext, "
-                    + "last_active_time, executions FROM gv$sql WHERE sql_id = ? "
-                    + "ORDER BY last_active_time DESC NULLS LAST, executions DESC NULLS LAST, child_number) "
+                    + "FROM (SELECT s.child_number, s.parsing_schema_name, s.inst_id, s.hash_value, "
+                    + "s.sql_fulltext, s.last_active_time, s.executions FROM gv$sql s WHERE s.sql_id = ? "
+                    + "ORDER BY " + SqlLookup.ORDER_GV_PREFER_CAPTURED + ") "
                     + "WHERE ROWNUM = 1",
             "SELECT child_number, parsing_schema_name, 1, hash_value, "
                     + "DBMS_LOB.GETLENGTH(sql_fulltext), sql_fulltext "
-                    + "FROM (SELECT child_number, parsing_schema_name, hash_value, sql_fulltext, "
-                    + "last_active_time, executions FROM v$sql WHERE sql_id = ? "
-                    + "ORDER BY last_active_time DESC NULLS LAST, executions DESC NULLS LAST, child_number) "
+                    + "FROM (SELECT s.child_number, s.parsing_schema_name, s.hash_value, "
+                    + "s.sql_fulltext, s.last_active_time, s.executions FROM v$sql s WHERE s.sql_id = ? "
+                    + "ORDER BY " + SqlLookup.ORDER_V_PREFER_CAPTURED + ") "
                     + "WHERE ROWNUM = 1"
         };
-        Row row = null;
         for (String q : queries) {
             log.logDbg("jdbc sql [export_load]: " + q);
             try (PreparedStatement ps = c.prepareStatement(q)) {
@@ -121,47 +142,99 @@ public class PackageExporter {
         if (row == null) {
             return null;
         }
-        row.binds = loadBinds(c, sqlId, row.meta.childNumber, row.meta.instId);
+        row.binds = loadBindsPreferFilled(c, sqlId, row.meta.childNumber, row.meta.instId);
+        int filled = countFilled(row.binds);
+        log.logInfo("export cursor sql_id=" + sqlId + " child=" + row.meta.childNumber
+                + " inst_id=" + row.meta.instId + " binds=" + row.binds.size()
+                + " filled=" + filled + " pick=sql_order");
         return row;
     }
 
-    private List<BindValue> loadBinds(Connection c, String sqlId, int child, int instId) throws SQLException {
-        List<BindValue> binds = new ArrayList<BindValue>();
+    private Row loadRowByChild(Connection c, String sqlId, int child, int instId) throws SQLException {
         String[] queries = new String[] {
-            "SELECT position, name, datatype_string, value_string, was_captured "
-                    + "FROM gv$sql_bind_capture WHERE sql_id = ? AND child_number = ? AND inst_id = ? "
-                    + "ORDER BY position, name",
-            "SELECT position, name, datatype_string, value_string, was_captured "
-                    + "FROM v$sql_bind_capture WHERE sql_id = ? AND child_number = ? "
-                    + "ORDER BY position, name"
+            "SELECT child_number, parsing_schema_name, NVL(inst_id,1), hash_value, "
+                    + "DBMS_LOB.GETLENGTH(sql_fulltext), sql_fulltext FROM gv$sql "
+                    + "WHERE sql_id = ? AND child_number = ? AND NVL(inst_id,1) = ? AND ROWNUM = 1",
+            "SELECT child_number, parsing_schema_name, 1, hash_value, "
+                    + "DBMS_LOB.GETLENGTH(sql_fulltext), sql_fulltext FROM v$sql "
+                    + "WHERE sql_id = ? AND child_number = ? AND ROWNUM = 1"
         };
         for (int qi = 0; qi < queries.length; qi++) {
             try (PreparedStatement ps = c.prepareStatement(queries[qi])) {
-                log.logDbg("jdbc sql [export_binds]: " + queries[qi]);
                 ps.setString(1, sqlId);
                 ps.setInt(2, child);
                 if (qi == 0) {
                     ps.setInt(3, instId);
                 }
                 try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        BindValue b = new BindValue();
-                        b.position = rs.getInt(1);
-                        b.name = nvl(rs.getString(2));
-                        b.datatype = nvl(rs.getString(3));
-                        b.value = nvl(rs.getString(4));
-                        b.wasCaptured = nvl(rs.getString(5));
-                        binds.add(b);
+                    if (!rs.next()) {
+                        continue;
                     }
-                }
-                if (!binds.isEmpty() || qi == queries.length - 1) {
-                    return binds;
+                    Row row = new Row();
+                    row.meta.sqlId = sqlId;
+                    row.meta.childNumber = rs.getInt(1);
+                    row.meta.parsingSchema = rs.getString(2);
+                    row.meta.instId = rs.getInt(3);
+                    row.meta.hashValue = rs.getLong(4);
+                    row.meta.sqlLen = rs.getInt(5);
+                    row.sqlText = JdbcSession.readClob(rs.getClob(6));
+                    return row;
                 }
             } catch (SQLException e) {
-                log.logDbg("export binds alternate view: " + e.getMessage());
+                log.logDbg("export load by child alternate: " + e.getMessage());
             }
         }
-        return binds;
+        // inst_id 对不上时放宽: 只按 child
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT child_number, parsing_schema_name, NVL(inst_id,1), hash_value, "
+                        + "DBMS_LOB.GETLENGTH(sql_fulltext), sql_fulltext FROM gv$sql "
+                        + "WHERE sql_id = ? AND child_number = ? AND ROWNUM = 1")) {
+            ps.setString(1, sqlId);
+            ps.setInt(2, child);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    Row row = new Row();
+                    row.meta.sqlId = sqlId;
+                    row.meta.childNumber = rs.getInt(1);
+                    row.meta.parsingSchema = rs.getString(2);
+                    row.meta.instId = rs.getInt(3);
+                    row.meta.hashValue = rs.getLong(4);
+                    row.meta.sqlLen = rs.getInt(5);
+                    row.sqlText = JdbcSession.readClob(rs.getClob(6));
+                    return row;
+                }
+            }
+        } catch (SQLException e) {
+            log.logDbg("export load by child gv$ loose: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private static int countFilled(List<BindValue> binds) {
+        int filled = 0;
+        if (binds == null) {
+            return 0;
+        }
+        for (BindValue b : binds) {
+            if (b.value != null && !b.value.isEmpty() && !"\\N".equals(b.value)) {
+                filled++;
+            }
+        }
+        return filled;
+    }
+
+    /** gv$/v$/HTZ 备份表都查, 选 filled 最多的一侧 (SqlLookup 统一实现). */
+    private List<BindValue> loadBindsPreferFilled(Connection c, String sqlId, int child, int instId)
+            throws SQLException {
+        return SqlLookup.loadBinds(c, sqlId, child, instId, new SqlLookup.WarnOut() {
+            public void warn(String msg) {
+                log.logDbg("export binds: " + msg);
+            }
+        });
+    }
+
+    private List<BindValue> loadBinds(Connection c, String sqlId, int child, int instId) throws SQLException {
+        return loadBindsPreferFilled(c, sqlId, child, instId);
     }
 
     private void ensureReplayTable(Connection c) throws SQLException {

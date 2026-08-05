@@ -154,8 +154,6 @@ public class Args {
                 return "exec";
             case 'd':
                 return "debug";
-            case 'm':
-                return "max-new";
             case 'R':
                 return "results-csv";
             case 'A':
@@ -192,7 +190,7 @@ public class Args {
     /** 需要取值的短选项 (不含 -d: 可选 bool; 不含纯 flag). */
     static boolean shortNeedsValue(char c) {
         return c == 'o' || c == 'l' || c == 'j' || c == 's' || c == 'S' || c == 'i' || c == 'c'
-                || c == 't' || c == 'T' || c == 'p' || c == 'N' || c == 'm' || c == 'R' || c == 'C'
+                || c == 't' || c == 'T' || c == 'p' || c == 'N' || c == 'R' || c == 'C'
                 || c == 'M' || c == 'L';
     }
 
@@ -208,7 +206,7 @@ public class Args {
         return "jdbc-config".equals(k) || "log-dir".equals(k) || "outdir".equals(k)
                 || "interval".equals(k) || "count".equals(k) || "sql-id".equals(k)
                 || "report-timeout".equals(k) || "timeout".equals(k) || "replay-timeout".equals(k)
-                || "max-new".equals(k) || "current-schema".equals(k) || "source".equals(k)
+                || "current-schema".equals(k) || "source".equals(k)
                 || "parallel".equals(k) || "sessions".equals(k) || "results-csv".equals(k)
                 || "on-sha-mismatch".equals(k) || "limit".equals(k) || "sort".equals(k)
                 || "run".equals(k) || "csv".equals(k) || "sqlid".equals(k);

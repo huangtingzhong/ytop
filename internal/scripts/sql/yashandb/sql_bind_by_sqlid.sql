@@ -1,6 +1,7 @@
 -- File Name: sql_bind_by_sqlid.sql
 -- Purpose: YashanDB Expand SQL text with bind values
 -- Created: 20260516  by  huangtingzhong
+-- Updated: 20260805 by huangtingzhong (exclude last_captured empty; prefer captured child)
 
 --          from V$SQL_BIND_CAPTURE, ordered by POSITION.
 -- Notes:
@@ -9,6 +10,7 @@
 --   - '?' binds use position-based replacement (see sql.sql).
 --   - If V$SQL has no rows for the sql_id, print message and RETURN (no error).
 --   - DATE/TIMESTAMP values are wrapped with to_date/to_timestamp (simple form).
+--   - Only binds with last_captured IS NOT NULL (or WAS_CAPTURED=YES); prefer that child.
 -- Usage:
 --   1) Edit c_sqlid below, then run with ysql -f this_file
 -- =============================================================================
@@ -20,7 +22,7 @@ DECLARE
 
   lvc_sql_text      VARCHAR2(32000);
   lvc_orig_sql_text VARCHAR2(32000);
-  ln_child          NUMBER := 10000;
+  ln_child          NUMBER;
   lvc_repl          VARCHAR2(2000);
   lvc_bind          VARCHAR2(200);
   lvc_name          VARCHAR2(30);
@@ -28,8 +30,12 @@ DECLARE
   ln_bind_count     NUMBER := 0;
   ln_sql_cnt        NUMBER := 0;
   ln_qpos           NUMBER;
+  ln_filled         NUMBER := 0;
 
-  CURSOR c1 IS
+  TYPE t_pos_seen IS TABLE OF PLS_INTEGER INDEX BY PLS_INTEGER;
+  v_pos_seen        t_pos_seen;
+
+  CURSOR c1(p_child NUMBER) IS
     SELECT child_number,
            name,
            position,
@@ -38,7 +44,11 @@ DECLARE
            sql_id
       FROM v$sql_bind_capture
      WHERE sql_id = c_sqlid
-     ORDER BY child_number, position;
+       AND child_number = p_child
+       AND last_captured IS NOT NULL
+     ORDER BY last_captured DESC NULLS LAST,
+              CASE WHEN name IS NOT NULL AND TRIM(name) <> '?' THEN 0 ELSE 1 END,
+              position;
 
   -- Replace first bind token outside single-quoted literals (handles ':name' in SQL).
   FUNCTION replace_first_outside_quotes(
@@ -146,48 +156,96 @@ BEGIN
     RETURN;
   END IF;
 
-  SELECT sql_fulltext
-    INTO lvc_orig_sql_text
-    FROM v$sql
-   WHERE sql_id = c_sqlid
-     AND ROWNUM = 1;
+  -- Prefer child of latest last_captured bind (lightweight; no correlated COUNT)
+  BEGIN
+    SELECT child_number, 1
+      INTO ln_child, ln_filled
+      FROM (
+             SELECT child_number
+               FROM v$sql_bind_capture
+              WHERE sql_id = c_sqlid
+                AND last_captured IS NOT NULL
+              ORDER BY last_captured DESC NULLS LAST, child_number
+           )
+     WHERE ROWNUM = 1;
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      ln_child := NULL;
+      ln_filled := 0;
+  END;
 
-  SELECT parsing_schema_name
-    INTO lvc_name
-    FROM v$sql
-   WHERE sql_id = c_sqlid
-     AND ROWNUM = 1;
-
-  SELECT COUNT(*)
-    INTO ln_bind_count
-    FROM v$sql_bind_capture
-   WHERE sql_id = c_sqlid;
-
-  IF ln_bind_count = 0 THEN
+  IF ln_child IS NULL THEN
+    DBMS_OUTPUT.PUT_LINE(
+      'No captured binds (last_captured empty) for sql_id=' || c_sqlid
+    );
+    SELECT sql_fulltext, parsing_schema_name
+      INTO lvc_orig_sql_text, lvc_name
+      FROM (
+             SELECT s.sql_fulltext, s.parsing_schema_name
+               FROM v$sql s
+              WHERE s.sql_id = c_sqlid
+              ORDER BY s.last_active_time DESC NULLS LAST, s.child_number
+           )
+     WHERE ROWNUM = 1;
     DBMS_OUTPUT.PUT_LINE('Schema: ' || lvc_name);
     DBMS_OUTPUT.PUT_LINE(lvc_orig_sql_text);
     DBMS_OUTPUT.PUT_LINE('--------------------------------------------------------');
     RETURN;
   END IF;
 
-  FOR r1 IN c1 LOOP
-    IF (r1.child_number <> ln_child) THEN
-      IF ln_child <> 10000 THEN
-        DBMS_OUTPUT.PUT_LINE('Schema: ' || lvc_name);
-        DBMS_OUTPUT.PUT_LINE(lvc_sql_text);
-        DBMS_OUTPUT.PUT_LINE('--------------------------------------------------------');
-      END IF;
+  BEGIN
+    SELECT sql_fulltext, parsing_schema_name
+      INTO lvc_orig_sql_text, lvc_name
+      FROM v$sql
+     WHERE sql_id = c_sqlid
+       AND child_number = ln_child
+       AND ROWNUM = 1;
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      SELECT sql_fulltext, parsing_schema_name
+        INTO lvc_orig_sql_text, lvc_name
+        FROM (
+               SELECT s.sql_fulltext, s.parsing_schema_name
+                 FROM v$sql s
+                WHERE s.sql_id = c_sqlid
+                ORDER BY s.last_active_time DESC NULLS LAST, s.child_number
+             )
+       WHERE ROWNUM = 1;
+  END;
 
-      ln_child     := r1.child_number;
-      lvc_sql_text := lvc_orig_sql_text;
-    END IF;
+  SELECT COUNT(*)
+    INTO ln_bind_count
+    FROM v$sql_bind_capture
+   WHERE sql_id = c_sqlid
+     AND child_number = ln_child
+     AND last_captured IS NOT NULL
+     AND ROWNUM = 1;
+
+  IF ln_bind_count = 0 THEN
+    DBMS_OUTPUT.PUT_LINE('Schema: ' || lvc_name || ' child=' || TO_CHAR(ln_child));
+    DBMS_OUTPUT.PUT_LINE(lvc_orig_sql_text);
+    DBMS_OUTPUT.PUT_LINE('--------------------------------------------------------');
+    RETURN;
+  END IF;
+
+  lvc_sql_text := lvc_orig_sql_text;
+  DBMS_OUTPUT.PUT_LINE(
+    'bind child=' || TO_CHAR(ln_child) || ' filled=' || TO_CHAR(ln_filled)
+    || ' captured_rows=' || TO_CHAR(ln_bind_count)
+  );
+  v_pos_seen.DELETE;
+
+  FOR r1 IN c1(ln_child) LOOP
+    IF NOT v_pos_seen.EXISTS(r1.position) THEN
+    v_pos_seen(r1.position) := 1;
 
     BEGIN
       SELECT parsing_schema_name
         INTO lvc_name
         FROM v$sql
        WHERE sql_id = r1.sql_id
-         AND child_number = r1.child_number;
+         AND child_number = r1.child_number
+         AND ROWNUM = 1;
     EXCEPTION
       WHEN OTHERS THEN NULL;
     END;
@@ -223,6 +281,7 @@ BEGIN
         lvc_repl ||
         SUBSTR(lvc_sql_text, ln_qpos + 1);
     END IF;
+    END IF; -- position dedupe
   END LOOP;
 
   DBMS_OUTPUT.PUT_LINE('Schema: ' || lvc_name);

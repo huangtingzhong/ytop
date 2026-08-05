@@ -46,6 +46,7 @@
 #   SYS.HTZ_GV_SQL              <- GV$SQL            key(inst_id,sql_id,child_number)
 #   SYS.HTZ_GV_SQLSTATS         <- GV$SQLSTATS       key(inst_id,sql_id)
 #   SYS.HTZ_GV_SQL_BIND_CAPTURE <- GV$SQL_BIND_CAPTURE
+#   SYS.HTZ_GV_SQL_PLAN         <- GV$SQL_PLAN       key(inst_id,sql_id,child_number,plan_hash_value,id)
 #                                 key(inst_id,sql_id,child_number,position,name)
 #   Note: Yashan has GV$SQLSTATS (not GV$SQL_STAT).
 #
@@ -170,6 +171,10 @@ BACKUP_SQL = (
     "    'HTZ_GV_SQL_BIND_CAPTURE',\n"
     "    'CREATE TABLE SYS.HTZ_GV_SQL_BIND_CAPTURE AS SELECT g.*, CAST(NULL AS DATE) AS COLLECT_TIME FROM GV$SQL_BIND_CAPTURE g WHERE 1=0'\n"
     "  );\n"
+    "  ensure_table(\n"
+    "    'HTZ_GV_SQL_PLAN',\n"
+    "    'CREATE TABLE SYS.HTZ_GV_SQL_PLAN AS SELECT g.*, CAST(NULL AS DATE) AS COLLECT_TIME FROM GV$SQL_PLAN g WHERE 1=0'\n"
+    "  );\n"
     "\n"
     "  -- dynamic DML: avoid compile-time check on HTZ_* before create\n"
     "  EXECUTE IMMEDIATE\n"
@@ -222,12 +227,36 @@ BACKUP_SQL = (
     "  v_ins := SQL%ROWCOUNT;\n"
     "  DBMS_OUTPUT.PUT_LINE('INSERT HTZ_GV_SQL_BIND_CAPTURE rows=' || TO_CHAR(v_ins));\n"
     "\n"
+    "  EXECUTE IMMEDIATE\n"
+    "    'INSERT INTO SYS.HTZ_GV_SQL_PLAN\n"
+    "     SELECT p.*, SYSDATE FROM GV$SQL_PLAN p\n"
+    "      WHERE p.sql_id IS NOT NULL\n"
+    "        AND p.id IS NOT NULL\n"
+    "        AND EXISTS (\n"
+    "              SELECT 1 FROM GV$SQL g\n"
+    "               WHERE g.inst_id = p.inst_id\n"
+    "                 AND g.sql_id = p.sql_id\n"
+    "                 AND NVL(g.child_number, -1) = NVL(p.child_number, -1)\n"
+    "                 AND UPPER(NVL(g.parsing_schema_name, ''X'')) NOT IN (''SYS'', ''SYSDBA'')\n"
+    "                 AND (g.sql_fulltext IS NULL OR DBMS_LOB.INSTR(g.sql_fulltext, ''sql_collect_probe'') = 0))\n"
+    "        AND NOT EXISTS (\n"
+    "              SELECT 1 FROM SYS.HTZ_GV_SQL_PLAN h\n"
+    "               WHERE h.inst_id = p.inst_id\n"
+    "                 AND h.sql_id = p.sql_id\n"
+    "                 AND NVL(h.child_number, -1) = NVL(p.child_number, -1)\n"
+    "                 AND NVL(h.plan_hash_value, -1) = NVL(p.plan_hash_value, -1)\n"
+    "                 AND NVL(h.id, -1) = NVL(p.id, -1))';\n"
+    "  v_ins := SQL%ROWCOUNT;\n"
+    "  DBMS_OUTPUT.PUT_LINE('INSERT HTZ_GV_SQL_PLAN rows=' || TO_CHAR(v_ins));\n"
+    "\n"
     "  EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM SYS.HTZ_GV_SQL' INTO v_cnt;\n"
     "  DBMS_OUTPUT.PUT_LINE('TOTAL HTZ_GV_SQL rows=' || TO_CHAR(v_cnt));\n"
     "  EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM SYS.HTZ_GV_SQLSTATS' INTO v_cnt;\n"
     "  DBMS_OUTPUT.PUT_LINE('TOTAL HTZ_GV_SQLSTATS rows=' || TO_CHAR(v_cnt));\n"
     "  EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM SYS.HTZ_GV_SQL_BIND_CAPTURE' INTO v_cnt;\n"
     "  DBMS_OUTPUT.PUT_LINE('TOTAL HTZ_GV_SQL_BIND_CAPTURE rows=' || TO_CHAR(v_cnt));\n"
+    "  EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM SYS.HTZ_GV_SQL_PLAN' INTO v_cnt;\n"
+    "  DBMS_OUTPUT.PUT_LINE('TOTAL HTZ_GV_SQL_PLAN rows=' || TO_CHAR(v_cnt));\n"
     "\n"
     "  DECLARE\n"
     "    TYPE t_ids IS TABLE OF VARCHAR2(64);\n"
@@ -240,9 +269,11 @@ BACKUP_SQL = (
     "          SELECT DISTINCT sql_id FROM SYS.HTZ_GV_SQLSTATS WHERE collect_time >= :2\n"
     "          UNION\n"
     "          SELECT DISTINCT sql_id FROM SYS.HTZ_GV_SQL_BIND_CAPTURE WHERE collect_time >= :3\n"
+    "          UNION\n"
+    "          SELECT DISTINCT sql_id FROM SYS.HTZ_GV_SQL_PLAN WHERE collect_time >= :4\n"
     "       ) ORDER BY 1'\n"
     "      BULK COLLECT INTO l_ids\n"
-    "      USING v_t0, v_t0, v_t0;\n"
+    "      USING v_t0, v_t0, v_t0, v_t0;\n"
     "    IF l_ids IS NOT NULL THEN\n"
     "      FOR i IN 1 .. l_ids.COUNT LOOP\n"
     "        v_n_sid := v_n_sid + 1;\n"
@@ -310,7 +341,7 @@ EMBEDDED_SQL_REPORT = r"""
 -- File Name: sql.sql
 -- Purpose: YashanDB SQL tuning report (ORIGINAL+LITERAL SQL, plan, objects)
 -- Created: 20251201  by  huangtingzhong
--- Updated: 20260803 by huangtingzhong (ORIGINAL=executed CLOB; >32K chunked)
+-- Updated: 20260805 by huangtingzhong (LITERAL: prefer :SYS_B even with ?; enlarge/truncate repl)
 
 set heading on;
 set serveroutput on;
@@ -332,13 +363,17 @@ DECLARE
   ln_hash           NUMBER;
   ln_phv            NUMBER;
   ln_sql_len        NUMBER;
-  lvc_repl          VARCHAR2(2000);
+  lvc_repl          VARCHAR2(8000);
   lvc_bind          VARCHAR2(200);
   lvc_name          VARCHAR2(64);
+  lvc_sql_tmp       VARCHAR2(32767);
 
   ln_bind_count     NUMBER := 0;
   ln_sql_cnt        NUMBER := 0;
   ln_qpos           NUMBER;
+
+  TYPE t_pos_seen IS TABLE OF PLS_INTEGER INDEX BY PLS_INTEGER;
+  v_pos_seen        t_pos_seen;
 
   CURSOR c1(p_child NUMBER) IS
     SELECT child_number,
@@ -350,7 +385,10 @@ DECLARE
       FROM v$sql_bind_capture
      WHERE sql_id = c_sqlid
        AND child_number = p_child
-     ORDER BY position;
+       AND last_captured IS NOT NULL
+     ORDER BY last_captured DESC NULLS LAST,
+              CASE WHEN name IS NOT NULL AND TRIM(name) <> '?' THEN 0 ELSE 1 END,
+              position;
 
   PROCEDURE put_clob(p_text IN CLOB) IS
     v_len NUMBER;
@@ -441,17 +479,35 @@ DECLARE
   END replace_first_outside_quotes;
 
   FUNCTION bind_pattern(p_name IN VARCHAR2) RETURN VARCHAR2 IS
+    v_bare VARCHAR2(128);
   BEGIN
-    IF p_name LIKE ':SYS_B_%' THEN
-      RETURN ':"' || SUBSTR(p_name, 2) || '"';
-    ELSIF p_name LIKE ':%' THEN
-      RETURN p_name;
-    ELSIF p_name IS NOT NULL AND LENGTH(TRIM(p_name)) > 0 THEN
-      RETURN ':' || LTRIM(p_name, ':');
-    ELSE
+    IF p_name IS NULL OR LENGTH(TRIM(p_name)) = 0 OR TRIM(p_name) = '?' THEN
       RETURN NULL;
     END IF;
+    -- SYS_B: SQL text usually :SYS_B_0 (unquoted); some tools use :"SYS_B_0"
+    IF UPPER(LTRIM(p_name, ':')) LIKE 'SYS_B_%'
+       OR UPPER(REPLACE(LTRIM(p_name, ':'), '"', '')) LIKE 'SYS_B_%' THEN
+      v_bare := REPLACE(LTRIM(p_name, ':'), '"', '');
+      RETURN ':' || v_bare;
+    ELSIF p_name LIKE ':%' THEN
+      RETURN p_name;
+    ELSE
+      RETURN ':' || LTRIM(p_name, ':');
+    END IF;
   END bind_pattern;
+
+  FUNCTION bind_pattern_alt(p_name IN VARCHAR2) RETURN VARCHAR2 IS
+    v_bare VARCHAR2(128);
+  BEGIN
+    IF p_name IS NULL OR LENGTH(TRIM(p_name)) = 0 OR TRIM(p_name) = '?' THEN
+      RETURN NULL;
+    END IF;
+    IF UPPER(REPLACE(LTRIM(p_name, ':'), '"', '')) LIKE 'SYS_B_%' THEN
+      v_bare := REPLACE(LTRIM(p_name, ':'), '"', '');
+      RETURN ':"' || v_bare || '"';
+    END IF;
+    RETURN NULL;
+  END bind_pattern_alt;
 
   FUNCTION uses_question_bind(p_text IN VARCHAR2) RETURN BOOLEAN IS
     v_pos      PLS_INTEGER := 1;
@@ -490,7 +546,7 @@ BEGIN
     RETURN;
   END IF;
 
-  -- ORIGINAL = executed cursor text in library cache (most recently active)
+  -- ORIGINAL: prefer child with non-empty bind capture, else last_active_time
   SELECT sql_fulltext,
          parsing_schema_name,
          child_number,
@@ -504,16 +560,18 @@ BEGIN
          ln_phv,
          ln_sql_len
     FROM (
-           SELECT sql_fulltext,
-                  parsing_schema_name,
-                  child_number,
-                  hash_value,
-                  plan_hash_value
-             FROM v$sql
-            WHERE sql_id = c_sqlid
-            ORDER BY last_active_time DESC NULLS LAST,
-                     executions DESC NULLS LAST,
-                     child_number
+           SELECT s.sql_fulltext,
+                  s.parsing_schema_name,
+                  s.child_number,
+                  s.hash_value,
+                  s.plan_hash_value,
+                  s.last_active_time,
+                  s.executions
+             FROM v$sql s
+            WHERE s.sql_id = c_sqlid
+            ORDER BY s.last_active_time DESC NULLS LAST,
+                   s.executions DESC NULLS LAST,
+                   s.child_number
          )
    WHERE ROWNUM = 1;
 
@@ -533,7 +591,9 @@ BEGIN
     INTO ln_bind_count
     FROM v$sql_bind_capture
    WHERE sql_id = c_sqlid
-     AND child_number = ln_exec_child;
+     AND child_number = ln_exec_child
+     AND last_captured IS NOT NULL
+     AND ROWNUM = 1;
 
   IF ln_bind_count = 0 THEN
     DBMS_OUTPUT.PUT_LINE('===== LITERAL SQL =====');
@@ -560,7 +620,10 @@ BEGIN
   -- short SQL: bind rewrite on VARCHAR2 copy of executed text
   lvc_sql_text := DBMS_LOB.SUBSTR(lvc_orig_sql_text, ln_sql_len, 1);
 
+  v_pos_seen.DELETE;
   FOR r1 IN c1(ln_exec_child) LOOP
+    IF NOT v_pos_seen.EXISTS(r1.position) THEN
+    v_pos_seen(r1.position) := 1;
     IF (r1.child_number <> ln_child) THEN
       IF ln_child <> 10000 THEN
         DBMS_OUTPUT.PUT_LINE('===== LITERAL SQL =====');
@@ -587,19 +650,48 @@ BEGIN
     IF r1.value_string IS NULL THEN
       lvc_repl := 'NULL';
     ELSIF r1.datatype_string = 'NUMBER' THEN
-      lvc_repl := r1.value_string;
+      IF LENGTH(r1.value_string) > 7900 THEN
+        lvc_repl := SUBSTR(r1.value_string, 1, 7900);
+      ELSE
+        lvc_repl := r1.value_string;
+      END IF;
     ELSIF r1.datatype_string = 'DATE' THEN
-      lvc_repl := 'to_date(''' || r1.value_string || ''')';
+      lvc_repl := 'to_date(''' || REPLACE(SUBSTR(NVL(r1.value_string, ''), 1, 7800), '''', '''''') || ''')';
     ELSIF r1.datatype_string LIKE 'TIMESTAMP%' THEN
-      lvc_repl := 'to_timestamp(''' || r1.value_string || ''')';
+      lvc_repl := 'to_timestamp(''' || REPLACE(SUBSTR(NVL(r1.value_string, ''), 1, 7800), '''', '''''') || ''')';
     ELSE
-      lvc_repl := '''' || REPLACE(r1.value_string, '''', '''''') || '''';
+      -- avoid YAS-04412 when value_string exceeds old VARCHAR2(2000) repl buffer
+      lvc_repl := '''' || REPLACE(SUBSTR(NVL(r1.value_string, ''), 1, 7800), '''', '''''') || '''';
+      IF LENGTH(NVL(r1.value_string, '')) > 7800 THEN
+        lvc_repl := lvc_repl || ' /*truncated*/';
+      END IF;
     END IF;
 
     lvc_bind := bind_pattern(r1.name);
 
-    IF lvc_bind IS NOT NULL AND NOT uses_question_bind(lvc_sql_text) THEN
-      lvc_sql_text := replace_first_outside_quotes(lvc_sql_text, lvc_bind, lvc_repl);
+    -- Prefer named placeholders even when SQL also has trailing ? (pagination)
+    IF lvc_bind IS NOT NULL THEN
+      lvc_sql_tmp := replace_first_outside_quotes(lvc_sql_text, lvc_bind, lvc_repl);
+      IF lvc_sql_tmp = lvc_sql_text AND bind_pattern_alt(r1.name) IS NOT NULL THEN
+        lvc_sql_tmp := replace_first_outside_quotes(
+          lvc_sql_text, bind_pattern_alt(r1.name), lvc_repl);
+      END IF;
+      IF lvc_sql_tmp <> lvc_sql_text THEN
+        lvc_sql_text := lvc_sql_tmp;
+      ELSE
+        ln_qpos := INSTR(lvc_sql_text, '?');
+        IF ln_qpos = 0 THEN
+          DBMS_OUTPUT.PUT_LINE(
+            'ERROR: no placeholder for bind position=' || r1.position
+            || ', name=' || NVL(r1.name, '(null)')
+          );
+          RETURN;
+        END IF;
+        lvc_sql_text :=
+          SUBSTR(lvc_sql_text, 1, ln_qpos - 1) ||
+          lvc_repl ||
+          SUBSTR(lvc_sql_text, ln_qpos + 1);
+      END IF;
     ELSE
       ln_qpos := INSTR(lvc_sql_text, '?');
       IF ln_qpos = 0 THEN
@@ -614,6 +706,7 @@ BEGIN
         SUBSTR(lvc_sql_text, 1, ln_qpos - 1) ||
         lvc_repl ||
         SUBSTR(lvc_sql_text, ln_qpos + 1);
+    END IF;
     END IF;
   END LOOP;
 
@@ -1808,6 +1901,7 @@ SELECT p.table_owner || '.' || p.table_name AS tab,
 
 
 
+
 """
 
 
@@ -2254,11 +2348,13 @@ def _capture_bind_filled_count(sql_id, connect_str, yasql_path):
         "    SELECT COUNT(*) INTO v_n\n"
         "      FROM gv$sql_bind_capture\n"
         "     WHERE sql_id = '{0}'\n"
+        "       AND last_captured IS NOT NULL\n"
         "       AND NVL(LENGTH(value_string), 0) > 0;\n"
         "  EXCEPTION WHEN OTHERS THEN\n"
         "    SELECT COUNT(*) INTO v_n\n"
         "      FROM v$sql_bind_capture\n"
         "     WHERE sql_id = '{0}'\n"
+        "       AND last_captured IS NOT NULL\n"
         "       AND NVL(LENGTH(value_string), 0) > 0;\n"
         "  END;\n"
         "  DBMS_OUTPUT.PUT_LINE('BIND_FILLED=' || TO_CHAR(v_n));\n"
@@ -2346,9 +2442,202 @@ def build_list_sql(use_gv):
     ).format(start=MARK_START, end=MARK_END, view=view, tag=PROBE_TAG)
 
 
+def build_active_sqlid_sql(use_gv):
+    # type: (bool) -> str
+    """活跃会话 sql_id, 跑得最久的优先 (与 Java CandidateService 对齐)."""
+    view = "gv$session" if use_gv else "v$session"
+    own = (
+        "AND NOT (s.INST_ID = TO_NUMBER(SYS_CONTEXT('USERENV', 'INSTANCE'))\n"
+        "             AND s.SID = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')))\n"
+        if use_gv
+        else "AND s.SID <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))\n"
+    )
+    return (
+        "SET SERVEROUTPUT ON\n"
+        "SET HEADING OFF\n"
+        "BEGIN\n"
+        "  DBMS_OUTPUT.PUT_LINE('{start}');\n"
+        "  FOR r IN (\n"
+        "    SELECT s.sql_id\n"
+        "      FROM {view} s\n"
+        "     WHERE s.TYPE NOT IN ('BACKGROUND')\n"
+        "       AND NVL(NULLIF(TRIM(s.status), ''), 'ACTIVE') NOT IN ('INACTIVE')\n"
+        "       AND s.sql_id IS NOT NULL\n"
+        "       AND LENGTH(TRIM(s.sql_id)) >= 5\n"
+        "       {own}"
+        "     ORDER BY s.exec_start_time ASC NULLS LAST, s.sql_id\n"
+        "  ) LOOP\n"
+        "    DBMS_OUTPUT.PUT_LINE(TRIM(r.sql_id));\n"
+        "  END LOOP;\n"
+        "  DBMS_OUTPUT.PUT_LINE('{end}');\n"
+        "END;\n"
+        "/\n"
+        "EXIT;\n"
+    ).format(start=MARK_START, end=MARK_END, view=view, own=own)
+
+
+def list_active_sqlids(connect_str, yasql_path):
+    # type: (str, str) -> list
+    """Return ordered unique active-session sql_ids (longest-running first)."""
+    out_ids = []
+    seen = set()
+    for use_gv in (True, False):
+        path = write_temp_sql(build_active_sqlid_sql(use_gv))
+        try:
+            rc, out = yasql_run(path, connect_str, yasql_path, timeout=60)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        if MARK_START not in out:
+            if use_gv:
+                continue
+            return out_ids
+        in_mark = False
+        for ln in out.splitlines():
+            s = ln.strip()
+            if s == MARK_START:
+                in_mark = True
+                continue
+            if s == MARK_END:
+                break
+            if not in_mark or not s or len(s) < 5:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out_ids.append(s)
+        if out_ids:
+            log_dbg(
+                "active session sql_ids={0} source={1}".format(
+                    len(out_ids), "gv$session" if use_gv else "v$session"
+                )
+            )
+            return out_ids
+    return out_ids
+
+
+def _lookup_one_candidate(connect_str, yasql_path, sql_id):
+    # type: (str, str, str) -> dict
+    """Fetch one sql_id from gv$/v$sql for active-first fill-in."""
+    for use_gv in (True, False):
+        view = "gv$sql" if use_gv else "v$sql"
+        body = (
+            "SET SERVEROUTPUT ON\n"
+            "SET HEADING OFF\n"
+            "DECLARE\n"
+            "  v_snip VARCHAR2(200);\n"
+            "BEGIN\n"
+            "  DBMS_OUTPUT.PUT_LINE('{start}');\n"
+            "  FOR r IN (\n"
+            "    SELECT sql_id,\n"
+            "           MAX(parsing_schema_name) AS parsing_schema_name,\n"
+            "           MAX(DBMS_LOB.GETLENGTH(sql_fulltext)) AS sql_len,\n"
+            "           MAX(DBMS_LOB.SUBSTR(sql_fulltext, 180, 1)) AS snip\n"
+            "      FROM {view}\n"
+            "     WHERE sql_id = '{sid}'\n"
+            "       AND parsing_schema_name IS NOT NULL\n"
+            "       AND UPPER(parsing_schema_name) NOT IN ('SYS','SYSDBA')\n"
+            "       AND (sql_fulltext IS NULL OR sql_fulltext NOT LIKE '%{tag}%')\n"
+            "     GROUP BY sql_id\n"
+            "  ) LOOP\n"
+            "    v_snip := REPLACE(REPLACE(NVL(r.snip,''), CHR(10), ' '), '|', '/');\n"
+            "    DBMS_OUTPUT.PUT_LINE(\n"
+            "      r.sql_id || '|' || NVL(r.parsing_schema_name,'') || '|' ||\n"
+            "      TO_CHAR(NVL(r.sql_len,0)) || '|' || v_snip);\n"
+            "  END LOOP;\n"
+            "  DBMS_OUTPUT.PUT_LINE('{end}');\n"
+            "END;\n"
+            "/\n"
+            "EXIT;\n"
+        ).format(start=MARK_START, end=MARK_END, view=view, sid=sql_id.replace("'", "''"), tag=PROBE_TAG)
+        path = write_temp_sql(body)
+        try:
+            rc, out = yasql_run(path, connect_str, yasql_path, timeout=60)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        if MARK_START not in out:
+            continue
+        in_mark = False
+        for ln in out.splitlines():
+            s = ln.strip()
+            if s == MARK_START:
+                in_mark = True
+                continue
+            if s == MARK_END:
+                break
+            if not in_mark or "|" not in s:
+                continue
+            parts = s.split("|", 3)
+            if len(parts) < 3:
+                continue
+            sid = parts[0].strip()
+            schema = parts[1].strip()
+            try:
+                sql_len = int(parts[2].strip() or "0")
+            except ValueError:
+                sql_len = 0
+            snip = parts[3] if len(parts) > 3 else ""
+            if not sid or len(sid) < 5:
+                continue
+            if schema.upper() in EXCLUDE_SCHEMAS:
+                continue
+            if sql_len < MIN_SQL_CHARS:
+                continue
+            if is_noise_text(snip):
+                continue
+            return {
+                "sql_id": sid,
+                "schema": schema,
+                "sql_len": sql_len,
+                "snip": snip,
+            }
+    return None
+
+
+def prioritize_active_candidates(candidates, active_ids, connect_str, yasql_path):
+    # type: (list, list, str, str) -> list
+    if not active_ids:
+        return candidates
+    by_id = {}
+    for item in candidates:
+        sid = item.get("sql_id")
+        if sid:
+            by_id[sid] = item
+    out = []
+    seen = set()
+    for sid in active_ids:
+        if not sid or sid in seen:
+            continue
+        item = by_id.get(sid)
+        if item is None:
+            item = _lookup_one_candidate(connect_str, yasql_path, sid)
+            if item is None:
+                continue
+            log_dbg("active sql_id not in pool; added {0} schema={1}".format(
+                sid, item.get("schema", "")
+            ))
+        out.append(item)
+        seen.add(sid)
+    for item in candidates:
+        sid = item.get("sql_id")
+        if not sid or sid in seen:
+            continue
+        out.append(item)
+        seen.add(sid)
+    return out
+
+
 def list_candidate_sqlids(connect_str, yasql_path):
     # type: (str, str) -> list
-    """Return list of dicts: sql_id, schema, sql_len, snip (noise-filtered)."""
+    """Return list of dicts: sql_id, schema, sql_len, snip (noise-filtered).
+
+    Active-session sql_ids are placed first (longest-running first).
+    """
     candidates = []
     for use_gv in (True, False):
         path = write_temp_sql(build_list_sql(use_gv))
@@ -2402,7 +2691,22 @@ def list_candidate_sqlids(connect_str, yasql_path):
                     "snip": snip,
                 }
             )
-        return candidates
+        active_ids = list_active_sqlids(connect_str, yasql_path)
+        ordered = prioritize_active_candidates(
+            candidates, active_ids, connect_str, yasql_path
+        )
+        active_first = 0
+        for item in ordered:
+            if item.get("sql_id") in active_ids:
+                active_first += 1
+            else:
+                break
+        log_info(
+            "candidates={0} active_session_sql={1} active_first={2}".format(
+                len(ordered), len(active_ids), active_first
+            )
+        )
+        return ordered
     return []
 
 
@@ -2525,9 +2829,6 @@ def run_round(args, collected_path):
             if x["sql_id"] in collected
             and sql_id_needs_bind_refresh(args.outdir, x["sql_id"])
         ]
-    if args.max_new is not None:
-        new_items = new_items[: args.max_new]
-        log_dbg("max-new cap -> {0}".format(len(new_items)))
 
     log_dbg(
         "round collected={0} candidates={1} backup_new={2} collect_new={3} "
@@ -3010,6 +3311,7 @@ public class SqlReplayJdbc {
         ps = cLookup.prepareStatement(
           "SELECT position, datatype_string, value_string FROM gv$sql_bind_capture" +
           " WHERE sql_id = ? AND child_number = ? AND inst_id = ?" +
+          " AND last_captured IS NOT NULL" +
           " ORDER BY position, name");
         ps.setString(1, sqlId);
         ps.setInt(2, child);
@@ -3033,7 +3335,8 @@ public class SqlReplayJdbc {
         try {
           ps = cLookup.prepareStatement(
             "SELECT position, datatype_string, value_string FROM v$sql_bind_capture" +
-            " WHERE sql_id = ? AND child_number = ? ORDER BY position, name");
+            " WHERE sql_id = ? AND child_number = ? AND last_captured IS NOT NULL" +
+            " ORDER BY position, name");
           ps.setString(1, sqlId);
           ps.setInt(2, child);
           rs = ps.executeQuery();
@@ -3371,6 +3674,7 @@ def build_replay_export_sql(sql_id):
         "        FROM gv$sql_bind_capture\n"
         "       WHERE sql_id = v_sql_id AND child_number = v_child\n"
         "         AND NVL(inst_id,1) = NVL(v_inst,1)\n"
+        "         AND last_captured IS NOT NULL\n"
         "       ORDER BY position, name\n"
         "    ) LOOP\n"
         "      v_n := v_n + 1;\n"
@@ -3395,6 +3699,7 @@ def build_replay_export_sql(sql_id):
         "      SELECT position, name, datatype_string, value_string, was_captured\n"
         "        FROM v$sql_bind_capture\n"
         "       WHERE sql_id = v_sql_id AND child_number = v_child\n"
+        "         AND last_captured IS NOT NULL\n"
         "       ORDER BY position, name\n"
         "    ) LOOP\n"
         "      v_n := v_n + 1;\n"
@@ -3441,6 +3746,7 @@ def build_replay_export_sql(sql_id):
         "        FROM gv$sql_bind_capture\n"
         "       WHERE sql_id = v_sql_id AND child_number = v_child\n"
         "         AND NVL(inst_id,1) = NVL(v_inst,1)\n"
+        "         AND last_captured IS NOT NULL\n"
         "       ORDER BY position, name\n"
         "    ) LOOP\n"
         "      v_n := v_n + 1;\n"
@@ -3460,6 +3766,7 @@ def build_replay_export_sql(sql_id):
         "      SELECT position, name, datatype_string, value_string, was_captured\n"
         "        FROM v$sql_bind_capture\n"
         "       WHERE sql_id = v_sql_id AND child_number = v_child\n"
+        "         AND last_captured IS NOT NULL\n"
         "       ORDER BY position, name\n"
         "    ) LOOP\n"
         "      v_name := REPLACE(REPLACE(NVL(r.name,''), CHR(92), CHR(92)||CHR(92)), '|', CHR(92)||'|');\n"
@@ -3660,8 +3967,8 @@ def export_replay_package(sql_id, outdir, connect_str, yasql_path, kind="NEW"):
     empty_vals = [b for b in binds if b.get("value", "") == ""]
     if empty_vals:
         eprint(
-            "[WARN] {0} bind(s) have empty value_string; edit binds.txt before execute".format(
-                len(empty_vals)
+            "[WARN] {0} bind(s) have empty value_string; sql_id={1} edit binds.txt before execute".format(
+                len(empty_vals), sql_id
             )
         )
     return True
@@ -4564,13 +4871,6 @@ examples:
             default=None,
             metavar="N",
             help="poll rounds; alone => interval defaults to 600s",
-        )
-        sp.add_argument(
-            "--max-new",
-            type=int,
-            default=None,
-            metavar="N",
-            help="cap number of new sql_id reports per round (debug/smoke)",
         )
         sp.add_argument(
             "--skip-backup",
